@@ -116,6 +116,54 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_parent_triage_worker_sees_unblock_for_source_card(monkeypatch, tmp_path):
+    """Kernel-created parent-triage workers get the narrow board-moving tool.
+
+    Ordinary workers stay scoped to their own card, but an on-block parent
+    triage card is created specifically to move one blocked source card after
+    local verification, so its schema must include ``kanban_unblock``.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        source = kb.create_task(
+            conn,
+            title="phase",
+            assignee="proofloopworker",
+            idempotency_key="proof-loop:plan:task:S1:BUILD_FIX",
+            skills=[kb.PROOF_LOOP_SKILL],
+        )
+        assert kb.block_task(conn, source, reason="needs parent triage")
+        triage = conn.execute(
+            "SELECT id FROM tasks WHERE created_by = ?",
+            (kb.ON_BLOCK_PARENT_TRIAGE_CREATED_BY,),
+        ).fetchone()["id"]
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", triage)
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_unblock" in names
+    assert "kanban_list" not in names
+
+
 # ---------------------------------------------------------------------------
 # Handler happy paths
 # ---------------------------------------------------------------------------
@@ -934,6 +982,39 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
 # tasks on behalf of the child.
 
 
+def _make_parent_triage_context(monkeypatch, tmp_path):
+    """Create a blocked proof-loop source and scope env to its parent triage."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        source = kb.create_task(
+            conn,
+            title="proof-loop source",
+            assignee="proofloopworker",
+            idempotency_key="proof-loop:plan:task:S1:BUILD_FIX",
+            skills=[kb.PROOF_LOOP_SKILL],
+        )
+        assert kb.block_task(conn, source, reason="parent triage required")
+        triage = conn.execute(
+            "SELECT id FROM tasks WHERE created_by = ?",
+            (kb.ON_BLOCK_PARENT_TRIAGE_CREATED_BY,),
+        ).fetchone()["id"]
+        sibling = kb.create_task(conn, title="sibling", assignee="peer")
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", triage)
+    return source, triage, sibling
+
+
 def test_worker_complete_rejects_foreign_task_id(worker_env):
     """A worker cannot complete a task that isn't its own (#19534)."""
     from hermes_cli import kanban_db as kb
@@ -1063,6 +1144,73 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, other).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_parent_triage_worker_can_complete_blocked_source_task(monkeypatch, tmp_path):
+    """On-block parent triage may close the exact source card after proof."""
+    source, triage, _sibling = _make_parent_triage_context(monkeypatch, tmp_path)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "task_id": source,
+        "summary": "FALSE_BLOCKER: parent verified locally; release gate.",
+        "metadata": {"classification": "FALSE_BLOCKER", "triage_task_id": triage},
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, source).status == "done"
+        assert kb.get_task(conn, triage).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_parent_triage_worker_can_unblock_blocked_source_task(monkeypatch, tmp_path):
+    """On-block parent triage may reopen the exact source card with instructions."""
+    source, _triage, _sibling = _make_parent_triage_context(monkeypatch, tmp_path)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_unblock({"task_id": source})
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+    assert d.get("status") == "ready"
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, source).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_parent_triage_worker_cannot_mutate_sibling_task(monkeypatch, tmp_path):
+    """The parent-triage exception is source-card exact, not board-wide."""
+    _source, _triage, sibling = _make_parent_triage_context(monkeypatch, tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, sibling, reason="ordinary sibling blocker")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    complete_out = json.loads(kt._handle_complete({
+        "task_id": sibling,
+        "summary": "should not be allowed",
+    }))
+    unblock_out = json.loads(kt._handle_unblock({"task_id": sibling}))
+    assert "refusing to mutate" in complete_out.get("error", "")
+    assert "refusing to mutate" in unblock_out.get("error", "")
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, sibling).status == "blocked"
     finally:
         conn.close()
 

@@ -87,6 +87,59 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _worker_parent_triage_source_task_id(kb, conn, triage_task_id: str) -> Optional[str]:
+    """Return the blocked source task this dispatcher worker may repair.
+
+    pre: triage_task_id is the current HERMES_KANBAN_TASK value
+    post: returns a task id only for kernel-created on-block parent triage cards
+    post: returns None for ordinary workers, forged cards, non-proof-loop tasks, or non-blocked sources
+    """
+    triage_task = kb.get_task(conn, triage_task_id)
+    if triage_task is None:
+        return None
+    created_by = getattr(kb, "ON_BLOCK_PARENT_TRIAGE_CREATED_BY", "kanban:on-block-parent-triage")
+    if triage_task.created_by != created_by:
+        return None
+    prefix = getattr(
+        kb,
+        "ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX",
+        "kanban:on-block-parent-triage:",
+    )
+    idem = triage_task.idempotency_key or ""
+    if not idem.startswith(prefix) or ":event:" not in idem:
+        return None
+    source_id = idem[len(prefix):].split(":event:", 1)[0]
+    if not source_id.startswith("t_"):
+        return None
+    source = kb.get_task(conn, source_id)
+    if source is None or source.status != "blocked":
+        return None
+    is_phase = getattr(kb, "_is_proof_loop_phase_task", lambda _task: False)
+    if not is_phase(source):
+        return None
+    return source_id
+
+
+def _check_kanban_unblock_mode() -> bool:
+    """Expose unblock only to orchestrators or kernel-created parent triage.
+
+    Ordinary dispatcher-spawned workers must not even see board-moving tools.
+    On-block parent-triage workers are the narrow exception: their whole job is
+    to inspect one blocked source card and move it after local verification.
+    """
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not env_tid:
+        return _profile_has_kanban_toolset()
+    try:
+        kb, conn = _connect()
+        try:
+            return _worker_parent_triage_source_task_id(kb, conn, env_tid) is not None
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -112,20 +165,26 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
-def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
-    """Reject worker-driven destructive calls on foreign task IDs.
+def _enforce_worker_task_ownership(
+    tid: str,
+    *,
+    action: Optional[str] = None,
+    kb=None,
+    conn=None,
+) -> Optional[str]:
+    """Reject worker-driven destructive calls on unauthorized task IDs.
 
     A process spawned by the dispatcher has ``HERMES_KANBAN_TASK`` set
-    to its own task id. Tools like ``kanban_complete`` / ``kanban_block``
-    / ``kanban_heartbeat`` mutate run-lifecycle state, so a buggy or
-    prompt-injected worker that passed an explicit ``task_id`` for some
-    other task could corrupt sibling or cross-tenant runs (see #19534).
+    to its own task id. Lifecycle tools mutate run state, so ordinary
+    workers may only mutate that one task. Kernel-created on-block parent
+    triage cards are a narrow exception: they may complete or unblock the
+    exact blocked source card encoded in their idempotency key after local
+    verification. Sibling or forged task ids still fail closed.
 
     Orchestrator profiles (kanban toolset enabled but **no**
     ``HERMES_KANBAN_TASK`` in env) aren't subject to this check — their
     job is routing, and they sometimes legitimately close out child
-    tasks or reopen blocked ones. Workers are narrowly scoped to their
-    one task.
+    tasks or reopen blocked ones.
 
     Returns ``None`` when the call is allowed, or a tool-error string
     when it must be rejected. Callers should ``return`` the error
@@ -136,6 +195,10 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
     if tid != env_tid:
+        if action in {"complete", "unblock"} and kb is not None and conn is not None:
+            source_id = _worker_parent_triage_source_task_id(kb, conn, env_tid)
+            if source_id == tid:
+                return None
         return tool_error(
             f"worker is scoped to task {env_tid}; refusing to mutate "
             f"{tid}. Use kanban_comment to hand off information to other "
@@ -364,9 +427,6 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
-    ownership_err = _enforce_worker_task_ownership(tid)
-    if ownership_err:
-        return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
@@ -395,6 +455,14 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect()
         try:
+            ownership_err = _enforce_worker_task_ownership(
+                tid,
+                action="complete",
+                kb=kb,
+                conn=conn,
+            )
+            if ownership_err:
+                return ownership_err
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -628,23 +696,27 @@ def _handle_create(args: dict, **kw) -> str:
 
 
 def _handle_unblock(args: dict, **kw) -> str:
-    """Transition a blocked task back to ready."""
-    guard = _require_orchestrator_tool("kanban_unblock")
-    if guard:
-        return guard
+    """Transition a blocked task back to ready/todo when authorized."""
     tid = args.get("task_id")
     if not tid:
         return tool_error("task_id is required")
-    ownership_err = _enforce_worker_task_ownership(str(tid))
-    if ownership_err:
-        return ownership_err
     try:
         kb, conn = _connect()
         try:
+            if os.environ.get("HERMES_KANBAN_TASK"):
+                ownership_err = _enforce_worker_task_ownership(
+                    str(tid),
+                    action="unblock",
+                    kb=kb,
+                    conn=conn,
+                )
+                if ownership_err:
+                    return ownership_err
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
-            return _ok(task_id=str(tid), status="ready")
+            task = kb.get_task(conn, str(tid))
+            return _ok(task_id=str(tid), status=task.status if task else "ready")
         finally:
             conn.close()
     except Exception as e:
@@ -752,7 +824,9 @@ KANBAN_COMPLETE_SCHEMA = {
     "name": "kanban_complete",
     "description": (
         "Mark your current task done with a structured handoff for "
-        "downstream workers and humans. Prefer ``summary`` for a "
+        "downstream workers and humans. Kernel-created parent triage workers "
+        "may also complete the exact blocked source card they were created "
+        "to repair after local verification. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
@@ -1019,9 +1093,10 @@ KANBAN_CREATE_SCHEMA = {
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
-        "Move a blocked Kanban task back to ready. Orchestrator-only — only "
-        "profiles with the kanban toolset can unblock routed work; "
-        "dispatcher-spawned task workers never see this tool."
+        "Move a blocked Kanban task back to ready/todo. Available to "
+        "orchestrator profiles, and to kernel-created parent triage workers "
+        "only for the exact blocked source card they were created to repair. "
+        "Ordinary dispatcher-spawned workers never see this tool."
     ),
     "parameters": {
         "type": "object",
@@ -1125,7 +1200,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
     handler=_handle_unblock,
-    check_fn=_check_kanban_orchestrator_mode,
+    check_fn=_check_kanban_unblock_mode,
     emoji="▶",
 )
 
