@@ -411,6 +411,14 @@ def test_blocking_proof_loop_phase_creates_ready_parent_triage(kanban_home):
         )
         claim = kb.claim_task(conn, phase, claimer="host:worker")
         assert claim is not None
+        kb.add_notify_sub(
+            conn,
+            task_id=phase,
+            platform="telegram",
+            chat_id="-1003351905082",
+            thread_id="25613",
+            notifier_profile="default",
+        )
 
         assert kb.block_task(conn, phase, reason="RED changed; parent triage required")
 
@@ -430,11 +438,18 @@ def test_blocking_proof_loop_phase_creates_ready_parent_triage(kanban_home):
         assert "RED changed; parent triage required" in (triage.body or "")
         assert str(claim.current_run_id) in (triage.body or "")
         assert "repo-task-proof-loop-hermes" in (triage.skills or [])
+        triage_subs = kb.list_notify_subs(conn, triage.id)
+        assert len(triage_subs) == 1
+        assert triage_subs[0]["platform"] == "telegram"
+        assert triage_subs[0]["chat_id"] == "-1003351905082"
+        assert triage_subs[0]["thread_id"] == "25613"
+        assert triage_subs[0]["notifier_profile"] == "default"
 
         events = kb.list_events(conn, phase)
         triage_events = [e for e in events if e.kind == "parent_triage_created"]
         assert len(triage_events) == 1
         assert triage_events[0].payload["triage_task_id"] == triage.id
+        assert triage_events[0].payload["copied_notify_subscriptions"] == 1
 
 
 def test_blocking_non_proof_loop_task_does_not_create_parent_triage(kanban_home):

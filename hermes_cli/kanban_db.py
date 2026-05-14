@@ -2682,6 +2682,33 @@ def _on_block_parent_triage_body(
     )
 
 
+def _copy_notify_subs_locked(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    target_task_id: str,
+    now: Optional[int] = None,
+) -> int:
+    """Copy gateway notification subscriptions to a derived task.
+
+    pre: caller holds write_txn(conn)
+    post[conn]: every source subscription has a matching target subscription
+    post: returned count is the number of newly inserted target subscriptions
+    """
+    created_at = int(now if now is not None else time.time())
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at, last_event_id)
+        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, 0
+          FROM kanban_notify_subs
+         WHERE task_id = ?
+        """,
+        (target_task_id, created_at, source_task_id),
+    )
+    return int(cur.rowcount or 0)
+
+
 def _insert_on_block_parent_triage_locked(
     conn: sqlite3.Connection,
     *,
@@ -2709,6 +2736,7 @@ def _insert_on_block_parent_triage_locked(
     priority = int(blocked_task.priority or 0) + 10
     idem = f"{ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX}{blocked_task.id}:event:{block_event_id}"
 
+    now = int(time.time())
     existing = conn.execute(
         "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
         "ORDER BY created_at DESC LIMIT 1",
@@ -2724,7 +2752,6 @@ def _insert_on_block_parent_triage_locked(
             block_event_id=block_event_id,
             review_gate=review_gate,
         )
-        now = int(time.time())
         skills = json.dumps([PROOF_LOOP_SKILL])
         title = f"[parent triage] blocked {blocked_task.id}: {blocked_task.title}"
         for attempt in range(2):
@@ -2778,6 +2805,13 @@ def _insert_on_block_parent_triage_locked(
         else:
             raise RuntimeError("unreachable")
 
+    copied_notify_subs = _copy_notify_subs_locked(
+        conn,
+        source_task_id=blocked_task.id,
+        target_task_id=triage_id,
+        now=now,
+    )
+
     _append_event(
         conn,
         blocked_task.id,
@@ -2787,6 +2821,7 @@ def _insert_on_block_parent_triage_locked(
             "blocked_event_id": block_event_id,
             "review_gate_task_id": review_gate.id if review_gate else None,
             "assignee": _canonical_assignee(assignee),
+            "copied_notify_subscriptions": copied_notify_subs,
         },
         run_id=run_id,
     )
