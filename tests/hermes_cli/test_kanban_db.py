@@ -277,7 +277,7 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["host_local"] is True
 
 
-def test_max_runtime_uses_current_run_start_after_retry(kanban_home):
+def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
 
     ``tasks.started_at`` intentionally records the first time the task ever
@@ -285,6 +285,8 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home):
     ``task_runs.started_at`` row; otherwise every retry of an old task is
     immediately timed out again.
     """
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
     with kb.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
         t = kb.create_task(
@@ -376,6 +378,97 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "blocked"
         assert kb.unblock_task(conn, t)
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_blocking_proof_loop_phase_creates_ready_parent_triage(kanban_home):
+    """A proof-loop phase block must create one runnable default-parent triage card.
+
+    post: original task is blocked
+    post: triage card is ready, unparented, assigned to the matching review gate assignee
+    post: triage body contains concrete blocked task/run context
+    """
+    with kb.connect() as conn:
+        phase = kb.create_task(
+            conn,
+            title="[task] S1 RED_PREP",
+            assignee="proofloopworker",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S1:RED_PREP",
+            skills=["repo-task-proof-loop-hermes"],
+        )
+        kb.create_task(
+            conn,
+            title="[task] S1 REVIEW RED_PREP",
+            assignee="default",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S1:PARENT_REVIEW_RED_PREP",
+            skills=["repo-task-proof-loop-hermes"],
+            parents=[phase],
+        )
+        claim = kb.claim_task(conn, phase, claimer="host:worker")
+        assert claim is not None
+
+        assert kb.block_task(conn, phase, reason="RED changed; parent triage required")
+
+        triages = [
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        ]
+        assert len(triages) == 1
+        triage = triages[0]
+        assert triage.status == "ready"
+        assert triage.assignee == "default"
+        assert triage.workspace_kind == "dir"
+        assert triage.workspace_path == "/repo"
+        assert triage.tenant == "canon"
+        assert kb.parent_ids(conn, triage.id) == []
+        assert phase in (triage.body or "")
+        assert "RED changed; parent triage required" in (triage.body or "")
+        assert str(claim.current_run_id) in (triage.body or "")
+        assert "repo-task-proof-loop-hermes" in (triage.skills or [])
+
+        events = kb.list_events(conn, phase)
+        triage_events = [e for e in events if e.kind == "parent_triage_created"]
+        assert len(triage_events) == 1
+        assert triage_events[0].payload["triage_task_id"] == triage.id
+
+
+def test_blocking_non_proof_loop_task_does_not_create_parent_triage(kanban_home):
+    """Only explicit proof-loop phase cards get automatic parent triage."""
+    with kb.connect() as conn:
+        task = kb.create_task(conn, title="ordinary", assignee="worker")
+        kb.claim_task(conn, task)
+        assert kb.block_task(conn, task, reason="ordinary blocker")
+
+        triages = [
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        ]
+        assert triages == []
+
+
+def test_blocking_parent_review_gate_does_not_create_recursive_triage(kanban_home):
+    """Parent review gates may block, but must not recursively enqueue parent triage."""
+    with kb.connect() as conn:
+        review = kb.create_task(
+            conn,
+            title="[task] S1 REVIEW RED_PREP",
+            assignee="default",
+            idempotency_key="proof-loop:plan:task:S1:PARENT_REVIEW_RED_PREP",
+            skills=["repo-task-proof-loop-hermes"],
+        )
+        kb.claim_task(conn, review)
+        assert kb.block_task(conn, review, reason="needs real user decision")
+
+        triages = [
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        ]
+        assert triages == []
 
 
 # ---------------------------------------------------------------------------

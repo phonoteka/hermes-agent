@@ -100,6 +100,11 @@ KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 # workloads either finish within 15m or set a longer claim explicitly.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
 
+PROOF_LOOP_SKILL = "repo-task-proof-loop-hermes"
+ON_BLOCK_PARENT_TRIAGE_CREATED_BY = "kanban:on-block-parent-triage"
+ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX = "kanban:on-block-parent-triage:"
+ON_BLOCK_PARENT_TRIAGE_MAX_RUNTIME_SECONDS = 30 * 60
+
 
 # Worker-context caps so build_worker_context() stays bounded on
 # pathological boards (retry-heavy tasks, comment storms, giant
@@ -1689,8 +1694,12 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
-    """Record an event row.  Called from within an already-open txn.
+) -> int:
+    """Record an event row and return its id. Called inside an open txn.
+
+    post[conn]: inserts exactly one task_events row for task_id/kind
+    post: returns the inserted event id
+    raises: sqlite3.Error when SQLite rejects the insert
 
     ``run_id`` is optional: pass the current run id so UIs can group
     events by attempt. For events that aren't scoped to a single run
@@ -1699,11 +1708,12 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
     )
+    return int(cur.lastrowid or 0)
 
 
 def _end_run(
@@ -2581,6 +2591,208 @@ def edit_completed_task_result(
     return True
 
 
+def _is_proof_loop_phase_task(task: Task) -> bool:
+    """Return whether ``task`` should trigger parent triage on block.
+
+    pre: task is a hydrated Task row
+    post: returns True only for explicit proof-loop phase cards, not parent gates
+    post: returns False for triage cards to prevent recursive creation
+    """
+    idem = task.idempotency_key or ""
+    if task.created_by == ON_BLOCK_PARENT_TRIAGE_CREATED_BY:
+        return False
+    if not idem.startswith("proof-loop:"):
+        return False
+    if ":PARENT_REVIEW_" in idem:
+        return False
+    return PROOF_LOOP_SKILL in (task.skills or [])
+
+
+def _review_gate_for_phase_locked(
+    conn: sqlite3.Connection,
+    task: Task,
+) -> Optional[Task]:
+    """Find the parent-review gate for a proof-loop phase card.
+
+    pre: task.idempotency_key follows proof-loop:<plan>:<task>:<slice>:<phase>
+    post: returns the matching non-archived PARENT_REVIEW_<phase> task when present
+    post: returns None when the source idempotency key is not parseable or no gate exists
+    """
+    idem = task.idempotency_key or ""
+    parts = idem.split(":")
+    if len(parts) != 5 or parts[0] != "proof-loop":
+        return None
+    phase = parts[4]
+    if phase.startswith("PARENT_REVIEW_"):
+        return None
+    review_key = ":".join([*parts[:4], f"PARENT_REVIEW_{phase}"])
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (review_key,),
+    ).fetchone()
+    return Task.from_row(row) if row else None
+
+
+def _on_block_parent_triage_body(
+    *,
+    blocked_task: Task,
+    reason: Optional[str],
+    run_id: Optional[int],
+    block_event_id: int,
+    review_gate: Optional[Task],
+) -> str:
+    """Build the runnable handoff body for an automatic parent triage card.
+
+    post: body names the exact blocked card/event/run and local triage protocol
+    post: body does not claim user escalation is required before verification
+    """
+    review_line = (
+        f"Review gate: {review_gate.id} ({review_gate.title})"
+        if review_gate else
+        "Review gate: not found; use default parent review profile and inspect proof-loop package"
+    )
+    run_line = str(run_id) if run_id is not None else "none"
+    reason_line = reason.strip() if reason and reason.strip() else "not provided"
+    workspace = (
+        f"dir:{blocked_task.workspace_path}"
+        if blocked_task.workspace_kind == "dir" and blocked_task.workspace_path else
+        blocked_task.workspace_kind
+    )
+    return (
+        "# Parent/default triage for blocked Kanban task\n\n"
+        "This card was created synchronously by the Kanban on-block hook. "
+        "It is a concrete recovery action for one already-blocked task, not a board poll.\n\n"
+        f"Blocked task: {blocked_task.id}\n"
+        f"Blocked title: {blocked_task.title}\n"
+        f"Blocked assignee: {blocked_task.assignee or 'unassigned'}\n"
+        f"Blocked run id: {run_line}\n"
+        f"Blocked event id: {block_event_id}\n"
+        f"Block reason: {reason_line}\n"
+        f"Workspace: {workspace}\n"
+        f"Tenant: {blocked_task.tenant or 'none'}\n"
+        f"{review_line}\n\n"
+        "Required parent triage protocol:\n"
+        "1. Show/read the blocked card, comments, run history, and events.\n"
+        "2. Read the proof-loop slice/package artifacts referenced by that card.\n"
+        "3. Reproduce or falsify the blocker locally with behavior/code-execution evidence when possible.\n"
+        "4. Classify exactly one: FALSE_BLOCKER, PLAN_OR_PROOF_REPAIR, REAL_ENGINEERING_BLOCKER, REAL_USER_DECISION.\n"
+        "5. Unblock with concrete next instructions, repair/re-baseline/create a follow-up card, or escalate to the user only for a real external decision.\n\n"
+        "Do not archive this card as acceptance. Do not ask the user before local verification unless the missing input is external.\n"
+    )
+
+
+def _insert_on_block_parent_triage_locked(
+    conn: sqlite3.Connection,
+    *,
+    blocked_task: Task,
+    reason: Optional[str],
+    run_id: Optional[int],
+    block_event_id: int,
+) -> Optional[str]:
+    """Create the idempotent parent/default triage card for a proof-loop block.
+
+    pre: caller holds write_txn(conn)
+    post[conn]: creates at most one ready, unparented triage task for block_event_id
+    post[conn]: appends parent_triage_created to the blocked task when a card exists
+    post: returns triage task id, or None when blocked_task is not an eligible proof-loop phase
+    raises: sqlite3.Error when DB writes fail; the caller transaction rolls back
+    """
+    if not _is_proof_loop_phase_task(blocked_task):
+        return None
+
+    review_gate = _review_gate_for_phase_locked(conn, blocked_task)
+    assignee = (review_gate.assignee if review_gate and review_gate.assignee else "default")
+    workspace_kind = blocked_task.workspace_kind
+    workspace_path = blocked_task.workspace_path
+    tenant = blocked_task.tenant
+    priority = int(blocked_task.priority or 0) + 10
+    idem = f"{ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX}{blocked_task.id}:event:{block_event_id}"
+
+    existing = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idem,),
+    ).fetchone()
+    if existing:
+        triage_id = existing["id"]
+    else:
+        body = _on_block_parent_triage_body(
+            blocked_task=blocked_task,
+            reason=reason,
+            run_id=run_id,
+            block_event_id=block_event_id,
+            review_gate=review_gate,
+        )
+        now = int(time.time())
+        skills = json.dumps([PROOF_LOOP_SKILL])
+        title = f"[parent triage] blocked {blocked_task.id}: {blocked_task.title}"
+        for attempt in range(2):
+            triage_id = _new_task_id()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO tasks (
+                        id, title, body, assignee, status, priority,
+                        created_by, created_at, workspace_kind, workspace_path,
+                        tenant, idempotency_key, max_runtime_seconds, skills,
+                        max_retries
+                    ) VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        triage_id,
+                        title[:240],
+                        body,
+                        _canonical_assignee(assignee),
+                        priority,
+                        ON_BLOCK_PARENT_TRIAGE_CREATED_BY,
+                        now,
+                        workspace_kind,
+                        workspace_path,
+                        tenant,
+                        idem,
+                        ON_BLOCK_PARENT_TRIAGE_MAX_RUNTIME_SECONDS,
+                        skills,
+                    ),
+                )
+                _append_event(
+                    conn,
+                    triage_id,
+                    "created",
+                    {
+                        "assignee": _canonical_assignee(assignee),
+                        "status": "ready",
+                        "parents": [],
+                        "tenant": tenant,
+                        "skills": [PROOF_LOOP_SKILL],
+                        "source": "on_block_parent_triage",
+                        "blocked_task_id": blocked_task.id,
+                        "blocked_event_id": block_event_id,
+                    },
+                )
+                break
+            except sqlite3.IntegrityError:
+                if attempt == 1:
+                    raise
+                continue
+        else:
+            raise RuntimeError("unreachable")
+
+    _append_event(
+        conn,
+        blocked_task.id,
+        "parent_triage_created",
+        {
+            "triage_task_id": triage_id,
+            "blocked_event_id": block_event_id,
+            "review_gate_task_id": review_gate.id if review_gate else None,
+            "assignee": _canonical_assignee(assignee),
+        },
+        run_id=run_id,
+    )
+    return triage_id
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2588,7 +2800,13 @@ def block_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running -> blocked``."""
+    """Transition ``running|ready`` to blocked and enqueue proof-loop triage.
+
+    post[conn]: blocked proof-loop phase cards synchronously get one ready,
+        unparented parent-triage card for the exact block event
+    post[conn]: non-proof-loop cards and parent-review gates are only blocked
+    raises: sqlite3.Error when the atomic block+triage transaction cannot commit
+    """
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -2632,7 +2850,22 @@ def block_task(
                 outcome="blocked",
                 summary=reason,
             )
-        _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
+        block_event_id = _append_event(
+            conn,
+            task_id,
+            "blocked",
+            {"reason": reason},
+            run_id=run_id,
+        )
+        blocked_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if blocked_row:
+            _insert_on_block_parent_triage_locked(
+                conn,
+                blocked_task=Task.from_row(blocked_row),
+                reason=reason,
+                run_id=run_id,
+                block_event_id=block_event_id,
+            )
         return True
 
 
