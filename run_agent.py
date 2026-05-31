@@ -6835,12 +6835,47 @@ class AIAgent:
                                 sum(len(p) for p in self._codex_streamed_text_parts),
                                 self._client_log_context(),
                             )
-                    final_response = stream.get_final_response()
+                    try:
+                        final_response = stream.get_final_response()
+                    except TypeError:
+                        # SDK get_final_response() can crash with
+                        # 'NoneType' object is not iterable when the
+                        # backend returns response.output=None. Recover
+                        # by synthesizing from collected stream events.
+                        logger.warning(
+                            "Codex stream: get_final_response() raised TypeError "
+                            "(likely response.output=None). "
+                            "Synthesizing response from %d collected items / %d deltas. %s",
+                            len(collected_output_items),
+                            sum(len(p) for p in self._codex_streamed_text_parts),
+                            self._client_log_context(),
+                        )
+                        final_response = SimpleNamespace(
+                            output=None,
+                            status="completed",
+                            model=api_kwargs.get("model", "?"),
+                            id="synthetic",
+                        )
                     # PATCH: ChatGPT Codex backend streams valid output items
-                    # but get_final_response() can return an empty output list.
-                    # Backfill from collected items or synthesize from deltas.
+                    # but get_final_response() can return an empty output list
+                    # or output=None (SDK version-dependent). Backfill from
+                    # collected items or synthesize from stream deltas.
                     _out = getattr(final_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    _output_missing = (_out is None) or (isinstance(_out, list) and not _out)
+                    if _output_missing:
+                        _model = getattr(final_response, "model", None) or "?"
+                        _req_id = getattr(final_response, "id", None) or "?"
+                        if _out is None:
+                            logger.warning(
+                                "Codex stream: get_final_response().output is None "
+                                "(model=%s request_id=%s). Backfilling from stream events.",
+                                _model, _req_id,
+                            )
+                        else:
+                            logger.debug(
+                                "Codex stream: get_final_response().output is empty list. "
+                                "Backfilling from stream events.",
+                            )
                         if collected_output_items:
                             final_response.output = list(collected_output_items)
                             logger.debug(
@@ -6859,6 +6894,24 @@ class AIAgent:
                                 "Codex stream: synthesized output from %d text deltas (%d chars)",
                                 len(self._codex_streamed_text_parts), len(assembled),
                             )
+                        else:
+                            # No collected output items and no streamed text
+                            # deltas.  Backend returned terminal events but the
+                            # SDK produced output=None with zero usable stream
+                            # content.  Synthesize a graceful empty message so
+                            # downstream code never iterates over None.
+                            logger.warning(
+                                "Codex stream: output is None/empty and no stream "
+                                "events to backfill from (model=%s request_id=%s). "
+                                "Synthesizing graceful empty output.",
+                                _model, _req_id,
+                            )
+                            final_response.output = [SimpleNamespace(
+                                type="message",
+                                role="assistant",
+                                status="completed",
+                                content=[SimpleNamespace(type="output_text", text="")],
+                            )]
                     return final_response
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
@@ -6894,6 +6947,49 @@ class AIAgent:
                     )
                     return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
                 raise
+            except TypeError:
+                # Codex backend can return response.output=None which
+                # causes 'NoneType' object is not iterable inside the
+                # SDK. Recover by synthesizing from collected events.
+                logger.warning(
+                    "Codex Responses stream raised TypeError "
+                    "(likely response.output=None). "
+                    "Recovering from %d collected items / %d deltas. %s",
+                    len(collected_output_items),
+                    sum(len(p) for p in self._codex_streamed_text_parts),
+                    self._client_log_context(),
+                )
+                final_response = SimpleNamespace(
+                    output=None,
+                    status="completed",
+                    model=api_kwargs.get("model", "?"),
+                    id="synthetic",
+                )
+                # Backfill from collected events (same logic as below)
+                _out = getattr(final_response, "output", None)
+                _output_missing = (_out is None) or (isinstance(_out, list) and not _out)
+                if _output_missing:
+                    if collected_output_items:
+                        final_response.output = list(collected_output_items)
+                    elif self._codex_streamed_text_parts and not has_tool_calls:
+                        assembled = "".join(self._codex_streamed_text_parts)
+                        final_response.output = [SimpleNamespace(
+                            type="message", role="assistant", status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )]
+                    else:
+                        # Zero stream content available — synthesize graceful
+                        # empty output so callers never iterate over None.
+                        logger.warning(
+                            "Codex stream TypeError recovery: no stream events "
+                            "to backfill from. Synthesizing graceful empty output. %s",
+                            self._client_log_context(),
+                        )
+                        final_response.output = [SimpleNamespace(
+                            type="message", role="assistant", status="completed",
+                            content=[SimpleNamespace(type="output_text", text="")],
+                        )]
+                return final_response
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Fallback path for stream completion edge cases on Codex-style Responses backends."""
@@ -6905,6 +7001,19 @@ class AIAgent:
 
         # Compatibility shim for mocks or providers that still return a concrete response.
         if hasattr(stream_or_response, "output"):
+            # Guard: if the concrete response has output=None (Codex backend
+            # edge case), synthesize graceful empty output instead of
+            # returning it raw — downstream code iterates over .output.
+            _out = getattr(stream_or_response, "output", None)
+            if _out is None or (isinstance(_out, list) and not _out):
+                logger.warning(
+                    "Codex fallback: concrete response has empty/None output. "
+                    "Synthesizing graceful empty output item."
+                )
+                stream_or_response.output = [SimpleNamespace(
+                    type="message", role="assistant", status="completed",
+                    content=[SimpleNamespace(type="output_text", text="")],
+                )]
             return stream_or_response
         if not hasattr(stream_or_response, "__iter__"):
             return stream_or_response
@@ -6940,9 +7049,18 @@ class AIAgent:
                 if terminal_response is None and isinstance(event, dict):
                     terminal_response = event.get("response")
                 if terminal_response is not None:
-                    # Backfill empty output from collected stream events
+                    # Backfill empty/None output from collected stream events
                     _out = getattr(terminal_response, "output", None)
-                    if isinstance(_out, list) and not _out:
+                    _output_missing = (_out is None) or (isinstance(_out, list) and not _out)
+                    if _output_missing:
+                        _model = getattr(terminal_response, "model", None) or "?"
+                        _req_id = getattr(terminal_response, "id", None) or "?"
+                        if _out is None:
+                            logger.warning(
+                                "Codex fallback stream: terminal response.output is None "
+                                "(model=%s request_id=%s). Backfilling from stream events.",
+                                _model, _req_id,
+                            )
                         if collected_output_items:
                             terminal_response.output = list(collected_output_items)
                             logger.debug(
@@ -12458,7 +12576,14 @@ class AIAgent:
                     if self._force_ascii_payload:
                         _sanitize_structure_non_ascii(api_kwargs)
                     if self.api_mode == "codex_responses":
-                        api_kwargs = self._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
+                        # Validate Codex API kwargs.  The main Codex path uses
+                        # client.responses.stream() which handles streaming
+                        # internally — do NOT force stream=True in kwargs
+                        # because the chatgpt.com backend returns zero text
+                        # deltas when stream=True is present in the JSON body.
+                        api_kwargs = self._get_transport().preflight_kwargs(
+                            api_kwargs, allow_stream=False,
+                        )
 
                     try:
                         from hermes_cli.plugins import invoke_hook as _invoke_hook

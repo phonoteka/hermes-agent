@@ -1768,3 +1768,118 @@ def test_preflight_codex_input_deduplicates_reasoning_ids(monkeypatch):
     # IDs must be stripped — with store=False the API 404s on id lookups.
     for it in reasoning_items:
         assert "id" not in it
+
+def test_normalize_codex_response_output_none_no_output_text_graceful(monkeypatch):
+    """Regression: _normalize_codex_response must not raise RuntimeError
+    when response.output is None and output_text is also None/empty.
+    Instead it should synthesize a graceful empty output item."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    response = SimpleNamespace(
+        output=None,
+        output_text=None,
+        usage=None,
+        status="completed",
+        model="gpt-5-codex",
+        id="req-graceful-1",
+    )
+
+    # Must not raise — graceful empty synthesis
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "stop"
+    assert assistant_message.content == ""
+    assert assistant_message.tool_calls == []
+
+
+def test_normalize_codex_response_output_none_empty_output_text_graceful(monkeypatch):
+    """Regression: _normalize_codex_response must gracefully handle
+    output=None with empty-string output_text (not just None)."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    response = SimpleNamespace(
+        output=None,
+        output_text="",
+        usage=None,
+        status="completed",
+        model="gpt-5-codex",
+        id="req-graceful-2",
+    )
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+
+    assert finish_reason == "stop"
+    assert assistant_message.content == ""
+    assert assistant_message.tool_calls == []
+
+
+def test_preflight_codex_force_stream_auto_adds_when_absent(monkeypatch):
+    """force_stream=True must auto-add stream=True when the kwarg is absent,
+    not reject the request. The main Codex path uses client.responses.stream()
+    which does not set stream=True in kwargs."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+
+    kwargs = {
+        "model": "gpt-5-codex",
+        "instructions": "You are helpful.",
+        "input": [{"role": "user", "content": "hello"}],
+    }
+    result = _preflight_codex_api_kwargs(kwargs, force_stream=True)
+
+    assert result["stream"] is True
+
+
+def test_preflight_codex_force_stream_rejects_explicit_false(monkeypatch):
+    """force_stream=True must reject requests with stream=False explicitly set."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    import pytest
+
+    kwargs = {
+        "model": "gpt-5-codex",
+        "instructions": "You are helpful.",
+        "input": [{"role": "user", "content": "hello"}],
+        "stream": False,
+    }
+    with pytest.raises(ValueError, match="requires stream=True"):
+        _preflight_codex_api_kwargs(kwargs, force_stream=True)
+
+
+def test_preflight_codex_force_stream_accepts_explicit_true(monkeypatch):
+    """force_stream=True must accept stream=True when explicitly set."""
+    agent = _build_agent(monkeypatch)
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+
+    kwargs = {
+        "model": "gpt-5-codex",
+        "instructions": "You are helpful.",
+        "input": [{"role": "user", "content": "hello"}],
+        "stream": True,
+    }
+    result = _preflight_codex_api_kwargs(kwargs, force_stream=True)
+
+    assert result["stream"] is True
+
+def test_run_codex_create_stream_fallback_guards_output_none(monkeypatch):
+    """Regression: _run_codex_create_stream_fallback must not return
+    a concrete response with output=None — it must synthesize graceful empty."""
+    agent = _build_agent(monkeypatch)
+
+    from types import SimpleNamespace
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    # Simulate what the fallback would return: a concrete response with output=None
+    fake_response = SimpleNamespace(
+        output=None,
+        status="completed",
+        model="gpt-5-codex",
+        id="fallback-test-1",
+    )
+
+    # The normalizer must synthesize graceful empty, not raise RuntimeError
+    assistant_message, finish_reason = _normalize_codex_response(fake_response)
+    assert finish_reason == "stop"
+    assert assistant_message.content == ""

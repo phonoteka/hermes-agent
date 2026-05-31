@@ -104,6 +104,8 @@ PROOF_LOOP_SKILL = "repo-task-proof-loop-hermes"
 ON_BLOCK_PARENT_TRIAGE_CREATED_BY = "kanban:on-block-parent-triage"
 ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX = "kanban:on-block-parent-triage:"
 ON_BLOCK_PARENT_TRIAGE_MAX_RUNTIME_SECONDS = 30 * 60
+ON_BLOCK_PARENT_TRIAGE_RESOLVER_VERSION = "v1"
+ON_BLOCK_PARENT_TRIAGE_ALLOWED_ACTIONS = ("complete", "unblock")
 
 
 # Worker-context caps so build_worker_context() stays bounded on
@@ -1249,6 +1251,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    created_event_extra: Optional[dict[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -1273,8 +1276,14 @@ def create_task(
     ``kanban-worker``. Use this to pin a task to a specialist skill
     (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``created_event_extra`` lets trusted internal callers add narrow,
+    structured metadata to the immutable ``created`` event without
+    overriding canonical fields such as assignee/status/parents.
     """
     assignee = _canonical_assignee(assignee)
+    if created_event_extra is not None and not isinstance(created_event_extra, dict):
+        raise ValueError("created_event_extra must be a dict when provided")
     if not title or not title.strip():
         raise ValueError("title is required")
     if workspace_kind not in VALID_WORKSPACE_KINDS:
@@ -1408,17 +1417,24 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                created_payload = {
+                    "assignee": assignee,
+                    "status": initial_status,
+                    "parents": list(parents),
+                    "tenant": tenant,
+                    "skills": list(skills_list) if skills_list else None,
+                }
+                if created_event_extra:
+                    # Trusted internal extension point: preserve canonical
+                    # created-event fields and add only non-conflicting metadata.
+                    for key, value in created_event_extra.items():
+                        if key not in created_payload:
+                            created_payload[key] = value
                 _append_event(
                     conn,
                     task_id,
                     "created",
-                    {
-                        "assignee": assignee,
-                        "status": initial_status,
-                        "parents": list(parents),
-                        "tenant": tenant,
-                        "skills": list(skills_list) if skills_list else None,
-                    },
+                    created_payload,
                 )
             return task_id
         except sqlite3.IntegrityError:
@@ -2592,20 +2608,30 @@ def edit_completed_task_result(
 
 
 def _is_proof_loop_phase_task(task: Task) -> bool:
-    """Return whether ``task`` should trigger parent triage on block.
+    """Return whether an explicit block should create an automatic recovery card.
 
     pre: task is a hydrated Task row
-    post: returns True only for explicit proof-loop phase cards, not parent gates
-    post: returns False for triage cards to prevent recursive creation
+    post: returns False for on-block recovery cards to prevent recursive recovery chains
+    post: returns True for ordinary and proof-loop tasks (including PARENT_REVIEW gates)
     """
-    idem = task.idempotency_key or ""
+    # Never create recovery for a recovery card itself; this is the anti-recursion gate.
     if task.created_by == ON_BLOCK_PARENT_TRIAGE_CREATED_BY:
         return False
-    if not idem.startswith("proof-loop:"):
-        return False
-    if ":PARENT_REVIEW_" in idem:
-        return False
-    return PROOF_LOOP_SKILL in (task.skills or [])
+    return True
+
+
+def _proof_loop_review_phase_candidates(phase: str) -> list[str]:
+    """Return review-gate phase ids that can parent-review a worker phase.
+
+    pre: phase is the fifth segment from a proof-loop idempotency key
+    post: RED_PREP routes to VERIFY_RED and BUILD_FIX routes to VERIFY_GREEN
+    post: unknown worker phases retain the explicit PARENT_REVIEW_<phase> convention
+    """
+    if phase == "RED_PREP":
+        return ["VERIFY_RED", "PARENT_REVIEW_RED_PREP"]
+    if phase == "BUILD_FIX":
+        return ["VERIFY_GREEN", "PARENT_REVIEW_BUILD_FIX"]
+    return [f"PARENT_REVIEW_{phase}"]
 
 
 def _review_gate_for_phase_locked(
@@ -2615,7 +2641,8 @@ def _review_gate_for_phase_locked(
     """Find the parent-review gate for a proof-loop phase card.
 
     pre: task.idempotency_key follows proof-loop:<plan>:<task>:<slice>:<phase>
-    post: returns the matching non-archived PARENT_REVIEW_<phase> task when present
+    post: RED_PREP finds the materialized VERIFY_RED gate when present
+    post: BUILD_FIX finds the materialized VERIFY_GREEN gate when present
     post: returns None when the source idempotency key is not parseable or no gate exists
     """
     idem = task.idempotency_key or ""
@@ -2623,15 +2650,32 @@ def _review_gate_for_phase_locked(
     if len(parts) != 5 or parts[0] != "proof-loop":
         return None
     phase = parts[4]
-    if phase.startswith("PARENT_REVIEW_"):
+    if phase.startswith("PARENT_REVIEW_") or phase.startswith("VERIFY_"):
         return None
-    review_key = ":".join([*parts[:4], f"PARENT_REVIEW_{phase}"])
-    row = conn.execute(
-        "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
-        "ORDER BY created_at DESC LIMIT 1",
-        (review_key,),
-    ).fetchone()
-    return Task.from_row(row) if row else None
+    for review_phase in _proof_loop_review_phase_candidates(phase):
+        review_key = ":".join([*parts[:4], review_phase])
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (review_key,),
+        ).fetchone()
+        if row:
+            return Task.from_row(row)
+    return None
+
+
+def _on_block_parent_triage_fallback_assignee(blocked_task: Task) -> str:
+    """Return the resolver profile when no downstream review gate exists.
+
+    pre: blocked_task is a hydrated Kanban task
+    post: proof-loop parent gates route recovery back to their own assignee
+    post: non-proof-loop or unassigned tasks preserve the legacy default-parent route
+    """
+    idem = blocked_task.idempotency_key or ""
+    parts = idem.split(":")
+    if len(parts) == 5 and parts[0] == "proof-loop" and blocked_task.assignee:
+        return blocked_task.assignee
+    return "default"
 
 
 def _on_block_parent_triage_body(
@@ -2645,12 +2689,13 @@ def _on_block_parent_triage_body(
     """Build the runnable handoff body for an automatic parent triage card.
 
     post: body names the exact blocked card/event/run and local triage protocol
+    post: body requires parent-owned RCA and detailed worker rebriefing before redispatch
     post: body does not claim user escalation is required before verification
     """
     review_line = (
         f"Review gate: {review_gate.id} ({review_gate.title})"
         if review_gate else
-        "Review gate: not found; use default parent review profile and inspect proof-loop package"
+        "Review gate: not found; route recovery to the blocked task assignee and inspect proof-loop package"
     )
     run_line = str(run_id) if run_id is not None else "none"
     reason_line = reason.strip() if reason and reason.strip() else "not provided"
@@ -2672,14 +2717,191 @@ def _on_block_parent_triage_body(
         f"Workspace: {workspace}\n"
         f"Tenant: {blocked_task.tenant or 'none'}\n"
         f"{review_line}\n\n"
-        "Required parent triage protocol:\n"
-        "1. Show/read the blocked card, comments, run history, and events.\n"
+        "Required parent/default takeover protocol:\n"
+        "1. Show/read the blocked card, comments, run history, events, and worker session/log artifacts.\n"
         "2. Read the proof-loop slice/package artifacts referenced by that card.\n"
         "3. Reproduce or falsify the blocker locally with behavior/code-execution evidence when possible.\n"
-        "4. Classify exactly one: FALSE_BLOCKER, PLAN_OR_PROOF_REPAIR, REAL_ENGINEERING_BLOCKER, REAL_USER_DECISION.\n"
-        "5. Unblock with concrete next instructions, repair/re-baseline/create a follow-up card, or escalate to the user only for a real external decision.\n\n"
+        "4. If the worker exited, timed out, gave up, or violated protocol, do not redispatch blindly. Classify RCA first: missing instruction, stale plan, proof gap, environmental failure, worker protocol failure, or real product blocker.\n"
+        "5. If source artifacts already prove a deterministic outcome, complete/block the exact source card with structured metadata and evidence paths instead of creating another vague worker loop.\n"
+        "6. If follow-up worker work is needed, create or unblock exactly one legal next card with a detailed parent-authored brief: objective, read-first files, exact commands, artifact paths, success/failure meaning, stop/block rules, and required Kanban terminal call.\n"
+        "7. Classify exactly one: FALSE_BLOCKER, PLAN_OR_PROOF_REPAIR, REAL_ENGINEERING_BLOCKER, REAL_USER_DECISION.\n"
+        "8. Unblock with concrete next instructions, repair/re-baseline/create a follow-up card, complete with READY_WITH_CONCRETE_CONTINUATION when resolver metadata permits it, or escalate to the user only for a real external decision.\n\n"
         "Do not archive this card as acceptance. Do not ask the user before local verification unless the missing input is external.\n"
     )
+
+
+def _on_block_parent_triage_skills(blocked_task: Task, review_gate: Optional[Task]) -> list[str]:
+    """Return skills for a parent/default recovery card.
+
+    pre: blocked_task is the source task that transitioned to blocked/gave-up
+    post: includes the proof-loop skill exactly once
+    post: preserves source/review project skills so default parent triage keeps project contracts
+    """
+    skills: list[str] = [PROOF_LOOP_SKILL]
+    for source in (blocked_task.skills or [], review_gate.skills if review_gate else []):
+        if not source:
+            continue
+        for skill in source:
+            if isinstance(skill, str) and skill.strip():
+                skills.append(skill.strip())
+    return list(dict.fromkeys(skills))
+
+
+def _build_on_block_parent_triage_resolver_metadata(
+    *,
+    source_task_id: str,
+    source_event_id: int,
+    review_gate_task_id: Optional[str],
+) -> dict[str, Any]:
+    """Build resolver authority payload for on-block parent-triage routing.
+
+    pre: source_task_id starts with "t_"
+    pre: source_event_id > 0
+    pre: review_gate_task_id is None or starts with "t_"
+    post: __return__["version"] == ON_BLOCK_PARENT_TRIAGE_RESOLVER_VERSION
+    post: __return__["source_task_id"] == source_task_id
+    post: __return__["source_event_id"] == source_event_id
+    post: __return__["allowed_actions"] == list(ON_BLOCK_PARENT_TRIAGE_ALLOWED_ACTIONS)
+    post: __return__["review_gate_task_id"] == review_gate_task_id
+    post: __return__["issued_by"] == ON_BLOCK_PARENT_TRIAGE_CREATED_BY
+    """
+    if not isinstance(source_task_id, str) or not source_task_id.startswith("t_"):
+        raise ValueError("source_task_id must be a task id")
+    if int(source_event_id) <= 0:
+        raise ValueError("source_event_id must be > 0")
+    if review_gate_task_id is not None:
+        if not isinstance(review_gate_task_id, str) or not review_gate_task_id.startswith("t_"):
+            raise ValueError("review_gate_task_id must be None or a task id")
+
+    return {
+        "version": ON_BLOCK_PARENT_TRIAGE_RESOLVER_VERSION,
+        "source_task_id": source_task_id,
+        "source_event_id": int(source_event_id),
+        "allowed_actions": list(ON_BLOCK_PARENT_TRIAGE_ALLOWED_ACTIONS),
+        "review_gate_task_id": review_gate_task_id,
+        "issued_by": ON_BLOCK_PARENT_TRIAGE_CREATED_BY,
+    }
+
+
+def _validate_on_block_parent_triage_resolver_metadata(
+    resolver: Any,
+) -> Optional[dict[str, Any]]:
+    """Normalize strict resolver metadata from a candidate payload.
+
+    pre: resolver may be any decoded task-event payload fragment
+    post: returns None for malformed, forged, or authority-widening metadata
+    post: returned metadata has canonical source/action/issuer fields plus optional inheritance fields
+    """
+    if not isinstance(resolver, dict):
+        return None
+    version = resolver.get("version")
+    if version not in (ON_BLOCK_PARENT_TRIAGE_RESOLVER_VERSION, 1):
+        return None
+
+    source_task_id = resolver.get("source_task_id")
+    source_event_id = resolver.get("source_event_id")
+    review_gate_task_id = resolver.get("review_gate_task_id")
+    issued_by = resolver.get("issued_by")
+    actions = resolver.get("allowed_actions")
+
+    if not isinstance(source_task_id, str) or not source_task_id.startswith("t_"):
+        return None
+    if not isinstance(source_event_id, int) or source_event_id <= 0:
+        return None
+    if review_gate_task_id is not None and (
+        not isinstance(review_gate_task_id, str) or not review_gate_task_id.startswith("t_")
+    ):
+        return None
+    if issued_by != ON_BLOCK_PARENT_TRIAGE_CREATED_BY:
+        return None
+    if not isinstance(actions, list) or not actions:
+        return None
+    if any(action not in ON_BLOCK_PARENT_TRIAGE_ALLOWED_ACTIONS for action in actions):
+        return None
+
+    normalized: dict[str, Any] = {
+        "version": ON_BLOCK_PARENT_TRIAGE_RESOLVER_VERSION,
+        "source_task_id": source_task_id,
+        "source_event_id": source_event_id,
+        "allowed_actions": list(actions),
+        "review_gate_task_id": review_gate_task_id,
+        "issued_by": issued_by,
+    }
+    inherited_from_task_id = resolver.get("inherited_from_task_id")
+    if inherited_from_task_id is not None:
+        if not isinstance(inherited_from_task_id, str) or not inherited_from_task_id.startswith("t_"):
+            return None
+        normalized["inherited_from_task_id"] = inherited_from_task_id
+    inherited_from_event_id = resolver.get("inherited_from_event_id")
+    if inherited_from_event_id is not None:
+        if not isinstance(inherited_from_event_id, int) or inherited_from_event_id <= 0:
+            return None
+        normalized["inherited_from_event_id"] = inherited_from_event_id
+    return normalized
+
+
+def _resolver_metadata_from_event_payload(payload: Any) -> Optional[dict[str, Any]]:
+    """Extract strict resolver authority from any supported event payload shape.
+
+    pre: payload is a decoded task_events.payload value or arbitrary input
+    post: accepts current wrapped payloads and legacy direct resolver_authority events
+    post: returns None for forged or incomplete metadata
+    """
+    if not isinstance(payload, dict):
+        return None
+    wrapped = payload.get("resolver")
+    if isinstance(wrapped, dict):
+        resolver = _validate_on_block_parent_triage_resolver_metadata(wrapped)
+        if resolver is not None:
+            return resolver
+    created_extra = payload.get("resolver_authority")
+    if isinstance(created_extra, dict):
+        resolver = _validate_on_block_parent_triage_resolver_metadata(created_extra)
+        if resolver is not None:
+            return resolver
+    if payload.get("resolver") == ON_BLOCK_PARENT_TRIAGE_RESOLVER_VERSION:
+        return _validate_on_block_parent_triage_resolver_metadata({
+            "version": payload.get("resolver"),
+            "source_task_id": payload.get("source_task_id"),
+            "source_event_id": payload.get("source_event_id"),
+            "allowed_actions": payload.get("allowed_actions"),
+            "review_gate_task_id": payload.get("review_gate_task_id"),
+            "issued_by": payload.get("issued_by"),
+            "inherited_from_task_id": payload.get("inherited_from_task_id"),
+            "inherited_from_event_id": payload.get("inherited_from_event_id"),
+        })
+    return None
+
+
+def read_on_block_parent_triage_resolver_metadata(
+    payload_or_conn: Any,
+    triage_task_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Return strict resolver metadata from an event payload or task history.
+
+    pre: with one argument, payload_or_conn is a decoded task_events.payload value
+    pre: with two arguments, payload_or_conn is a sqlite connection and triage_task_id names a task
+    post: returns None for missing/invalid/incompatible resolver metadata
+    post: returned metadata always has version/source ids/allowed_actions/issuer fields
+    """
+    if triage_task_id is None:
+        return _resolver_metadata_from_event_payload(payload_or_conn)
+
+    conn = payload_or_conn
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? ORDER BY id DESC",
+        (triage_task_id,),
+    ).fetchall()
+    for event_row in row:
+        payload_raw = event_row["payload"]
+        try:
+            payload = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
+        except (TypeError, ValueError):
+            continue
+        resolver = _resolver_metadata_from_event_payload(payload)
+        if resolver is not None:
+            return resolver
+    return None
 
 
 def _copy_notify_subs_locked(
@@ -2717,24 +2939,32 @@ def _insert_on_block_parent_triage_locked(
     run_id: Optional[int],
     block_event_id: int,
 ) -> Optional[str]:
-    """Create the idempotent parent/default triage card for a proof-loop block.
+    """Create the idempotent parent/default triage card for an explicit block.
 
     pre: caller holds write_txn(conn)
     post[conn]: creates at most one ready, unparented triage task for block_event_id
     post[conn]: appends parent_triage_created to the blocked task when a card exists
-    post: returns triage task id, or None when blocked_task is not an eligible proof-loop phase
+    post: returns triage task id, or None when blocked_task is an on-block recovery card
     raises: sqlite3.Error when DB writes fail; the caller transaction rolls back
     """
     if not _is_proof_loop_phase_task(blocked_task):
         return None
 
     review_gate = _review_gate_for_phase_locked(conn, blocked_task)
-    assignee = (review_gate.assignee if review_gate and review_gate.assignee else "default")
+    assignee = (
+        review_gate.assignee
+        if review_gate and review_gate.assignee
+        else _on_block_parent_triage_fallback_assignee(blocked_task)
+    )
     workspace_kind = blocked_task.workspace_kind
     workspace_path = blocked_task.workspace_path
     tenant = blocked_task.tenant
     priority = int(blocked_task.priority or 0) + 10
-    idem = f"{ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX}{blocked_task.id}:event:{block_event_id}"
+    # Keep `source` as the 4th colon-delimited segment for test/operator parsing.
+    idem = (
+        f"{ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX}source:"
+        f"{blocked_task.id}:event:{block_event_id}"
+    )
 
     now = int(time.time())
     existing = conn.execute(
@@ -2742,6 +2972,12 @@ def _insert_on_block_parent_triage_locked(
         "ORDER BY created_at DESC LIMIT 1",
         (idem,),
     ).fetchone()
+    resolver = _build_on_block_parent_triage_resolver_metadata(
+        source_task_id=blocked_task.id,
+        source_event_id=block_event_id,
+        review_gate_task_id=review_gate.id if review_gate else None,
+    )
+
     if existing:
         triage_id = existing["id"]
     else:
@@ -2752,7 +2988,8 @@ def _insert_on_block_parent_triage_locked(
             block_event_id=block_event_id,
             review_gate=review_gate,
         )
-        skills = json.dumps([PROOF_LOOP_SKILL])
+        triage_skills = _on_block_parent_triage_skills(blocked_task, review_gate)
+        skills = json.dumps(triage_skills)
         title = f"[parent triage] blocked {blocked_task.id}: {blocked_task.title}"
         for attempt in range(2):
             triage_id = _new_task_id()
@@ -2791,12 +3028,21 @@ def _insert_on_block_parent_triage_locked(
                         "status": "ready",
                         "parents": [],
                         "tenant": tenant,
-                        "skills": [PROOF_LOOP_SKILL],
+                        "skills": triage_skills,
                         "source": "on_block_parent_triage",
                         "blocked_task_id": blocked_task.id,
                         "blocked_event_id": block_event_id,
+                        "resolver": resolver,
                     },
                 )
+                _append_event(conn, triage_id, "resolver_authority", {
+                    "resolver": ON_BLOCK_PARENT_TRIAGE_RESOLVER_VERSION,
+                    "source_task_id": blocked_task.id,
+                    "source_event_id": block_event_id,
+                    "allowed_actions": list(ON_BLOCK_PARENT_TRIAGE_ALLOWED_ACTIONS),
+                    "review_gate_task_id": review_gate.id if review_gate else None,
+                    "issued_by": ON_BLOCK_PARENT_TRIAGE_CREATED_BY,
+                })
                 break
             except sqlite3.IntegrityError:
                 if attempt == 1:
@@ -2822,6 +3068,7 @@ def _insert_on_block_parent_triage_locked(
             "review_gate_task_id": review_gate.id if review_gate else None,
             "assignee": _canonical_assignee(assignee),
             "copied_notify_subscriptions": copied_notify_subs,
+            "resolver": resolver,
         },
         run_id=run_id,
     )
@@ -2835,11 +3082,13 @@ def block_task(
     reason: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready`` to blocked and enqueue proof-loop triage.
+    """Transition ``running|ready`` to blocked and enqueue explicit-block recovery.
 
-    post[conn]: blocked proof-loop phase cards synchronously get one ready,
-        unparented parent-triage card for the exact block event
-    post[conn]: non-proof-loop cards and parent-review gates are only blocked
+    post[conn]: blocked ordinary, proof-loop phase, and parent-review cards
+        synchronously get one ready, unparented parent-triage card for the exact
+        block event
+    post[conn]: on-block recovery cards are only blocked and do not create
+        second-generation recovery cards
     raises: sqlite3.Error when the atomic block+triage transaction cannot commit
     """
     with write_txn(conn):
@@ -2902,6 +3151,129 @@ def block_task(
                 block_event_id=block_event_id,
             )
         return True
+
+
+def reconcile_orphan_blocked_tasks(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Create recovery triage cards for blocked tasks missing active recovery.
+
+    An "orphan blocked" task is a row in ``status='blocked'`` that does not have
+    an active on-block parent-triage recovery card and is not explicitly marked
+    as waiting on a real external user decision.
+
+    pre: conn points to an initialized kanban DB
+    post[conn]: each repaired orphan gets at most one parent-triage recovery card
+    post: repeated calls are idempotent (once repaired, task is skipped)
+    post: tasks with valid REAL_USER_DECISION wait markers are not repaired
+    """
+
+    def _latest_blocked_event_locked(task_id: str) -> tuple[Optional[int], Optional[str]]:
+        """Return ``(event_id, reason)`` for the newest ``blocked`` event."""
+        row = conn.execute(
+            """
+            SELECT id, payload
+              FROM task_events
+             WHERE task_id = ?
+               AND kind = 'blocked'
+             ORDER BY id DESC
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return (None, None)
+        reason: Optional[str] = None
+        payload_raw = row["payload"]
+        if payload_raw:
+            try:
+                payload_obj = json.loads(payload_raw)
+                if isinstance(payload_obj, dict):
+                    reason_value = payload_obj.get("reason")
+                    if isinstance(reason_value, str):
+                        reason = reason_value
+            except Exception:
+                reason = None
+        return (int(row["id"]), reason)
+
+    def _has_real_user_decision_marker_locked(task_id: str) -> bool:
+        """Whether task has explicit recovery metadata requiring human decision."""
+        rows = conn.execute(
+            """
+            SELECT payload
+              FROM task_events
+             WHERE task_id = ?
+               AND kind = 'blocked_waiting_user_decision'
+             ORDER BY id DESC
+            """,
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            payload_raw = row["payload"]
+            if not payload_raw:
+                continue
+            try:
+                payload_obj = json.loads(payload_raw)
+            except Exception:
+                continue
+            if not isinstance(payload_obj, dict):
+                continue
+            if payload_obj.get("classification") != "REAL_USER_DECISION":
+                continue
+            source_blocked_task_id = payload_obj.get("source_blocked_task_id")
+            source_triage_task_id = payload_obj.get("source_triage_task_id")
+            if source_blocked_task_id == task_id and source_triage_task_id:
+                return True
+        return False
+
+    repaired: list[dict[str, Any]] = []
+    with write_txn(conn):
+        blocked_rows = conn.execute(
+            """
+            SELECT *
+              FROM tasks
+             WHERE status = 'blocked'
+             ORDER BY created_at ASC
+            """
+        ).fetchall()
+        for row in blocked_rows:
+            task = Task.from_row(row)
+            if not _is_proof_loop_phase_task(task):
+                continue
+            if _has_real_user_decision_marker_locked(task.id):
+                continue
+
+            blocked_event_id, reason = _latest_blocked_event_locked(task.id)
+            if blocked_event_id is None:
+                continue
+
+            idem = (
+                f"{ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX}source:"
+                f"{task.id}:event:{blocked_event_id}"
+            )
+            existing = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (idem,),
+            ).fetchone()
+            if existing:
+                continue
+
+            triage_id = _insert_on_block_parent_triage_locked(
+                conn,
+                blocked_task=task,
+                reason=reason,
+                run_id=None,
+                block_event_id=blocked_event_id,
+            )
+            if not triage_id:
+                continue
+            repaired.append(
+                {
+                    "blocked_task_id": task.id,
+                    "triage_task_id": triage_id,
+                    "blocked_event_id": blocked_event_id,
+                }
+            )
+    return repaired
 
 
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -3223,6 +3595,22 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+def _kanban_protocol_violation_error(task_id: Optional[str] = None) -> str:
+    """Return the corrective error for workers that exit without closing their task.
+
+    pre: task_id is None or a non-empty Kanban task id
+    post: __return__ names the protocol violation and the exact terminal tools allowed
+    post: __return__ is concise enough to fit in task last_failure_error truncation
+    """
+    subject = f"Kanban task {task_id}" if task_id else "Kanban task"
+    return (
+        f"{subject} stayed running after worker exited cleanly (rc=0): protocol violation. "
+        "You must call exactly one terminal Kanban tool before final answer: "
+        "kanban_complete(summary='...', metadata={...}) if done, or "
+        "kanban_block(reason='...') if blocked. Do not only write prose/artifacts."
+    )
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -3283,26 +3671,35 @@ def _pid_alive(pid: Optional[int]) -> bool:
     """
     if not pid or pid <= 0:
         return False
+    # Linux: rely on /proc directly instead of os.kill(pid, 0).
+    # Test harnesses may guard os.kill to prevent signaling non-test
+    # processes, and /proc gives us deterministic liveness + zombie
+    # detection without signal side effects.
+    if sys.platform == "linux":
+        try:
+            with open(f"/proc/{int(pid)}/status", "r", encoding="utf-8") as f:
+                saw_state = False
+                for line in f:
+                    if line.startswith("State:"):
+                        saw_state = True
+                        # "State:\tZ (zombie)" → dead
+                        if "Z" in line.split(":", 1)[1]:
+                            return False
+                        return True
+                # /proc entry exists but State is missing/corrupt.
+                # Fail closed for dispatcher safety.
+                if not saw_state:
+                    return False
+        except (FileNotFoundError, PermissionError, OSError):
+            # proc entry gone/inaccessible → treat as dead.
+            return False
+
     from gateway.status import _pid_exists
     if not _pid_exists(int(pid)):
         return False
     # Still here → process exists. Check for zombie on platforms
     # where we have a cheap, deterministic process-state probe.
-    if sys.platform == "linux":
-        try:
-            with open(f"/proc/{int(pid)}/status", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("State:"):
-                        # "State:\tZ (zombie)" → dead
-                        if "Z" in line.split(":", 1)[1]:
-                            return False
-                        break
-        except (FileNotFoundError, PermissionError, OSError):
-            # proc entry gone → already reaped; treat as dead.
-            # PermissionError shouldn't happen for our own children but
-            # be defensive.
-            pass
-    elif sys.platform == "darwin":
+    if sys.platform == "darwin":
         try:
             proc = subprocess.run(
                 ["ps", "-o", "stat=", "-p", str(int(pid))],
@@ -3538,6 +3935,7 @@ def enforce_max_runtime(
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed},
+                source_run_id=run_id,
             )
     return timed_out
 
@@ -3582,8 +3980,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # write_txn so can't nest). ``protocol_violation`` flags the
     # clean-exit-but-still-running case so we can trip the breaker
     # immediately instead of incrementing by 1.
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, int]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, run_id)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock FROM tasks "
@@ -3606,15 +4004,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # ``kanban_complete`` / ``kanban_block``. Retrying won't
                 # help.
                 protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
-                )
+                error_text = _kanban_protocol_violation_error(row["id"])
                 event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                    "error": error_text,
                 }
             else:
                 protocol_violation = False
@@ -3651,7 +4047,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 crashed.append(row["id"])
                 crash_details.append(
                     (row["id"], pid, row["claim_lock"],
-                     protocol_violation, error_text)
+                     protocol_violation, error_text, run_id)
                 )
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
@@ -3664,7 +4060,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # human with a clear reason than to loop ``DEFAULT_FAILURE_LIMIT``
     # times first.
     auto_blocked: list[str] = []
-    for tid, pid, claimer, protocol_violation, error_text in crash_details:
+    for tid, pid, claimer, protocol_violation, error_text, run_id in crash_details:
         tripped = _record_task_failure(
             conn, tid,
             error=error_text,
@@ -3673,6 +4069,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             release_claim=False,
             end_run=False,
             event_payload_extra={"pid": pid, "claimer": claimer},
+            source_run_id=run_id,
         )
         if tripped:
             auto_blocked.append(tid)
@@ -3694,6 +4091,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    source_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -3718,6 +4116,9 @@ def _record_task_failure(
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
       ``ready → blocked`` and a ``gave_up`` event is emitted.
+
+    ``source_run_id`` carries the already-closed failing run for crash/timeout
+    paths; spawn failures derive it from the run closed by this function.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -3775,7 +4176,7 @@ def _record_task_failure(
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (failures, error[:500], task_id),
                 )
-            run_id = None
+            run_id = source_run_id
             if end_run:
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
@@ -3798,9 +4199,21 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
-            _append_event(
+            block_event_id = _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            blocked_row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if blocked_row:
+                _insert_on_block_parent_triage_locked(
+                    conn,
+                    blocked_task=Task.from_row(blocked_row),
+                    reason=error,
+                    run_id=run_id,
+                    block_event_id=block_event_id,
+                )
             blocked = True
         else:
             # Below threshold.
@@ -4004,6 +4417,12 @@ def dispatch_once(
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
     result.crashed = detect_crashed_workers(conn)
+    # Repair blocked rows that bypassed block_task() and therefore never got
+    # a parent-triage recovery card. This runs before idle/spawn decisions so
+    # a stale blocked orphan cannot keep the board silently stalled.
+    repaired_orphans = reconcile_orphan_blocked_tasks(conn)
+    if repaired_orphans:
+        return result
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.

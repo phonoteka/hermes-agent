@@ -656,7 +656,20 @@ def _preflight_codex_api_kwargs(
     api_kwargs: Any,
     *,
     allow_stream: bool = False,
+    force_stream: bool = False,
 ) -> Dict[str, Any]:
+    """Validate and normalize Codex Responses API kwargs.
+
+    pre: api_kwargs is a dict
+    post: __return__ is a normalized dict with only allowed keys
+    raises: ValueError on missing required fields or invalid values
+
+    When force_stream=True, auto-adds stream=True if absent; rejects
+    only when stream is explicitly set to a non-True value.  Required
+    for chatgpt.com/backend-api/codex to avoid None output.
+    When allow_stream=True (without force), accepts stream=True if present.
+    Otherwise, stream key is rejected.
+    """
     if not isinstance(api_kwargs, dict):
         raise ValueError("Codex Responses request must be a dict.")
 
@@ -776,7 +789,21 @@ def _preflight_codex_api_kwargs(
         if normalized_headers:
             normalized["extra_headers"] = normalized_headers
 
-    if allow_stream:
+    if force_stream:
+        stream = api_kwargs.get("stream")
+        if stream is not None and stream is not True:
+            raise ValueError(
+                "Codex backend requires stream=True. "
+                f"Got stream={stream!r}. "
+                "The chatgpt.com/backend-api/codex endpoint must always use streaming "
+                "to avoid response.output=None causing TypeError on iteration."
+            )
+        # Auto-add stream=True when absent — the main Codex path uses
+        # client.responses.stream() which handles streaming internally,
+        # but fallback/create paths need the explicit kwarg.
+        normalized["stream"] = True
+        allowed_keys.add("stream")
+    elif allow_stream:
         stream = api_kwargs.get("stream")
         if stream is not None and stream is not True:
             raise ValueError("Codex Responses 'stream' must be true when set.")
@@ -838,16 +865,40 @@ def _extract_responses_reasoning_text(item: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def _normalize_codex_response(response: Any) -> tuple[Any, str]:
-    """Normalize a Responses API object to an assistant_message-like object."""
+    """Normalize a Responses API object to an assistant_message-like object.
+
+    pre: response is not None
+    post: __return__[0] is a SimpleNamespace with content/tool_calls/...
+    post: __return__[1] is a finish_reason string
+    raises: RuntimeError when output is missing and cannot be recovered
+    """
     output = getattr(response, "output", None)
+    _model = getattr(response, "model", None) or "?"
+    _req_id = getattr(response, "id", None) or "?"
+
     if not isinstance(output, list) or not output:
-        # The Codex backend can return empty output when the answer was
+        # Distinguish None (SDK bug / backend anomaly) from empty list
+        # (stream backfill gap). None is the dangerous case that causes
+        # TypeError: 'NoneType' object is not iterable downstream.
+        if output is None:
+            logger.warning(
+                "Codex response.output is None (model=%s request_id=%s) — "
+                "this is the TypeError-prone path. Attempting output_text fallback.",
+                _model, _req_id,
+            )
+        else:
+            logger.debug(
+                "Codex response.output is empty list (model=%s request_id=%s). "
+                "Attempting output_text fallback.",
+                _model, _req_id,
+            )
+        # The Codex backend can return empty/None output when the answer was
         # delivered entirely via stream events. Check output_text as a
         # last-resort fallback before raising.
         out_text = getattr(response, "output_text", None)
         if isinstance(out_text, str) and out_text.strip():
             logger.debug(
-                "Codex response has empty output but output_text is present (%d chars); "
+                "Codex response has empty/None output but output_text is present (%d chars); "
                 "synthesizing output item.", len(out_text.strip()),
             )
             output = [SimpleNamespace(
@@ -856,7 +907,24 @@ def _normalize_codex_response(response: Any) -> tuple[Any, str]:
             )]
             response.output = output
         else:
-            raise RuntimeError("Responses API returned no output items")
+            # Backend returned no output items and no output_text.
+            # This is a known edge case with chatgpt.com/backend-api/codex
+            # when the stream closes without terminal events.  Instead of
+            # raising RuntimeError (which becomes a non-retryable crash),
+            # synthesize a graceful empty message so the agent loop can
+            # handle this as an empty-response turn.
+            logger.warning(
+                "Codex response.output is None/empty and output_text is absent "
+                "(model=%s request_id=%s status=%s). "
+                "Synthesizing graceful empty output item.",
+                _model, _req_id,
+                getattr(response, "status", None),
+            )
+            output = [SimpleNamespace(
+                type="message", role="assistant", status="completed",
+                content=[SimpleNamespace(type="output_text", text="")],
+            )]
+            response.output = output
 
     response_status = getattr(response, "status", None)
     if isinstance(response_status, str):

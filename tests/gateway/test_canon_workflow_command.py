@@ -191,13 +191,13 @@ async def test_canon_run_live_path_uses_canon_module_workflow_resolution_without
     )
 
 
-def test_solution_modeling_phase_session_uses_route_model_and_skill_tools(monkeypatch):
-    """Live solution-modeling phases must run with skill access and the Canon-selected model route.
+def test_solution_modeling_phase_session_uses_route_model_and_explicit_authorized_toolsets(monkeypatch):
+    """Live solution-modeling phases must use explicit projection-authorized toolsets.
 
-    pre: Canon phase backend projection carries modelRoute from workflow routing authority.
-    post: gateway phase session calls oneshot agent with openai-codex/gpt-5.5 and skills/file/terminal
-          toolsets, so mandatorySkills can actually be loaded by the model.
-    raises: AssertionError while phase execution still uses the ambient gateway model with no tools.
+    pre: Canon phase backend projection carries modelRoute plus allowedScopes.toolsetRefs authority.
+    post: gateway phase session calls oneshot agent with openai-codex/gpt-5.5 and exactly the authorized
+          toolsets; result includes session/checkpoint/cursor authority refs.
+    raises: AssertionError when phase execution still uses hidden hardcoded tools.
     """
 
     import hermes_cli.oneshot as oneshot
@@ -214,6 +214,7 @@ def test_solution_modeling_phase_session_uses_route_model_and_skill_tools(monkey
     session = _GatewayHermesScopedPhaseSession(
         envelope_projection={
             "modelRoute": {"provider": "openai-codex", "model": "gpt-5.5"},
+            "allowedScopes": {"toolsetRefs": ["skills", "file", "terminal"]},
             "hermesProfileId": "default",
         },
         artifacts_dir=None,
@@ -233,12 +234,91 @@ def test_solution_modeling_phase_session_uses_route_model_and_skill_tools(monkey
         "status": "succeeded",
         "output": {"ok": True},
         "agentSessionRef": "hermes-current-gateway:run-skill-route:model_solution:1",
+        "agentCheckpointRef": "hermes-current-gateway:checkpoint:run-skill-route:model_solution:1",
+        "eventCursorRefs": [
+            "hermes-current-gateway:run-skill-route:model_solution:1:events:run-skill-route:model_solution:cursor:1"
+        ],
     }
     assert captured["kwargs"]["provider"] == "openai-codex"
     assert captured["kwargs"]["model"] == "gpt-5.5"
     assert captured["kwargs"]["toolsets"] == ["skills", "file", "terminal"]
     assert captured["kwargs"]["use_config_toolsets"] is False
     assert "use skill_view to load every skill named in inputs.mandatorySkills" in captured["prompt"]
+
+
+def test_solution_modeling_phase_session_fails_closed_without_toolset_authority(monkeypatch):
+    """Tool-requiring phases must fail closed when projection omits explicit toolset authority.
+
+    pre: phase inputs require mandatory skills but envelope projection has no allowedScopes.toolsetRefs.
+    post: run_phase raises RuntimeError before calling oneshot _run_agent.
+    raises: AssertionError if hidden default toolsets are used.
+    """
+
+    import hermes_cli.oneshot as oneshot
+    from tools.canon_workflow_command import _GatewayHermesScopedPhaseSession
+
+    called = {"run_agent": False}
+
+    def fake_run_agent(prompt, **kwargs):
+        called["run_agent"] = True
+        return '{"ok": true}'
+
+    monkeypatch.setattr(oneshot, "_run_agent", fake_run_agent)
+    session = _GatewayHermesScopedPhaseSession(
+        envelope_projection={"modelRoute": {"provider": "openai-codex", "model": "gpt-5.5"}},
+        artifacts_dir=None,
+    )
+
+    with pytest.raises(RuntimeError, match="missing required allowedScopes.toolsetRefs authority"):
+        session.run_phase(
+            {
+                "runId": "run-missing-toolset-authority",
+                "phaseId": "model_solution",
+                "objective": "Produce model package.",
+                "inputs": {"mandatorySkills": ["solution-modeling-packages"]},
+                "outputSchema": {"schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}},
+            }
+        )
+
+    assert called["run_agent"] is False
+
+
+def test_phase_without_tool_requirement_runs_with_no_explicit_toolsets(monkeypatch):
+    """Phases with no explicit tool requirement may execute with no authorized toolsets.
+
+    pre: projection omits allowedScopes.toolsetRefs and inputs do not declare mandatory skills.
+    post: _run_agent is invoked with toolsets=None and use_config_toolsets=False.
+    raises: AssertionError when hidden defaults are injected.
+    """
+
+    import hermes_cli.oneshot as oneshot
+    from tools.canon_workflow_command import _GatewayHermesScopedPhaseSession
+
+    captured = {}
+
+    def fake_run_agent(prompt, **kwargs):
+        captured["kwargs"] = kwargs
+        return '{"ok": true}'
+
+    monkeypatch.setattr(oneshot, "_run_agent", fake_run_agent)
+    session = _GatewayHermesScopedPhaseSession(
+        envelope_projection={"modelRoute": {"provider": "openai-codex", "model": "gpt-5.5"}},
+        artifacts_dir=None,
+    )
+
+    result = session.run_phase(
+        {
+            "runId": "run-no-tool-requirement",
+            "phaseId": "finalize_solution",
+            "objective": "Finalize freeze metadata.",
+            "inputs": {},
+            "outputSchema": {"schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}},
+        }
+    )
+
+    assert result["status"] == "succeeded"
+    assert captured["kwargs"]["toolsets"] is None
+    assert captured["kwargs"]["use_config_toolsets"] is False
 
 
 @pytest.mark.asyncio

@@ -78,9 +78,52 @@ def test_no_idempotency_key_never_collides(kanban_home):
         conn.close()
 
 
+def test_dispatch_repairs_orphan_blocked_before_idle(
+    kanban_home,
+    all_assignees_spawnable,
+):
+    """A dispatcher tick repairs silent blocked orphans before reporting idle.
+
+    Models a stale board row that reached status='blocked' without block_task(),
+    gave_up, or a parent-triage event. dispatch_once() must reconcile that row
+    into an active recovery task even when there is no ready work to spawn.
+    """
+    with kb.connect() as conn:
+        orphan = kb.create_task(conn, title="stale blocked", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (orphan,))
+            blocked_event_id = kb._append_event(
+                conn,
+                orphan,
+                "blocked",
+                {"reason": "external stale write"},
+            )
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, ws: 999)
+
+        assert result.spawned == []
+        triages = [
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        ]
+        assert len(triages) == 1
+        triage = triages[0]
+        assert triage.status == "ready"
+        assert triage.assignee == "default"
+        assert orphan in (triage.body or "")
+        assert f"Blocked event id: {blocked_event_id}" in (triage.body or "")
+
+        orphan_events = kb.list_events(conn, orphan)
+        parent_triage_events = [e for e in orphan_events if e.kind == "parent_triage_created"]
+        assert len(parent_triage_events) == 1
+        assert parent_triage_events[0].payload["triage_task_id"] == triage.id
+        assert parent_triage_events[0].payload["blocked_event_id"] == blocked_event_id
+
+
 # ---------------------------------------------------------------------------
 # Spawn-failure circuit breaker
 # ---------------------------------------------------------------------------
+
 
 def test_spawn_failure_auto_blocks_after_limit(kanban_home, all_assignees_spawnable):
     """N consecutive spawn failures on the same task → auto_blocked."""
@@ -1134,12 +1177,43 @@ def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")
         for _ in range(5):
             kb.dispatch_once(conn, spawn_fn=_bad, failure_limit=5)
         events = kb.list_events(conn, tid)
         kinds = [e.kind for e in events]
         assert "gave_up" in kinds
         assert "spawn_auto_blocked" not in kinds
+
+        gave_up_rows = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='gave_up' ORDER BY id",
+            (tid,),
+        ).fetchall()
+        assert gave_up_rows, "expected gave_up event"
+        gave_up_payload = json.loads(gave_up_rows[-1]["payload"] or "{}")
+        assert gave_up_payload.get("trigger_outcome") == "spawn_failed"
+
+        triages = [
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        ]
+        assert len(triages) == 1
+        triage = triages[0]
+
+        triage_subs = kb.list_notify_subs(conn, triage.id)
+        assert len(triage_subs) == 1
+        assert triage_subs[0]["platform"] == "telegram"
+        assert triage_subs[0]["chat_id"] == "123"
+
+        triage_events = [e for e in events if e.kind == "parent_triage_created"]
+        assert len(triage_events) == 1
+        assert triage_events[0].payload["triage_task_id"] == triage.id
+        assert triage_events[0].payload["copied_notify_subscriptions"] == 1
+        assert triage_events[0].payload["blocked_event_id"] == gave_up_rows[-1]["id"]
+
+        latest_run = kb.latest_run(conn, tid)
+        assert latest_run is not None
+        assert f"Blocked run id: {latest_run.id}" in (triage.body or "")
     finally:
         conn.close()
 
@@ -2366,6 +2440,7 @@ def test_build_worker_context_role_history_bounded_to_5(kanban_home):
 
 @pytest.mark.skipif("linux" not in __import__("sys").platform,
                     reason="zombie detection is Linux-specific")
+@pytest.mark.live_system_guard_bypass
 def test_pid_alive_detects_zombie(kanban_home):
     """_pid_alive must return False for a zombie process.
 
@@ -3973,6 +4048,7 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="quiet", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="123")
         host_prefix = _kb._claimer_id().split(":", 1)[0]
         lock = f"{host_prefix}:mock"
         kb.claim_task(conn, tid, claimer=lock)
@@ -3999,6 +4075,13 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
         assert "kanban_complete" in (task.last_failure_error or ""), (
             f"expected protocol-violation message, got {task.last_failure_error!r}"
         )
+        assert "call exactly one terminal Kanban tool" in (task.last_failure_error or "")
+        assert "kanban_complete(summary=" in (task.last_failure_error or "")
+        assert "kanban_block(reason=" in (task.last_failure_error or "")
+
+        latest_run = kb.latest_run(conn, tid)
+        assert latest_run is not None
+        assert "call exactly one terminal Kanban tool" in (latest_run.error or "")
 
         events = kb.list_events(conn, tid)
         kinds = [e.kind for e in events]
@@ -4013,6 +4096,36 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
         assert "gave_up" in kinds, (
             f"breaker should trip, expected 'gave_up' event, got {kinds}"
         )
+
+        gave_up_rows = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind='gave_up' ORDER BY id",
+            (tid,),
+        ).fetchall()
+        assert gave_up_rows, "expected gave_up event"
+        gave_up_payload = json.loads(gave_up_rows[-1]["payload"] or "{}")
+        assert gave_up_payload.get("trigger_outcome") == "crashed"
+
+        triages = [
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        ]
+        assert len(triages) == 1
+        triage = triages[0]
+
+        triage_subs = kb.list_notify_subs(conn, triage.id)
+        assert len(triage_subs) == 1
+        assert triage_subs[0]["platform"] == "telegram"
+        assert triage_subs[0]["chat_id"] == "123"
+
+        triage_events = [e for e in events if e.kind == "parent_triage_created"]
+        assert len(triage_events) == 1
+        assert triage_events[0].payload["triage_task_id"] == triage.id
+        assert triage_events[0].payload["copied_notify_subscriptions"] == 1
+        assert triage_events[0].payload["blocked_event_id"] == gave_up_rows[-1]["id"]
+
+        latest_run = kb.latest_run(conn, tid)
+        assert latest_run is not None
+        assert f"Blocked run id: {latest_run.id}" in (triage.body or "")
     finally:
         conn.close()
 

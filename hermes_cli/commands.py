@@ -171,6 +171,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("list", "ls", "show", "create", "assign", "link", "unlink",
                             "claim", "comment", "complete", "block", "unblock", "archive",
                             "tail", "dispatch", "context", "init", "gc")),
+    CommandDef("canon", "Run Canon operator commands (/canon run|latest|inspect)", "Tools & Skills",
+               gateway_only=True, args_hint="<run|latest|inspect ...>"),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",

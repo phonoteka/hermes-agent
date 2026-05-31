@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from tools.registry import registry, tool_error
 
@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+READY_WITH_CONCRETE_CONTINUATION = "READY_WITH_CONCRETE_CONTINUATION"
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -87,35 +88,73 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
-def _worker_parent_triage_source_task_id(kb, conn, triage_task_id: str) -> Optional[str]:
-    """Return the blocked source task this dispatcher worker may repair.
+def _resolver_source_event_exists(conn, *, source_id: str, source_event_id: int) -> bool:
+    """Return whether resolver metadata points at a real event on the source.
+
+    pre: source_id is a task id candidate from structured resolver metadata.
+    pre: source_event_id is a positive integer candidate from structured resolver metadata.
+    post: returns True only when the event id belongs to source_id.
+
+    The source's current ``blocked`` state is the authorization boundary; the
+    source event is provenance. Do not couple this check to one event kind,
+    because Kanban core can route several transitions into the same blocked
+    recovery state (explicit block, gave_up/protocol violation, timeout, etc.).
+    """
+    row = conn.execute(
+        "SELECT id FROM task_events WHERE id = ? AND task_id = ?",
+        (source_event_id, source_id),
+    ).fetchone()
+    return row is not None
+
+
+def _worker_parent_triage_source_task_id(
+    kb,
+    conn,
+    triage_task_id: str,
+    *,
+    action: Optional[str] = None,
+) -> Optional[str]:
+    """Return source task id only when structured resolver metadata authorizes it.
 
     pre: triage_task_id is the current HERMES_KANBAN_TASK value
-    post: returns a task id only for kernel-created on-block parent triage cards
-    post: returns None for ordinary workers, forged cards, non-proof-loop tasks, or non-blocked sources
+    pre: action is None for generic gating checks, or one of complete/unblock
+    post: returns source task id only for kernel-emitted structured metadata
+    post: returns None for ordinary workers, forged cards, malformed payloads,
+          non-proof-loop sources, sources not currently blocked, or disallowed actions
     """
-    triage_task = kb.get_task(conn, triage_task_id)
-    if triage_task is None:
+    read_meta = getattr(kb, "read_on_block_parent_triage_resolver_metadata", None)
+    if not callable(read_meta):
         return None
-    created_by = getattr(kb, "ON_BLOCK_PARENT_TRIAGE_CREATED_BY", "kanban:on-block-parent-triage")
-    if triage_task.created_by != created_by:
+    resolver = read_meta(conn, triage_task_id)
+    if not isinstance(resolver, dict):
         return None
-    prefix = getattr(
-        kb,
-        "ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX",
-        "kanban:on-block-parent-triage:",
-    )
-    idem = triage_task.idempotency_key or ""
-    if not idem.startswith(prefix) or ":event:" not in idem:
+
+    source_id = resolver.get("source_task_id")
+    if not isinstance(source_id, str) or not source_id.startswith("t_"):
         return None
-    source_id = idem[len(prefix):].split(":event:", 1)[0]
-    if not source_id.startswith("t_"):
+
+    allowed_actions = resolver.get("allowed_actions")
+    if not isinstance(allowed_actions, list) or not all(isinstance(x, str) for x in allowed_actions):
         return None
+    allowed = {x.strip() for x in allowed_actions if x and x.strip()}
+    if action in {"complete", "unblock"} and action not in allowed:
+        return None
+
     source = kb.get_task(conn, source_id)
     if source is None or source.status != "blocked":
         return None
     is_phase = getattr(kb, "_is_proof_loop_phase_task", lambda _task: False)
     if not is_phase(source):
+        return None
+
+    source_event_id = resolver.get("source_event_id")
+    if not isinstance(source_event_id, int):
+        return None
+    if not _resolver_source_event_exists(
+        conn,
+        source_id=source_id,
+        source_event_id=source_event_id,
+    ):
         return None
     return source_id
 
@@ -133,7 +172,12 @@ def _check_kanban_unblock_mode() -> bool:
     try:
         kb, conn = _connect()
         try:
-            return _worker_parent_triage_source_task_id(kb, conn, env_tid) is not None
+            return _worker_parent_triage_source_task_id(
+                kb,
+                conn,
+                env_tid,
+                action="unblock",
+            ) is not None
         finally:
             conn.close()
     except Exception:
@@ -177,9 +221,9 @@ def _enforce_worker_task_ownership(
     A process spawned by the dispatcher has ``HERMES_KANBAN_TASK`` set
     to its own task id. Lifecycle tools mutate run state, so ordinary
     workers may only mutate that one task. Kernel-created on-block parent
-    triage cards are a narrow exception: they may complete or unblock the
-    exact blocked source card encoded in their idempotency key after local
-    verification. Sibling or forged task ids still fail closed.
+    triage cards are a narrow exception: they may complete or unblock only the
+    exact blocked source card named by Kanban-core structured resolver metadata
+    after local verification. Sibling or forged task ids still fail closed.
 
     Orchestrator profiles (kanban toolset enabled but **no**
     ``HERMES_KANBAN_TASK`` in env) aren't subject to this check — their
@@ -196,7 +240,12 @@ def _enforce_worker_task_ownership(
         return None
     if tid != env_tid:
         if action in {"complete", "unblock"} and kb is not None and conn is not None:
-            source_id = _worker_parent_triage_source_task_id(kb, conn, env_tid)
+            source_id = _worker_parent_triage_source_task_id(
+                kb,
+                conn,
+                env_tid,
+                action=action,
+            )
             if source_id == tid:
                 return None
         return tool_error(
@@ -463,6 +512,19 @@ def _handle_complete(args: dict, **kw) -> str:
             )
             if ownership_err:
                 return ownership_err
+            release_context: Optional[dict[str, Any]] = None
+            release_err: Optional[str] = None
+            if os.environ.get("HERMES_KANBAN_TASK") == tid:
+                release_context, release_err = _prepare_source_gate_release(
+                    kb,
+                    conn,
+                    repair_task_id=tid,
+                    result=result,
+                    metadata=metadata,
+                    created_cards=created_cards,
+                )
+                if release_err:
+                    return release_err
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -494,8 +556,25 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
+            source_gate_payload: dict[str, Any] = {}
+            if release_context is not None:
+                source_gate_payload, release_err = _complete_source_gate_and_dispatch(
+                    kb,
+                    conn,
+                    repair_task_id=tid,
+                    source_task_id=release_context["source_task_id"],
+                    continuation_task_ids=release_context["continuation_task_ids"],
+                    summary=summary,
+                    metadata=metadata,
+                )
+                if release_err:
+                    return release_err
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                **source_gate_payload,
+            )
         finally:
             conn.close()
     except Exception as e:
@@ -619,6 +698,277 @@ def _handle_comment(args: dict, **kw) -> str:
         return tool_error(f"kanban_comment: {e}")
 
 
+def _completion_requests_source_gate_release(
+    *,
+    result: Any,
+    metadata: Any,
+) -> bool:
+    """Return whether completion requests automatic source-gate release.
+
+    pre: result and metadata are raw kanban_complete arguments
+    post: returns True only for the exact READY_WITH_CONCRETE_CONTINUATION token
+    """
+    if result == READY_WITH_CONCRETE_CONTINUATION:
+        return True
+    if isinstance(metadata, dict) and metadata.get("result") == READY_WITH_CONCRETE_CONTINUATION:
+        return True
+    return False
+
+
+def _extract_concrete_continuation_task_ids(
+    *,
+    metadata: Any,
+    created_cards: Optional[Iterable[str]],
+) -> tuple[list[str], Optional[str]]:
+    """Extract and normalize source-gate continuation ids from completion data.
+
+    pre: metadata is None or the already type-checked kanban_complete metadata dict
+    pre: created_cards is None or a normalized iterable of task-id strings
+    post: returns non-empty task ids only when the completion names concrete continuations
+    post: returns an error string when the READY_WITH_CONCRETE_CONTINUATION contract is ambiguous
+    """
+    raw_ids: Any = None
+    if isinstance(metadata, dict):
+        if metadata.get("continuation_task_id") is not None:
+            raw_ids = [metadata.get("continuation_task_id")]
+        elif metadata.get("continuation_task_ids") is not None:
+            raw_ids = metadata.get("continuation_task_ids")
+    if raw_ids is None and created_cards:
+        raw_ids = list(created_cards)
+    if not isinstance(raw_ids, list):
+        return [], tool_error(
+            "READY_WITH_CONCRETE_CONTINUATION requires metadata.continuation_task_id "
+            "or metadata.continuation_task_ids (or created_cards)"
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_id in raw_ids:
+        if not isinstance(raw_id, str):
+            return [], tool_error("continuation task ids must be strings")
+        tid = raw_id.strip()
+        if not tid or not tid.startswith("t_"):
+            return [], tool_error("continuation task ids must be Kanban task ids")
+        if tid not in seen:
+            seen.add(tid)
+            normalized.append(tid)
+    if not normalized:
+        return [], tool_error("READY_WITH_CONCRETE_CONTINUATION requires at least one continuation task id")
+    return normalized, None
+
+
+def _validate_source_gate_continuations(
+    kb,
+    conn,
+    *,
+    source_task_id: str,
+    continuation_task_ids: list[str],
+) -> Optional[str]:
+    """Fail closed unless every continuation is a pending child of the source gate.
+
+    pre: source_task_id starts with "t_"
+    pre: continuation_task_ids is non-empty and normalized
+    post: returns None only when all continuations exist and are source-gated
+    """
+    for continuation_id in continuation_task_ids:
+        task = kb.get_task(conn, continuation_id)
+        if task is None:
+            return tool_error(f"continuation task {continuation_id} does not exist")
+        if task.status not in {"todo", "ready"}:
+            return tool_error(
+                f"continuation task {continuation_id} must be todo/ready, got {task.status}"
+            )
+        linked = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ? LIMIT 1",
+            (source_task_id, continuation_id),
+        ).fetchone()
+        if linked is None:
+            return tool_error(
+                f"continuation task {continuation_id} is not gated by source task {source_task_id}"
+            )
+    return None
+
+
+def _prepare_source_gate_release(
+    kb,
+    conn,
+    *,
+    repair_task_id: str,
+    result: Any,
+    metadata: Any,
+    created_cards: Optional[Iterable[str]],
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Validate READY_WITH_CONCRETE_CONTINUATION before any task is completed.
+
+    pre: repair_task_id is the current scoped worker task id
+    post: returns release context when the exact READY token is present
+    post: returns (None, None) for ordinary completions
+    post: returns (None, error_string) for ambiguous or unauthorized READY completions
+    """
+    if not _completion_requests_source_gate_release(result=result, metadata=metadata):
+        return None, None
+
+    source_task_id = _worker_parent_triage_source_task_id(
+        kb,
+        conn,
+        repair_task_id,
+        action="complete",
+    )
+    if source_task_id is None:
+        return None, tool_error(
+            "READY_WITH_CONCRETE_CONTINUATION requires resolver authority to complete "
+            "one blocked source gate"
+        )
+
+    continuation_task_ids, err = _extract_concrete_continuation_task_ids(
+        metadata=metadata,
+        created_cards=created_cards,
+    )
+    if err:
+        return None, err
+    err = _validate_source_gate_continuations(
+        kb,
+        conn,
+        source_task_id=source_task_id,
+        continuation_task_ids=continuation_task_ids,
+    )
+    if err:
+        return None, err
+    return {
+        "source_task_id": source_task_id,
+        "continuation_task_ids": continuation_task_ids,
+    }, None
+
+
+def _complete_source_gate_and_dispatch(
+    kb,
+    conn,
+    *,
+    repair_task_id: str,
+    source_task_id: str,
+    continuation_task_ids: list[str],
+    summary: Optional[str],
+    metadata: Optional[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Complete a resolver source gate and run one dispatcher tick.
+
+    pre: repair_task_id is already completed successfully
+    pre: source_task_id is the blocked resolver source gate
+    pre: continuation_task_ids name validated source-gated continuation tasks
+    post[conn]: source_task_id is done and dependents have been recomputed
+    post: dispatch_once has been invoked once after source completion
+    """
+    source_summary = (
+        f"{READY_WITH_CONCRETE_CONTINUATION}: resolver repair {repair_task_id} "
+        "provided concrete continuation "
+        + ", ".join(continuation_task_ids)
+    )
+    if summary:
+        source_summary = f"{source_summary}. Repair summary: {str(summary).strip()}"
+    source_metadata: dict[str, Any] = {
+        "classification": READY_WITH_CONCRETE_CONTINUATION,
+        "resolved_by_task_id": repair_task_id,
+        "continuation_task_ids": continuation_task_ids,
+    }
+    if metadata:
+        source_metadata["repair_metadata"] = metadata
+
+    if not kb.complete_task(
+        conn,
+        source_task_id,
+        result=READY_WITH_CONCRETE_CONTINUATION,
+        summary=source_summary,
+        metadata=source_metadata,
+    ):
+        return None, tool_error(f"could not complete source gate {source_task_id}")
+
+    dispatch_result = kb.dispatch_once(conn, max_spawn=1)
+    dispatch_payload = {
+        "source_gate_completed": True,
+        "source_task_id": source_task_id,
+        "continuation_task_ids": continuation_task_ids,
+        "dispatch_spawned": getattr(dispatch_result, "spawned", []),
+        "dispatch_promoted": getattr(dispatch_result, "promoted", 0),
+    }
+    return dispatch_payload, None
+
+
+def _build_inherited_resolver_authority(
+    kb,
+    conn,
+    *,
+    parent_task_id: str,
+    request: Any,
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Validate and derive resolver authority for a follow-up child card.
+
+    pre: parent_task_id is the current scoped worker task id
+    pre: request is either None or a dict with source_task_id + allowed_actions
+    post: returns (metadata, None) when inheritance is explicitly authorized
+    post: returns (None, error_string) on malformed, forged, or widened requests
+    """
+    if request is None:
+        return None, None
+    if not isinstance(request, dict):
+        return None, tool_error("inherit_parent_resolver_authority must be an object")
+
+    read_meta = getattr(kb, "read_on_block_parent_triage_resolver_metadata", None)
+    if not callable(read_meta):
+        return None, tool_error("inherited resolver authority is unavailable in this runtime")
+    parent_meta = read_meta(conn, parent_task_id)
+    if not isinstance(parent_meta, dict):
+        return None, tool_error(
+            "current worker task has no structured resolver authority to inherit"
+        )
+
+    source_task_id = request.get("source_task_id")
+    if not isinstance(source_task_id, str) or not source_task_id.startswith("t_"):
+        return None, tool_error("inherit_parent_resolver_authority.source_task_id must be a task id")
+    if source_task_id != parent_meta.get("source_task_id"):
+        return None, tool_error("inherited source_task_id must match current resolver authority")
+
+    requested_actions = request.get("allowed_actions")
+    if not isinstance(requested_actions, list) or not all(isinstance(x, str) for x in requested_actions):
+        return None, tool_error(
+            "inherit_parent_resolver_authority.allowed_actions must be a list of strings"
+        )
+    normalized_requested: list[str] = []
+    seen: set[str] = set()
+    for action in requested_actions:
+        cleaned = action.strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        normalized_requested.append(cleaned)
+    if not normalized_requested:
+        return None, tool_error("inherit_parent_resolver_authority.allowed_actions cannot be empty")
+
+    parent_allowed_raw = parent_meta.get("allowed_actions")
+    if not isinstance(parent_allowed_raw, list) or not all(isinstance(x, str) for x in parent_allowed_raw):
+        return None, tool_error("current resolver authority has invalid allowed_actions")
+    parent_allowed = {x.strip() for x in parent_allowed_raw if x and x.strip()}
+    if not set(normalized_requested).issubset(parent_allowed):
+        return None, tool_error("inherited allowed_actions must be a subset of current resolver authority")
+
+    source_event_id = parent_meta.get("source_event_id")
+    if not isinstance(source_event_id, int):
+        return None, tool_error("current resolver authority has invalid source_event_id")
+
+    inherited = {
+        "version": parent_meta.get("version") or "v1",
+        "source_task_id": source_task_id,
+        "source_event_id": source_event_id,
+        "allowed_actions": normalized_requested,
+        "review_gate_task_id": parent_meta.get("review_gate_task_id"),
+        "issued_by": parent_meta.get("issued_by"),
+        "inherited_from_task_id": parent_task_id,
+    }
+    inherited_from_event_id = parent_meta.get("source_event_id")
+    if isinstance(inherited_from_event_id, int):
+        inherited["inherited_from_event_id"] = inherited_from_event_id
+    return inherited, None
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -659,9 +1009,28 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
+    inherit_parent_resolver_authority = args.get("inherit_parent_resolver_authority")
     try:
         kb, conn = _connect()
         try:
+            created_event_extra = None
+            current_task_id = os.environ.get("HERMES_KANBAN_TASK")
+            if inherit_parent_resolver_authority is not None:
+                if not current_task_id:
+                    return tool_error(
+                        "inherit_parent_resolver_authority is only available for scoped worker tasks"
+                    )
+                created_resolver, resolver_err = _build_inherited_resolver_authority(
+                    kb,
+                    conn,
+                    parent_task_id=current_task_id,
+                    request=inherit_parent_resolver_authority,
+                )
+                if resolver_err:
+                    return resolver_err
+                if created_resolver is not None:
+                    created_event_extra = {"resolver_authority": created_resolver}
+
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -680,6 +1049,7 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 skills=skills,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                created_event_extra=created_event_extra,
             )
             new_task = kb.get_task(conn, new_tid)
             return _ok(
@@ -834,7 +1204,13 @@ KANBAN_COMPLETE_SCHEMA = {
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
-        "automation."
+        "automation. If this is a resolver-authorized repair card and "
+        "the verified handoff is ready, set ``result`` to "
+        "``READY_WITH_CONCRETE_CONTINUATION`` and provide "
+        "``metadata.continuation_task_id``/``continuation_task_ids``; "
+        "the kernel will fail closed unless those ids are concrete children "
+        "of the blocked source gate, then complete that source gate and run "
+        "a dispatcher tick."
     ),
     "parameters": {
         "type": "object",
@@ -1084,6 +1460,24 @@ KANBAN_CREATE_SCHEMA = {
                     "The names must match skills installed on the "
                     "assignee's profile."
                 ),
+            },
+            "inherit_parent_resolver_authority": {
+                "type": "object",
+                "description": (
+                    "Optional narrow inheritance for resolver-scoped workers: "
+                    "derive child resolver_authority from the current task's "
+                    "structured resolver metadata. source_task_id must match "
+                    "the current authority source, and allowed_actions must be "
+                    "an equal-or-narrower subset."
+                ),
+                "properties": {
+                    "source_task_id": {"type": "string"},
+                    "allowed_actions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["source_task_id", "allowed_actions"],
             },
         },
         "required": ["title", "assignee"],

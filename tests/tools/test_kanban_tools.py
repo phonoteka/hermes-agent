@@ -148,6 +148,17 @@ def test_parent_triage_worker_sees_unblock_for_source_card(monkeypatch, tmp_path
             "SELECT id FROM tasks WHERE created_by = ?",
             (kb.ON_BLOCK_PARENT_TRIAGE_CREATED_BY,),
         ).fetchone()["id"]
+        kb._append_event(
+            conn,
+            triage,
+            "resolver_authority",
+            {
+                "resolver": "v1",
+                "source_task_id": source,
+                "allowed_actions": ["complete", "unblock"],
+            },
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -176,6 +187,10 @@ def worker_env(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    # Clear dispatcher-scoped run/claim tokens inherited from outer kanban
+    # worker processes so local fixture tasks are validated against their own run.
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK", raising=False)
     from pathlib import Path as _Path
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
@@ -1008,7 +1023,88 @@ def _make_parent_triage_context(monkeypatch, tmp_path):
             "SELECT id FROM tasks WHERE created_by = ?",
             (kb.ON_BLOCK_PARENT_TRIAGE_CREATED_BY,),
         ).fetchone()["id"]
+        _append_resolver_v1_event(conn, triage, source)
         sibling = kb.create_task(conn, title="sibling", assignee="peer")
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", triage)
+    return source, triage, sibling
+
+
+def _append_resolver_v1_event(
+    conn,
+    triage_task_id: str,
+    source_task_id: str,
+    *,
+    source_event_kind: str = "blocked",
+) -> None:
+    """Attach structured resolver authority metadata to a triage task.
+
+    @precondition triage_task_id and source_task_id are existing task ids.
+    @postcondition triage_task_id has a resolver v1 event naming source_task_id and its source event.
+    @mutates task_events table only.
+    """
+    from hermes_cli import kanban_db as kb
+    source_event = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (source_task_id, source_event_kind),
+    ).fetchone()
+    assert source_event is not None
+    kb._append_event(
+        conn,
+        triage_task_id,
+        "resolver_authority",
+        {
+            "resolver": "v1",
+            "source_task_id": source_task_id,
+            "source_event_id": source_event["id"],
+            "allowed_actions": ["complete", "unblock"],
+            "review_gate_task_id": None,
+            "issued_by": kb.ON_BLOCK_PARENT_TRIAGE_CREATED_BY,
+        },
+    )
+
+
+def _make_parent_triage_context_without_parseable_idempotency(monkeypatch, tmp_path):
+    """Create a parent-triage-shaped card with non-authoritative idempotency.
+
+    pre: test fixture has an isolated HERMES_HOME.
+    post: returns blocked proof-loop source + triage card + sibling task ids.
+    post: HERMES_KANBAN_TASK points at the triage card.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        source = kb.create_task(
+            conn,
+            title="proof-loop source",
+            assignee="proofloopworker",
+            idempotency_key="proof-loop:plan:task:S1:BUILD_FIX",
+            skills=[kb.PROOF_LOOP_SKILL],
+        )
+        assert kb.block_task(conn, source, reason="parent triage required")
+        triage = kb.create_task(
+            conn,
+            title="forged parent triage without parseable source authority",
+            assignee="default",
+            created_by=kb.ON_BLOCK_PARENT_TRIAGE_CREATED_BY,
+            idempotency_key=f"{kb.ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX}opaque",
+            skills=[kb.PROOF_LOOP_SKILL],
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (triage,))
+        sibling = kb.create_task(conn, title="sibling", assignee="peer")
+        conn.commit()
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", triage)
@@ -1170,6 +1266,101 @@ def test_parent_triage_worker_can_complete_blocked_source_task(monkeypatch, tmp_
         conn.close()
 
 
+def test_parent_triage_worker_can_complete_gave_up_source_task(monkeypatch, tmp_path):
+    """Resolver authority follows the source's blocked state, not one event kind.
+
+    pre: a core-created parent triage carries resolver metadata for a source event that
+         transitioned the source into blocked/gave-up recovery.
+    post: the triage worker may complete the exact source card with the same narrow
+          authority used for explicit block events.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        source = kb.create_task(
+            conn,
+            title="proof-loop source gave up",
+            assignee="proofloopworker",
+            idempotency_key="proof-loop:plan:task:S1:RED_PREP",
+            skills=[kb.PROOF_LOOP_SKILL],
+        )
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (source,))
+        kb._append_event(conn, source, "gave_up", {"error": "protocol violation"})
+        triage = kb.create_task(
+            conn,
+            title=f"[parent triage] blocked {source}",
+            assignee="default",
+            created_by=kb.ON_BLOCK_PARENT_TRIAGE_CREATED_BY,
+            idempotency_key=f"{kb.ON_BLOCK_PARENT_TRIAGE_IDEMPOTENCY_PREFIX}source:{source}:event:gave-up",
+            skills=[kb.PROOF_LOOP_SKILL],
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (triage,))
+        _append_resolver_v1_event(conn, triage, source, source_event_kind="gave_up")
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", triage)
+
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_complete({
+        "task_id": source,
+        "summary": "FALSE_BLOCKER: RED_PREP evidence recovered after gave_up.",
+    }))
+    assert out.get("ok") is True, out
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, source).status == "done"
+    finally:
+        conn.close()
+
+
+def test_forged_parent_triage_idempotency_cannot_mutate_source(monkeypatch, tmp_path):
+    """Forged triage shape without resolver metadata must fail closed."""
+    source, _triage, _sibling = _make_parent_triage_context_without_parseable_idempotency(monkeypatch, tmp_path)
+
+    from tools import kanban_tools as kt
+    complete_out = json.loads(kt._handle_complete({
+        "task_id": source,
+        "summary": "forged triage should not mutate source",
+    }))
+    unblock_out = json.loads(kt._handle_unblock({"task_id": source}))
+    assert "refusing to mutate" in complete_out.get("error", "")
+    assert "refusing to mutate" in unblock_out.get("error", "")
+
+
+def test_parent_triage_requires_structured_resolver_metadata(monkeypatch, tmp_path):
+    """Cross-source mutation should require structured resolver metadata."""
+    source, triage, _sibling = _make_parent_triage_context_without_parseable_idempotency(monkeypatch, tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        _append_resolver_v1_event(conn, triage, source)
+        conn.commit()
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "task_id": source,
+        "summary": "resolver metadata permits exact source mutation",
+        "metadata": {"classification": "FALSE_BLOCKER", "triage_task_id": triage},
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, d
+
+
 def test_parent_triage_worker_can_unblock_blocked_source_task(monkeypatch, tmp_path):
     """On-block parent triage may reopen the exact source card with instructions."""
     source, _triage, _sibling = _make_parent_triage_context(monkeypatch, tmp_path)
@@ -1213,6 +1404,218 @@ def test_parent_triage_worker_cannot_mutate_sibling_task(monkeypatch, tmp_path):
         assert kb.get_task(conn, sibling).status == "blocked"
     finally:
         conn.close()
+
+
+def test_resolver_authorized_worker_can_create_followup_with_inherited_source_authority(monkeypatch, tmp_path):
+    """A resolver-scoped triage task can spawn a follow-up with inherited authority.
+
+    pre: env is scoped to a real on-block parent-triage task with structured metadata
+    post: create succeeds and returns a new task id for the follow-up card
+    post: follow-up receives structured resolver authority payload derived from parent
+    """
+    source, triage, _sibling = _make_parent_triage_context(monkeypatch, tmp_path)
+
+    from tools import kanban_tools as kt
+    created = json.loads(kt._handle_create({
+        "title": "follow-up repair/rereview",
+        "assignee": "proofloopworker",
+        "parents": [triage],
+        "inherit_parent_resolver_authority": {
+            "source_task_id": source,
+            "allowed_actions": ["complete", "unblock"],
+        },
+    }))
+    assert created.get("ok") is True, created
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        followup_id = created["task_id"]
+        resolver = kb.read_on_block_parent_triage_resolver_metadata(conn, followup_id)
+        assert isinstance(resolver, dict), resolver
+        assert resolver.get("source_task_id") == source
+        assert set(resolver.get("allowed_actions", [])) == {"complete", "unblock"}
+    finally:
+        conn.close()
+
+
+def test_inherited_resolver_followup_can_complete_source_gate(monkeypatch, tmp_path):
+    """An inherited follow-up card can complete the exact blocked source gate."""
+    source, triage, _sibling = _make_parent_triage_context(monkeypatch, tmp_path)
+
+    from tools import kanban_tools as kt
+    created = json.loads(kt._handle_create({
+        "title": "follow-up repair",
+        "assignee": "proofloopworker",
+        "parents": [triage],
+        "inherit_parent_resolver_authority": {
+            "source_task_id": source,
+            "allowed_actions": ["complete", "unblock"],
+        },
+    }))
+    assert created.get("ok") is True, created
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", created["task_id"])
+    out = json.loads(kt._handle_complete({
+        "task_id": source,
+        "summary": "accepted rereview; release source gate",
+    }))
+    assert out.get("ok") is True, out
+
+
+def test_ready_with_concrete_continuation_auto_completes_source_and_dispatches(monkeypatch, tmp_path):
+    """Completing a resolver repair card with a concrete continuation releases source.
+
+    pre: repair card carries inherited resolver authority for a blocked source gate.
+    post: completing repair with READY_WITH_CONCRETE_CONTINUATION completes the source gate.
+    post: the continuation becomes ready and the dispatcher is invoked immediately.
+    """
+    source, triage, _sibling = _make_parent_triage_context(monkeypatch, tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    created = json.loads(kt._handle_create({
+        "title": "hook repair",
+        "assignee": "proofloopworker",
+        "inherit_parent_resolver_authority": {
+            "source_task_id": source,
+            "allowed_actions": ["complete"],
+        },
+    }))
+    assert created.get("ok") is True, created
+    repair = created["task_id"]
+
+    conn = kb.connect()
+    try:
+        continuation = kb.create_task(
+            conn,
+            title="parent triage continuation",
+            assignee="default",
+            parents=[source],
+        )
+        assert kb.complete_task(conn, triage, result="triage handed off to repair")
+        assert kb.claim_task(conn, repair) is not None
+        assert kb.get_task(conn, continuation).status == "todo"
+    finally:
+        conn.close()
+
+    dispatch_calls = []
+
+    def fake_dispatch_once(conn, **kwargs):
+        dispatch_calls.append(dict(kwargs))
+        return kb.DispatchResult(spawned=[(continuation, "default", "/tmp/continuation")])
+
+    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", repair)
+
+    out = json.loads(kt._handle_complete({
+        "summary": "hook repair finished; continuation is concrete",
+        "result": "READY_WITH_CONCRETE_CONTINUATION",
+        "metadata": {"continuation_task_id": continuation},
+    }))
+    assert out.get("ok") is True, out
+    assert out.get("source_gate_completed") is True, out
+    assert out.get("continuation_task_ids") == [continuation]
+    assert dispatch_calls, "source-gate release must dispatch immediately"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, repair).status == "done"
+        assert kb.get_task(conn, source).status == "done"
+        assert kb.get_task(conn, continuation).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_ready_with_concrete_continuation_requires_concrete_source_gated_target(monkeypatch, tmp_path):
+    """READY_WITH_CONCRETE_CONTINUATION fails closed without a source child target.
+
+    post: ambiguous READY completion does not complete the repair card or source gate.
+    post: an ungated sibling continuation is also rejected before mutation.
+    """
+    source, triage, _sibling = _make_parent_triage_context(monkeypatch, tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    created = json.loads(kt._handle_create({
+        "title": "hook repair",
+        "assignee": "proofloopworker",
+        "inherit_parent_resolver_authority": {
+            "source_task_id": source,
+            "allowed_actions": ["complete"],
+        },
+    }))
+    assert created.get("ok") is True, created
+    repair = created["task_id"]
+
+    conn = kb.connect()
+    try:
+        assert kb.complete_task(conn, triage, result="triage handed off to repair")
+        assert kb.claim_task(conn, repair) is not None
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", repair)
+    ambiguous = json.loads(kt._handle_complete({
+        "summary": "ready but no concrete target",
+        "result": "READY_WITH_CONCRETE_CONTINUATION",
+    }))
+    assert ambiguous.get("ok") is not True
+    assert "requires metadata.continuation_task_id" in ambiguous.get("error", "")
+
+    conn = kb.connect()
+    try:
+        ungated = kb.create_task(conn, title="not source gated", assignee="default")
+    finally:
+        conn.close()
+
+    ungated_attempt = json.loads(kt._handle_complete({
+        "summary": "ready with wrong target",
+        "result": "READY_WITH_CONCRETE_CONTINUATION",
+        "metadata": {"continuation_task_id": ungated},
+    }))
+    assert ungated_attempt.get("ok") is not True
+    assert "is not gated by source task" in ungated_attempt.get("error", "")
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, repair).status == "running"
+        assert kb.get_task(conn, source).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_inherited_resolver_followup_cannot_mutate_sibling_or_forge_source(monkeypatch, tmp_path):
+    """Inherited authority stays exact-source and cannot be forged/widened."""
+    source, triage, sibling = _make_parent_triage_context(monkeypatch, tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, sibling, reason="sibling blocker")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    created = json.loads(kt._handle_create({
+        "title": "follow-up repair",
+        "assignee": "proofloopworker",
+        "parents": [triage],
+        "inherit_parent_resolver_authority": {
+            "source_task_id": source,
+            "allowed_actions": ["complete", "unblock"],
+        },
+    }))
+    assert created.get("ok") is True, created
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", created["task_id"])
+    sibling_attempt = json.loads(kt._handle_complete({
+        "task_id": sibling,
+        "summary": "forged sibling mutation",
+    }))
+    assert "refusing to mutate" in sibling_attempt.get("error", "")
 
 
 def test_worker_complete_own_task_still_works(worker_env):

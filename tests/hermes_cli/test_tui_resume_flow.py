@@ -350,6 +350,15 @@ def test_oneshot_all_toolsets_warns_about_ignored_extra_entries(monkeypatch, cap
     assert "ignoring additional entries: nope" in capsys.readouterr().err
 
 
+def test_oneshot_rejects_provider_without_model_even_before_stdio_redirect(capsys):
+    from hermes_cli.oneshot import run_oneshot
+
+    assert run_oneshot("hello", provider="openai") == 2
+    err = capsys.readouterr().err
+    assert "--provider requires --model" in err
+    assert "configured defaults" in err
+
+
 def test_oneshot_accepts_plugin_toolset_after_discovery(monkeypatch):
     import toolsets
 

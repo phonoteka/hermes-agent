@@ -659,6 +659,7 @@ class TestAuxiliaryPoolAwareness:
 
         with (
             patch("agent.auxiliary_client.load_pool", return_value=_Pool()),
+            patch("hermes_cli.models.get_nous_recommended_aux_model", return_value="google/gemini-3-flash-preview"),
             patch("agent.auxiliary_client.OpenAI") as mock_openai,
         ):
             from agent.auxiliary_client import _try_nous
@@ -2121,6 +2122,128 @@ class TestCodexAuxiliaryAdapterTimeout:
             )
 
         assert time.monotonic() - started < 0.14
+
+
+class TestCodexAuxiliaryAdapterOutputRecovery:
+    def test_recovers_from_stream_iteration_typeerror_with_streamed_items(self):
+        streamed_item = SimpleNamespace(
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="streamed summary")],
+        )
+
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_item.done", item=streamed_item)
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):
+                raise AssertionError("get_final_response should not run after stream iteration TypeError")
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return FakeStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.4-mini")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
+
+        assert response.choices[0].message.content == "streamed summary"
+        assert response.choices[0].message.tool_calls is None
+
+    def test_recovers_from_get_final_response_typeerror_with_streamed_items(self):
+        streamed_item = SimpleNamespace(
+            type="message",
+            role="assistant",
+            status="completed",
+            content=[SimpleNamespace(type="output_text", text="streamed summary")],
+        )
+
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter([SimpleNamespace(type="response.output_item.done", item=streamed_item)])
+
+            def get_final_response(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return FakeStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.4-mini")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
+
+        assert response.choices[0].message.content == "streamed summary"
+        assert response.choices[0].message.tool_calls is None
+
+    def test_synthesizes_graceful_empty_output_when_stream_iteration_typeerror_has_no_stream_events(self):
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                raise TypeError("'NoneType' object is not iterable")
+                yield  # pragma: no cover
+
+            def get_final_response(self):
+                raise AssertionError("get_final_response should not run after stream iteration TypeError")
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return FakeStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.4-mini")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
+
+        assert response.choices[0].message.content is None
+        assert response.choices[0].message.tool_calls is None
+
+    def test_synthesizes_graceful_empty_output_when_typeerror_has_no_stream_events(self):
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_response(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                return FakeStream()
+
+        fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.4-mini")
+
+        response = adapter.create(messages=[{"role": "user", "content": "summarize this"}])
+
+        assert response.choices[0].message.content is None
+        assert response.choices[0].message.tool_calls is None
 
 
 # ---------------------------------------------------------------------------

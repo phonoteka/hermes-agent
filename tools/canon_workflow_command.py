@@ -296,7 +296,7 @@ class _GatewayHermesPhaseBackendClient:
 
 
 class _GatewayHermesScopedPhaseSession:
-    """Run one Canon phase as a bounded Hermes model-only session.
+    """Run one Canon phase as a bounded Hermes session with explicit toolset authority.
 
     pre: envelope_projection is Canon-minted identity/scope authority for one phase.
     post: run_phase returns a backend payload with schema-shaped JSON output from a real model call;
@@ -325,11 +325,12 @@ class _GatewayHermesScopedPhaseSession:
         model_route = self._projection.get("modelRoute") if isinstance(self._projection.get("modelRoute"), dict) else {}
         model = str(model_route.get("model") or "").strip() or None
         provider = str(model_route.get("provider") or "").strip() or None
+        toolsets = self._derive_authorized_toolsets(envelope)
         response = _run_agent(
             prompt,
             model=model,
             provider=provider,
-            toolsets=["skills", "file", "terminal"],
+            toolsets=toolsets,
             use_config_toolsets=False,
         )
         output = _extract_json_object(response)
@@ -337,8 +338,104 @@ class _GatewayHermesScopedPhaseSession:
         result: dict[str, Any] = {"status": "succeeded", "output": output}
         if artifact_refs:
             result["artifactRefs"] = artifact_refs
-        result["agentSessionRef"] = self._agent_session_ref(envelope)
+        agent_session_ref = self._agent_session_ref(envelope)
+        result["agentSessionRef"] = agent_session_ref
+        result["agentCheckpointRef"] = self._agent_checkpoint_ref(envelope)
+        result["eventCursorRefs"] = self._event_cursor_refs(envelope, agent_session_ref=agent_session_ref)
         return result
+
+    def _derive_authorized_toolsets(self, envelope: dict[str, Any]) -> list[str] | None:
+        """Resolve explicit toolset authority from projection and fail closed when required scopes are missing.
+
+        pre: envelope is the active Canon phase envelope and self._projection is Canon-minted authority.
+        post: returns a normalized ordered toolset list when authority is explicit; returns None only when
+              no explicit tool authority is required by the current phase contract.
+        raises: RuntimeError when phase contract requires tool scopes but projection provides no explicit
+                allowedScopes.toolsetRefs authority.
+        """
+
+        allowed_scopes = self._projection.get("allowedScopes")
+        refs = allowed_scopes.get("toolsetRefs") if isinstance(allowed_scopes, dict) else None
+        authorized = self._normalize_toolset_refs(refs)
+        if authorized:
+            return authorized
+        if self._phase_requires_tools(envelope):
+            raise RuntimeError(
+                "Canon phase backend projection is missing required allowedScopes.toolsetRefs authority "
+                "for a tool-requiring phase"
+            )
+        return None
+
+    def _phase_requires_tools(self, envelope: dict[str, Any]) -> bool:
+        """Return whether this phase contract explicitly requires tool access.
+
+        pre: envelope is a Canon phase envelope object.
+        post: returns True when phase inputs request mandatory skills; otherwise False.
+        raises: none.
+        """
+
+        inputs = envelope.get("inputs") if isinstance(envelope.get("inputs"), dict) else {}
+        mandatory_skills = inputs.get("mandatorySkills")
+        return isinstance(mandatory_skills, list) and any(isinstance(item, str) and item.strip() for item in mandatory_skills)
+
+    def _normalize_toolset_refs(self, refs: Any) -> list[str] | None:
+        """Normalize projection toolset refs to bounded unique toolset names.
+
+        pre: refs is a potential allowedScopes.toolsetRefs projection value.
+        post: returns ordered unique non-empty strings when refs is list-like; otherwise None.
+        raises: RuntimeError when refs is present but malformed.
+        """
+
+        if refs is None:
+            return None
+        if not isinstance(refs, list):
+            raise RuntimeError("Canon phase backend projection allowedScopes.toolsetRefs must be a list")
+        normalized: list[str] = []
+        for entry in refs:
+            value = str(entry).strip() if isinstance(entry, str) else ""
+            if not value:
+                continue
+            if value not in normalized:
+                normalized.append(value)
+        return normalized or None
+
+    def _agent_checkpoint_ref(self, envelope: dict[str, Any]) -> str:
+        """Build an opaque bounded checkpoint ref for Canon backend-linked authority.
+
+        pre: envelope may carry runId and phaseId strings.
+        post: returns a deterministic non-empty bounded checkpoint ref.
+        raises: none.
+        """
+
+        run_id = str(envelope.get("runId") or "run").strip() or "run"
+        phase_id = str(envelope.get("phaseId") or "phase").strip() or "phase"
+        return self._bounded_ref(f"hermes-current-gateway:checkpoint:{run_id}:{phase_id}:1")
+
+    def _event_cursor_refs(self, envelope: dict[str, Any], *, agent_session_ref: str) -> list[str]:
+        """Build opaque event cursor refs linked to the scoped phase run.
+
+        pre: agent_session_ref is the canonical session ref emitted for this phase result.
+        post: returns a non-empty list of bounded opaque refs with no transcript/prompt/tool output.
+        raises: none.
+        """
+
+        run_id = str(envelope.get("runId") or "run").strip() or "run"
+        phase_id = str(envelope.get("phaseId") or "phase").strip() or "phase"
+        cursor_ref = self._bounded_ref(f"{agent_session_ref}:events:{run_id}:{phase_id}:cursor:1")
+        return [cursor_ref]
+
+    def _bounded_ref(self, value: str, *, max_length: int = 128) -> str:
+        """Bound opaque refs to a stable non-empty string envelope.
+
+        pre: value is a ref candidate string.
+        post: returns a stripped non-empty string capped at max_length bytes/characters.
+        raises: none.
+        """
+
+        text = str(value or "").strip()
+        if not text:
+            return "hermes-current-gateway:ref"
+        return text[:max_length]
 
     def _build_phase_prompt(self, envelope: dict[str, Any]) -> str:
         """Build a strict JSON-only prompt from Canon envelope authority.

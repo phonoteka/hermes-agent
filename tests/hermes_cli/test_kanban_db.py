@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import time
 from pathlib import Path
@@ -396,7 +397,7 @@ def test_blocking_proof_loop_phase_creates_ready_parent_triage(kanban_home):
             workspace_path="/repo",
             tenant="canon",
             idempotency_key="proof-loop:plan:task:S1:RED_PREP",
-            skills=["repo-task-proof-loop-hermes"],
+            skills=["repo-task-proof-loop-hermes", "code-contracts", "plastinka-code-contracts"],
         )
         kb.create_task(
             conn,
@@ -438,6 +439,11 @@ def test_blocking_proof_loop_phase_creates_ready_parent_triage(kanban_home):
         assert "RED changed; parent triage required" in (triage.body or "")
         assert str(claim.current_run_id) in (triage.body or "")
         assert "repo-task-proof-loop-hermes" in (triage.skills or [])
+        assert "code-contracts" in (triage.skills or [])
+        assert "plastinka-code-contracts" in (triage.skills or [])
+        assert "Required parent/default takeover protocol" in (triage.body or "")
+        assert "do not redispatch blindly" in (triage.body or "")
+        assert "detailed parent-authored brief" in (triage.body or "")
         triage_subs = kb.list_notify_subs(conn, triage.id)
         assert len(triage_subs) == 1
         assert triage_subs[0]["platform"] == "telegram"
@@ -452,23 +458,293 @@ def test_blocking_proof_loop_phase_creates_ready_parent_triage(kanban_home):
         assert triage_events[0].payload["copied_notify_subscriptions"] == 1
 
 
-def test_blocking_non_proof_loop_task_does_not_create_parent_triage(kanban_home):
-    """Only explicit proof-loop phase cards get automatic parent triage."""
+def test_blocking_red_prep_uses_verify_red_parent_gate_assignee(kanban_home):
+    """RED_PREP recovery must route to VERIFY_RED when that is the materialized parent gate.
+
+    pre: proof-loop materialization can model RED_PREP as a worker source whose child is VERIFY_RED
+    post: on-block parent triage is assigned to the VERIFY_RED parent profile, not the source worker
+    post: resolver metadata records VERIFY_RED as the review gate authority
+    """
     with kb.connect() as conn:
-        task = kb.create_task(conn, title="ordinary", assignee="worker")
-        kb.claim_task(conn, task)
-        assert kb.block_task(conn, task, reason="ordinary blocker")
+        phase = kb.create_task(
+            conn,
+            title="[task] S0/11 RED_PREP",
+            assignee="proofloopworker",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S0:RED_PREP",
+            skills=["repo-task-proof-loop-hermes", "canon-architecture-contracts", "code-contracts"],
+        )
+        verify_red = kb.create_task(
+            conn,
+            title="[task] S0/11 VERIFY_RED",
+            assignee="proofloopparent",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S0:VERIFY_RED",
+            skills=["repo-task-proof-loop-hermes", "canon-architecture-contracts", "code-contracts"],
+            parents=[phase],
+        )
+        claim = kb.claim_task(conn, phase, claimer="host:worker")
+        assert claim is not None
+
+        assert kb.block_task(conn, phase, reason="worker protocol violation")
+
+        triage = next(
+            t
+            for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        )
+        assert triage.status == "ready"
+        assert triage.assignee == "proofloopparent"
+        assert "Review gate:" in (triage.body or "")
+        assert verify_red in (triage.body or "")
+
+        source_events = [e for e in kb.list_events(conn, phase) if e.kind == "parent_triage_created"]
+        assert len(source_events) == 1
+        assert source_events[0].payload["assignee"] == "proofloopparent"
+        assert source_events[0].payload["review_gate_task_id"] == verify_red
+        assert source_events[0].payload["resolver"]["review_gate_task_id"] == verify_red
+
+
+def test_red_prep_gave_up_triage_uses_verify_red_parent_assignee(kanban_home):
+    """Dispatcher gave-up recovery must route RED_PREP to its VERIFY_RED parent gate.
+
+    pre: RED_PREP crashes or exits without a terminal Kanban call and trips the failure breaker
+    post: created parent triage is assigned to the VERIFY_RED gate assignee
+    post: source parent_triage_created event records the VERIFY_RED review gate id
+    """
+    with kb.connect() as conn:
+        phase = kb.create_task(
+            conn,
+            title="[task] S0/11 RED_PREP",
+            assignee="proofloopworker",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S0:RED_PREP",
+            skills=["repo-task-proof-loop-hermes", "canon-architecture-contracts", "code-contracts"],
+        )
+        verify_red = kb.create_task(
+            conn,
+            title="[task] S0/11 VERIFY_RED",
+            assignee="proofloopparent",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S0:VERIFY_RED",
+            skills=["repo-task-proof-loop-hermes", "canon-architecture-contracts", "code-contracts"],
+            parents=[phase],
+        )
+        claim = kb.claim_task(conn, phase, claimer="host:worker")
+        assert claim is not None
+
+        blocked = kb._record_task_failure(
+            conn,
+            phase,
+            "worker exited cleanly (rc=0) without calling kanban_complete or kanban_block",
+            outcome="crashed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"exit_code": 0},
+        )
+        assert blocked is True
+
+        triage = next(
+            t
+            for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        )
+        assert triage.assignee == "proofloopparent"
+
+        source_events = [e for e in kb.list_events(conn, phase) if e.kind == "parent_triage_created"]
+        assert len(source_events) == 1
+        assert source_events[0].payload["assignee"] == "proofloopparent"
+        assert source_events[0].payload["review_gate_task_id"] == verify_red
+        assert source_events[0].payload["resolver"]["review_gate_task_id"] == verify_red
+
+
+def test_blocking_proof_loop_parent_gate_triages_to_same_parent_assignee(kanban_home):
+    """A blocked proof-loop parent gate must not fall back to the default profile.
+
+    pre: VERIFY_GREEN is itself the parent gate, so no downstream review gate exists
+    post: recovery triage is assigned to the blocked gate's parent-review profile
+    """
+    with kb.connect() as conn:
+        gate = kb.create_task(
+            conn,
+            title="[task] S1 VERIFY_GREEN",
+            assignee="proofloopparent",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S1:VERIFY_GREEN",
+            skills=["repo-task-proof-loop-hermes", "code-contracts", "plastinka-code-contracts"],
+        )
+        claim = kb.claim_task(conn, gate, claimer="host:parent")
+        assert claim is not None
+
+        assert kb.block_task(conn, gate, reason="proof surface needs parent repair")
+
+        triage = next(
+            t
+            for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        )
+        assert triage.status == "ready"
+        assert triage.assignee == "proofloopparent"
+        assert "Review gate: not found; route recovery to the blocked task assignee" in (triage.body or "")
+
+
+def test_on_block_parent_triage_writes_resolver_metadata(kanban_home):
+    """Created/parent events must carry resolver authority metadata for triage routing.
+
+    pre: blocking a proof-loop phase creates a parent triage task
+    post: triage created event and source parent_triage_created event expose resolver metadata
+    """
+    with kb.connect() as conn:
+        phase = kb.create_task(
+            conn,
+            title="[task] S1 RED_PREP",
+            assignee="proofloopworker",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S1:RED_PREP",
+            skills=["repo-task-proof-loop-hermes"],
+        )
+        review = kb.create_task(
+            conn,
+            title="[task] S1 REVIEW RED_PREP",
+            assignee="default",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S1:PARENT_REVIEW_RED_PREP",
+            skills=["repo-task-proof-loop-hermes"],
+            parents=[phase],
+        )
+        claim = kb.claim_task(conn, phase, claimer="host:worker")
+        assert claim is not None
+
+        assert kb.block_task(conn, phase, reason="RED changed; parent triage required")
+
+        triage = next(
+            t
+            for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        )
+
+        triage_created_events = [e for e in kb.list_events(conn, triage.id) if e.kind == "created"]
+        assert len(triage_created_events) == 1
+        triage_created_payload = triage_created_events[0].payload
+        resolver = triage_created_payload["resolver"]
+        assert resolver["version"] == "v1"
+        assert resolver["source_task_id"] == phase
+        assert resolver["source_event_id"] > 0
+        assert resolver["allowed_actions"] == ["complete", "unblock"]
+        assert resolver["review_gate_task_id"] == review
+        assert resolver["issued_by"] == "kanban:on-block-parent-triage"
+
+        source_events = [e for e in kb.list_events(conn, phase) if e.kind == "parent_triage_created"]
+        assert len(source_events) == 1
+        source_resolver = source_events[0].payload["resolver"]
+        assert source_resolver["version"] == "v1"
+        assert source_resolver["source_task_id"] == phase
+        assert source_resolver["source_event_id"] == source_events[0].payload["blocked_event_id"]
+        assert source_resolver["allowed_actions"] == ["complete", "unblock"]
+        assert source_resolver["review_gate_task_id"] == review
+        assert source_resolver["issued_by"] == "kanban:on-block-parent-triage"
+
+
+def test_on_block_parent_triage_resolver_metadata_is_idempotent(kanban_home):
+    """Re-insert on same blocked event must reuse one triage id and preserve resolver payload."""
+    with kb.connect() as conn:
+        phase = kb.create_task(
+            conn,
+            title="[task] S1 RED_PREP",
+            assignee="proofloopworker",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S1:RED_PREP",
+            skills=["repo-task-proof-loop-hermes"],
+        )
+        review = kb.create_task(
+            conn,
+            title="[task] S1 REVIEW RED_PREP",
+            assignee="default",
+            workspace_kind="dir",
+            workspace_path="/repo",
+            tenant="canon",
+            idempotency_key="proof-loop:plan:task:S1:PARENT_REVIEW_RED_PREP",
+            skills=["repo-task-proof-loop-hermes"],
+            parents=[phase],
+        )
+        claim = kb.claim_task(conn, phase, claimer="host:worker")
+        assert claim is not None
+
+        assert kb.block_task(conn, phase, reason="RED changed; parent triage required")
+
+        triage = next(
+            t
+            for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        )
+
+        blocked_events = [e for e in kb.list_events(conn, phase) if e.kind == "blocked"]
+        assert len(blocked_events) == 1
+        block_event_id = blocked_events[0].id
+
+        with kb.write_txn(conn):
+            reused = kb._insert_on_block_parent_triage_locked(
+                conn,
+                blocked_task=kb.get_task(conn, phase),
+                reason="RED changed; parent triage required",
+                run_id=claim.current_run_id,
+                block_event_id=block_event_id,
+            )
+        assert reused == triage.id
 
         triages = [
-            t for t in kb.list_tasks(conn, include_archived=True)
+            t
+            for t in kb.list_tasks(conn, include_archived=True)
             if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
         ]
-        assert triages == []
+        assert len(triages) == 1
+
+        source_events = [e for e in kb.list_events(conn, phase) if e.kind == "parent_triage_created"]
+        assert len(source_events) == 2
+        first_resolver = source_events[0].payload["resolver"]
+        second_resolver = source_events[1].payload["resolver"]
+
+        assert first_resolver["version"] == "v1"
+        assert second_resolver["version"] == "v1"
+        assert first_resolver["source_task_id"] == phase
+        assert second_resolver["source_task_id"] == phase
+        assert first_resolver["source_event_id"] == block_event_id
+        assert second_resolver["source_event_id"] == block_event_id
+        assert first_resolver["allowed_actions"] == ["complete", "unblock"]
+        assert second_resolver["allowed_actions"] == ["complete", "unblock"]
+        assert first_resolver["review_gate_task_id"] == review
+        assert second_resolver["review_gate_task_id"] == review
+        assert first_resolver["issued_by"] == "kanban:on-block-parent-triage"
+        assert second_resolver["issued_by"] == "kanban:on-block-parent-triage"
 
 
-def test_blocking_parent_review_gate_does_not_create_recursive_triage(kanban_home):
-    """Parent review gates may block, but must not recursively enqueue parent triage."""
+def test_block_task_creates_recovery_for_parent_review_and_ordinary_blocked_sources(
+    kanban_home,
+):
+    """Explicit blocks on ordinary and parent-review cards create one recovery each.
+
+    Also verifies anti-recursion: blocking a recovery card itself does not create
+    a second-generation recovery task.
+    """
     with kb.connect() as conn:
+        ordinary = kb.create_task(conn, title="ordinary", assignee="worker")
         review = kb.create_task(
             conn,
             title="[task] S1 REVIEW RED_PREP",
@@ -476,14 +752,241 @@ def test_blocking_parent_review_gate_does_not_create_recursive_triage(kanban_hom
             idempotency_key="proof-loop:plan:task:S1:PARENT_REVIEW_RED_PREP",
             skills=["repo-task-proof-loop-hermes"],
         )
-        kb.claim_task(conn, review)
+
+        ordinary_claim = kb.claim_task(conn, ordinary, claimer="host:worker")
+        review_claim = kb.claim_task(conn, review, claimer="host:reviewer")
+        assert ordinary_claim is not None
+        assert review_claim is not None
+
+        assert kb.block_task(conn, ordinary, reason="ordinary blocker")
         assert kb.block_task(conn, review, reason="needs real user decision")
 
         triages = [
             t for t in kb.list_tasks(conn, include_archived=True)
             if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
         ]
-        assert triages == []
+        assert len(triages) == 2
+        by_source = {t.idempotency_key.split(":", 4)[3]: t for t in triages}
+        assert ordinary in by_source
+        assert review in by_source
+
+        ordinary_triage = by_source[ordinary]
+        review_triage = by_source[review]
+
+        for source_id, triage in ((ordinary, ordinary_triage), (review, review_triage)):
+            assert triage.status == "ready"
+            assert kb.parent_ids(conn, triage.id) == []
+            assert source_id in (triage.body or "")
+            assert "Blocked event id:" in (triage.body or "")
+            assert "do not ask the user before local verification" in (triage.body or "").lower()
+
+        # Anti-recursion: blocking recovery cards must not create new recovery cards.
+        triage_claim = kb.claim_task(conn, ordinary_triage.id, claimer="host:triage")
+        assert triage_claim is not None
+        assert kb.block_task(conn, ordinary_triage.id, reason="triage follow-up")
+        triages_after = [
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        ]
+        assert len(triages_after) == 2
+
+        ordinary_events = kb.list_events(conn, ordinary)
+        review_events = kb.list_events(conn, review)
+        ordinary_triage_events = [e for e in ordinary_events if e.kind == "parent_triage_created"]
+        review_triage_events = [e for e in review_events if e.kind == "parent_triage_created"]
+        assert len(ordinary_triage_events) == 1
+        assert len(review_triage_events) == 1
+        assert ordinary_triage_events[0].payload["triage_task_id"] == ordinary_triage.id
+        assert review_triage_events[0].payload["triage_task_id"] == review_triage.id
+
+
+def _run_resolver_sweeper(*args: str, env: dict[str, str] | None = None) -> "subprocess.CompletedProcess[str]":
+    """Run the planned resolver sweeper script as a subprocess.
+
+    pre: ``args`` are CLI args for scripts/kanban_resolver_sweeper.py
+    post: returns CompletedProcess with captured stdout/stderr
+    """
+    import subprocess
+    import sys
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "kanban_resolver_sweeper.py"
+    cmd = [sys.executable, str(script), *args]
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    return subprocess.run(cmd, capture_output=True, text=True, env=merged_env, check=False)
+
+
+def test_resolver_sweeper_dry_run_is_non_mutating(kanban_home):
+    """Dry-run should report safe actions and leave task state untouched."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="worker")
+        blocked = kb.create_task(conn, title="blocked", assignee="worker")
+        claim = kb.claim_task(conn, blocked, claimer="host:worker")
+        assert claim is not None
+        assert kb.block_task(conn, blocked, reason="proof blocker")
+
+        triage = next(
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        )
+
+        before_source = kb.get_task(conn, source)
+        before_triage = kb.get_task(conn, triage.id)
+
+    run = _run_resolver_sweeper("--board", "proof-loop", "--json", env={"HERMES_HOME": str(kanban_home)})
+    assert run.returncode == 0, run.stderr
+    payload = json.loads(run.stdout)
+    assert payload["mode"] == "dry_run"
+    assert payload["count"] == 1
+    assert payload["results"][0]["triage_task_id"] == triage.id
+    assert payload["results"][0]["source_task_id"] == blocked
+    assert payload["results"][0]["action"] == "unblock"
+
+    with kb.connect() as conn:
+        after_source = kb.get_task(conn, source)
+        after_triage = kb.get_task(conn, triage.id)
+
+    assert before_source is not None and after_source is not None
+    assert before_triage is not None and after_triage is not None
+    assert after_source.status == before_source.status
+    assert after_triage.status == before_triage.status
+
+
+def test_resolver_sweeper_apply_mutates_only_metadata_authorized_source(kanban_home):
+    """Apply should mutate only source task named by resolver metadata."""
+    with kb.connect() as conn:
+        blocked = kb.create_task(conn, title="blocked", assignee="worker")
+        claim = kb.claim_task(conn, blocked, claimer="host:worker")
+        assert claim is not None
+        assert kb.block_task(conn, blocked, reason="proof blocker")
+
+        triage = next(
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        )
+
+        assert kb.get_task(conn, blocked).status == "blocked"
+        assert kb.get_task(conn, triage.id).status == "ready"
+
+    run = _run_resolver_sweeper(
+        "--board", "proof-loop", "--apply", "--json", env={"HERMES_HOME": str(kanban_home)}
+    )
+    assert run.returncode == 0, run.stderr
+    payload = json.loads(run.stdout)
+    assert payload["count"] == 1
+    assert payload["results"][0]["triage_task_id"] == triage.id
+    assert payload["results"][0]["source_task_id"] == blocked
+    assert payload["results"][0]["action"] == "unblock"
+
+    with kb.connect() as conn:
+        blocked_after = kb.get_task(conn, blocked)
+        triage_after = kb.get_task(conn, triage.id)
+
+    assert blocked_after is not None and triage_after is not None
+    assert blocked_after.status == "ready"
+    assert triage_after.status == "done"
+
+
+def test_resolver_sweeper_leaves_legacy_cards_manual_only(kanban_home):
+    """Legacy parse-looking blocked cards with no resolver metadata stay manual-only."""
+    with kb.connect() as conn:
+        legacy = kb.create_task(
+            conn,
+            title="legacy blocked",
+            assignee="worker",
+            body="source_task_id=t_legacy source_event_id=10 allowed_actions=complete",
+        )
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='blocked' WHERE id = ?", (legacy,))
+            kb._append_event(conn, legacy, "blocked", {"reason": "legacy parse-looking text"})
+
+        assert kb.get_task(conn, legacy).status == "blocked"
+
+    run = _run_resolver_sweeper("--board", "proof-loop", "--json", env={"HERMES_HOME": str(kanban_home)})
+    assert run.returncode == 0, run.stderr
+    payload = json.loads(run.stdout)
+    assert payload["count"] == 1
+    assert payload["results"][0]["triage_task_id"] == legacy
+    assert payload["results"][0]["source_task_id"] is None
+    assert payload["results"][0]["source_event_id"] is None
+    assert payload["results"][0]["action"] == "manual_only"
+    assert payload["results"][0]["mutated"] is False
+
+    with kb.connect() as conn:
+        legacy_after = kb.get_task(conn, legacy)
+
+    assert legacy_after is not None
+    assert legacy_after.status == "blocked"
+
+
+def test_reconcile_orphan_blocked_creates_recovery_unless_waiting_user_decision(
+    kanban_home,
+):
+    """Orphan blocked rows are reconciled unless a real user-decision marker exists.
+
+    The test creates blocked rows through direct DB writes to model stale or
+    externally-mutated board state that bypassed block_task(). Reconciliation must
+    create one active parent-triage resolver for ordinary orphans, stay idempotent
+    on repeated runs, and suppress only rows with explicit REAL_USER_DECISION
+    evidence from a recovery review.
+    """
+    with kb.connect() as conn:
+        orphan = kb.create_task(conn, title="orphan blocked", assignee="worker")
+        explicit_wait = kb.create_task(conn, title="waiting on user", assignee="worker")
+        invalid_wait = kb.create_task(conn, title="bad waiting marker", assignee="worker")
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked' WHERE id IN (?, ?, ?)",
+                (orphan, explicit_wait, invalid_wait),
+            )
+            kb._append_event(conn, orphan, "blocked", {"reason": "legacy orphan"})
+            kb._append_event(conn, explicit_wait, "blocked", {"reason": "needs user"})
+            kb._append_event(
+                conn,
+                explicit_wait,
+                "blocked_waiting_user_decision",
+                {
+                    "classification": "REAL_USER_DECISION",
+                    "source_triage_task_id": "t_triage",
+                    "source_blocked_task_id": explicit_wait,
+                },
+            )
+            kb._append_event(conn, invalid_wait, "blocked", {"reason": "bad marker"})
+            kb._append_event(
+                conn,
+                invalid_wait,
+                "blocked_waiting_user_decision",
+                {"classification": "PLAN_OR_PROOF_REPAIR"},
+            )
+
+        repaired = kb.reconcile_orphan_blocked_tasks(conn)
+        repaired_again = kb.reconcile_orphan_blocked_tasks(conn)
+
+        assert repaired_again == []
+        assert {item["blocked_task_id"] for item in repaired} == {orphan, invalid_wait}
+
+        triages = [
+            t for t in kb.list_tasks(conn, include_archived=True)
+            if t.idempotency_key and t.idempotency_key.startswith("kanban:on-block-parent-triage:")
+        ]
+        by_source = {t.idempotency_key.split(":", 4)[3]: t for t in triages}
+        assert set(by_source) == {orphan, invalid_wait}
+        assert explicit_wait not in by_source
+
+        for source_id, triage in by_source.items():
+            assert triage.status == "ready"
+            assert kb.parent_ids(conn, triage.id) == []
+            body = triage.body or ""
+            assert f"Blocked task: {source_id}" in body
+            assert "Classify exactly one" in body
+            assert "Do not ask the user before local verification" in body
+
+        orphan_events = kb.list_events(conn, orphan)
+        invalid_events = kb.list_events(conn, invalid_wait)
+        assert [e.kind for e in orphan_events].count("parent_triage_created") == 1
+        assert [e.kind for e in invalid_events].count("parent_triage_created") == 1
 
 
 # ---------------------------------------------------------------------------
