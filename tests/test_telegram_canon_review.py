@@ -304,6 +304,54 @@ async def test_canon_non_revise_callback_answers_before_resolver_runs():
 
 
 @pytest.mark.asyncio
+async def test_canon_non_revise_callback_replaces_buttons_with_fixed_choice_panel_while_processing():
+    """Callback click must immediately remove old buttons and show a fixed choice + processing panel.
+
+    pre: operator clicks approve/reject callback for a Canon review card with inline buttons.
+    post: adapter first edits the original message with reply_markup=None and a fixed-choice
+          status panel before calling the resolver; final edit can include resolver output.
+    raises: AssertionError while old buttons stay active until resolver completion.
+    """
+
+    adapter = _make_adapter()
+    call_order = []
+
+    query = AsyncMock()
+    query.data = '{"gateId":"gate-r05","action":"approve"}'
+    query.message = MagicMock()
+    query.message.chat_id = -10012345
+    query.message.message_id = 456
+    query.message.message_thread_id = 789
+    query.message.chat.type = "supergroup"
+    query.from_user = MagicMock()
+    query.from_user.id = 333
+    query.from_user.first_name = "Operator"
+    query.answer = AsyncMock()
+
+    async def _edit_message_text_side_effect(*args, **kwargs):
+        call_order.append(("edit", kwargs.get("text", ""), kwargs.get("reply_markup", "<missing>")))
+
+    query.edit_message_text = AsyncMock(side_effect=_edit_message_text_side_effect)
+
+    update = MagicMock()
+    update.callback_query = query
+
+    def _resolver_side_effect(**kwargs):
+        call_order.append(("resolver", kwargs.get("action_id") or kwargs.get("choice")))
+        return "recorded"
+
+    with patch("tools.canon_gateway_review.resolve_telegram_canon_review", side_effect=_resolver_side_effect):
+        await adapter._handle_callback_query(update, MagicMock())
+
+    assert call_order[0][0] == "edit"
+    assert "Выбор зафиксирован" in call_order[0][1]
+    assert "✅ Да" in call_order[0][1]
+    assert "Обрабатываю" in call_order[0][1]
+    assert call_order[0][2] is None
+    assert call_order[1] == ("resolver", "approve")
+
+
+@pytest.mark.asyncio
 async def test_completed_canon_callback_sends_operator_closeout_as_new_message():
     """Completed Canon reviews must produce an operator-visible chat message, not only edit the card.
 
@@ -339,7 +387,17 @@ async def test_completed_canon_callback_sends_operator_closeout_as_new_message()
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review", return_value=closeout_text):
         await adapter._handle_callback_query(update, MagicMock())
 
-    query.edit_message_text.assert_called_once()
+    assert query.edit_message_text.call_count == 2
+    first_edit = query.edit_message_text.call_args_list[0].kwargs
+    assert first_edit["reply_markup"] is None
+    assert "Выбор зафиксирован: ✅ Да" in first_edit["text"]
+    assert "Статус: ⏳ Обрабатываю" in first_edit["text"]
+
+    final_edit = query.edit_message_text.call_args_list[-1].kwargs
+    assert final_edit["reply_markup"] is None
+    assert "Статус: ✅ Завершено" in final_edit["text"]
+    assert closeout_text in final_edit["text"]
+
     adapter._bot.send_message.assert_called_once()
     sent = adapter._bot.send_message.call_args.kwargs
     assert sent["chat_id"] == 5558998798

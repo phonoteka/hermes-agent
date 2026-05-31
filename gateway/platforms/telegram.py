@@ -3002,9 +3002,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         thread_id=transport_thread_id,
                     )
                     label_map = {
-                        "approve": "✅ Принято",
-                        "reject": "❌ Отклонено",
-                        "revise": "✏️ Нужны коррективы",
+                        "approve": "✅ Да",
+                        "reject": "❌ Нет",
+                        "revise": "✏️ Коррективы",
                     }
                     label = label_map.get(str(action_id or "").lower(), "Resolved")
                 else:
@@ -3014,17 +3014,35 @@ class TelegramAdapter(BasePlatformAdapter):
                         choice=choice,
                     )
                     label_map = {
-                        "y": "✅ Принято",
-                        "n": "❌ Отклонено",
-                        "e": "✏️ Нужны коррективы",
+                        "y": "✅ Да",
+                        "n": "❌ Нет",
+                        "e": "✏️ Коррективы",
                     }
                     label = label_map.get(choice, "Resolved")
                 await query.answer(text="Принято, обрабатываю…")
+                try:
+                    await query.edit_message_text(
+                        text=(
+                            "Выбор зафиксирован: "
+                            f"{label}\n"
+                            "Статус: ⏳ Обрабатываю…"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
                 result_text = resolve_telegram_canon_review(**resolver_kwargs)
                 user_display = getattr(query.from_user, "first_name", "User")
                 try:
                     await query.edit_message_text(
-                        text=f"{label} by {user_display}\n\n{result_text}",
+                        text=(
+                            "Выбор зафиксирован: "
+                            f"{label}\n"
+                            f"Оператор: {user_display}\n"
+                            "Статус: ✅ Завершено\n\n"
+                            f"{result_text}"
+                        ),
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=None,
                     )

@@ -178,6 +178,133 @@ class TestTelegramExecApproval:
         )
         assert result.success is False
 
+
+class TestTelegramCanonReviewButtons:
+    """Canon review buttons must be mechanical gateway callbacks, not agent turns."""
+
+    @pytest.mark.asyncio
+    async def test_sends_yes_no_corrections_keyboard(self):
+        """send_canon_review_prompt renders the exact three operator choices.
+
+        pre: Telegram adapter is connected and receives a Canon run id.
+        post: the outgoing inline keyboard carries cg:y/n/e callbacks for the same run id.
+        raises: AssertionError while the review UI cannot be answered by button callbacks.
+        """
+
+        adapter = _make_adapter()
+        adapter._bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=42))
+        buttons = []
+
+        def fake_button(text, callback_data=None, **kwargs):
+            button = SimpleNamespace(text=text, callback_data=callback_data, kwargs=kwargs)
+            buttons.append(button)
+            return button
+
+        with patch("gateway.platforms.telegram.InlineKeyboardButton", side_effect=fake_button):
+            result = await adapter.send_canon_review_prompt(
+                chat_id="12345",
+                message="**Canon ждёт согласования**\nВопрос: test",
+                run_id="cg-test-1",
+                metadata={"thread_id": "999"},
+            )
+
+        assert result.success is True
+        assert [button.text for button in buttons] == ["✅ Да", "❌ Нет", "✏️ Внести коррективы"]
+        assert [button.callback_data for button in buttons] == [
+            "cg:y:cg-test-1",
+            "cg:n:cg-test-1",
+            "cg:e:cg-test-1",
+        ]
+        kwargs = adapter._bot.send_message.call_args[1]
+        assert kwargs.get("message_thread_id") == 999
+        assert kwargs.get("parse_mode") is None
+
+    @pytest.mark.asyncio
+    async def test_canon_callback_records_decision_without_agent_message(self):
+        """cg button callbacks persist the decision directly through the Canon gateway tool.
+
+        pre: an authorized Telegram user clicks a Canon review button.
+        post: the callback calls resolve_telegram_canon_review and edits the prompt in-place;
+              it does not route through _handle_message / the agent.
+        raises: AssertionError while button mechanics still require an agent turn.
+        """
+
+        adapter = _make_adapter()
+        runner = _AuthRunner(authorized=True)
+        adapter._message_handler = runner._handle_message
+        query = AsyncMock()
+        query.data = "cg:y:cg-test-2"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 777
+        query.message.message_thread_id = 999
+        query.message.chat.type = "supergroup"
+        query.from_user = MagicMock()
+        query.from_user.id = 222
+        query.from_user.first_name = "Breanainn"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch("tools.canon_gateway_review.resolve_telegram_canon_review", return_value="recorded") as resolver:
+            await adapter._handle_callback_query(update, MagicMock())
+
+        resolver.assert_called_once_with(
+            run_id="cg-test-2",
+            choice="y",
+            actor_id="222",
+            actor_name="Breanainn",
+            chat_id="12345",
+            thread_id="999",
+            message_id="777",
+        )
+        query.answer.assert_called_once()
+        assert query.edit_message_text.call_count == 2
+        first_edit = query.edit_message_text.call_args_list[0].kwargs
+        assert first_edit["reply_markup"] is None
+        assert "Выбор зафиксирован: ✅ Да" in first_edit["text"]
+        assert "Статус: ⏳ Обрабатываю" in first_edit["text"]
+
+        final_edit = query.edit_message_text.call_args_list[-1].kwargs
+        assert final_edit["reply_markup"] is None
+        assert "Статус: ✅ Завершено" in final_edit["text"]
+        assert "recorded" in final_edit["text"]
+        assert runner.last_source is not None
+
+    @pytest.mark.asyncio
+    async def test_canon_callback_without_runner_auth_or_allowlist_fails_closed(self, monkeypatch):
+        """Canon review buttons must not fall back to public access when auth authority is absent.
+
+        pre: a Telegram Canon callback arrives but no runner auth function or allowlist is present.
+        post: the callback is rejected before resolve_telegram_canon_review can mutate Canon state.
+        raises: AssertionError while current-gateway review buttons default-open on auth gaps.
+        """
+
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "cg:y:cg-test-auth-gap"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.message_id = 777
+        query.message.message_thread_id = None
+        query.message.chat.type = "private"
+        query.from_user = MagicMock()
+        query.from_user.id = 222
+        query.from_user.first_name = "Breanainn"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch("tools.canon_gateway_review.resolve_telegram_canon_review", return_value="recorded") as resolver:
+            await adapter._handle_callback_query(update, MagicMock())
+
+        resolver.assert_not_called()
+        query.answer.assert_called_once_with(text="⛔ You are not authorized to answer this Canon review.")
+        query.edit_message_text.assert_not_called()
+
     @pytest.mark.asyncio
     async def test_disable_link_previews_sets_preview_kwargs(self):
         adapter = _make_adapter(extra={"disable_link_previews": True})
