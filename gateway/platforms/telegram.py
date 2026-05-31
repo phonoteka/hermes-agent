@@ -615,6 +615,23 @@ class TelegramAdapter(BasePlatformAdapter):
         return None
 
     @classmethod
+    def _is_canon_operator_closeout_text(cls, text: str) -> bool:
+        """Return true when resolver output is the completed current-gateway closeout.
+
+        pre: text is the operator-facing result returned by the Canon review resolver.
+        post: returns true only for completed closeouts that include artifact-index content;
+              generic recorded/failed/revise status lines are not re-sent as fresh messages.
+        raises: none.
+        """
+
+        normalized = str(text or "")
+        return (
+            "Canon review recorded: `completed`" in normalized
+            and "Артефакты:" in normalized
+            and "artifacts." in normalized
+        )
+
+    @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
             return None
@@ -3013,6 +3030,20 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass
+                if self._is_canon_operator_closeout_text(result_text) and self._bot:
+                    closeout_kwargs: Dict[str, Any] = {
+                        "chat_id": query_chat_id,
+                        "text": result_text,
+                        "parse_mode": ParseMode.MARKDOWN,
+                    }
+                    closeout_kwargs.update(
+                        self._thread_kwargs_for_send(
+                            str(query_chat_id or ""),
+                            str(resolver_kwargs.get("thread_id") or "") or None,
+                            {"thread_id": resolver_kwargs.get("thread_id")},
+                        )
+                    )
+                    await self._bot.send_message(**closeout_kwargs)
             except Exception as exc:
                 logger.error("[%s] Canon review callback failed: %s", self.name, exc, exc_info=True)
                 await query.answer(text=f"Canon callback failed: {exc}")

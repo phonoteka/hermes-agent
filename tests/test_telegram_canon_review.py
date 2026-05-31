@@ -304,6 +304,49 @@ async def test_canon_non_revise_callback_answers_before_resolver_runs():
 
 
 @pytest.mark.asyncio
+async def test_completed_canon_callback_sends_operator_closeout_as_new_message():
+    """Completed Canon reviews must produce an operator-visible chat message, not only edit the card.
+
+    pre: approve callback resolves to a completed current-gateway closeout with artifact refs.
+    post: Telegram adapter edits the card and also sends the closeout as a fresh message to
+          the same chat/thread so completion is visible in the conversation flow.
+    raises: AssertionError while closeout is only hidden in an edited review card.
+    """
+
+    adapter = _make_adapter()
+    query = AsyncMock()
+    query.data = '{"a":"approve","n":"review","r":"sm-closeout","t":"0"}'
+    query.message = MagicMock()
+    query.message.chat_id = 5558998798
+    query.message.message_id = 8060
+    query.message.message_thread_id = None
+    query.message.chat.type = "private"
+    query.from_user = MagicMock()
+    query.from_user.id = 5558998798
+    query.from_user.first_name = "Breanainn"
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+
+    update = MagicMock()
+    update.callback_query = query
+    closeout_text = (
+        "Canon review recorded: `completed` for `sm-closeout`.\n"
+        "Кратко: done\n"
+        "Артефакты:\n"
+        "- `artifacts.solution-modeling.spec` -> `/tmp/spec.json`"
+    )
+
+    with patch("tools.canon_gateway_review.resolve_telegram_canon_review", return_value=closeout_text):
+        await adapter._handle_callback_query(update, MagicMock())
+
+    query.edit_message_text.assert_called_once()
+    adapter._bot.send_message.assert_called_once()
+    sent = adapter._bot.send_message.call_args.kwargs
+    assert sent["chat_id"] == 5558998798
+    assert sent["text"] == closeout_text
+
+
+@pytest.mark.asyncio
 async def test_compact_canon_callback_reconstructs_gate_identity_under_telegram_limit():
     """Compact Canon callbacks must fit Telegram while preserving resolvable gate authority.
 
