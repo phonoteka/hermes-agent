@@ -140,33 +140,12 @@ def resolve_telegram_canon_review(
         summary = closeout.get("summary")
         if isinstance(summary, str) and summary.strip():
             lines.append(f"Кратко: {summary.strip()}")
-        plan = closeout.get("implementationPlan")
-        if isinstance(plan, dict):
-            objective = plan.get("objective")
-            if isinstance(objective, str) and objective.strip():
-                lines.append(f"План: {objective.strip()}")
-            steps = plan.get("steps")
-            if isinstance(steps, list):
-                compact_steps = [str(step).strip() for step in steps if str(step).strip()][:3]
-                for step in compact_steps:
-                    lines.append(f"- {step}")
-        artifact_index = closeout.get("artifactIndex")
-        if isinstance(artifact_index, list) and artifact_index:
-            lines.append("Артефакты:")
-            for row in artifact_index[:8]:
-                if not isinstance(row, dict):
-                    continue
-                ref = str(row.get("ref") or "").strip()
-                path = str(row.get("path") or "").strip()
-                note = str(row.get("note") or "").strip()
-                if ref and path:
-                    lines.append(f"- `{ref}` -> `{path}`")
-                elif ref and note:
-                    lines.append(f"- `{ref}` ({note})")
-                elif ref:
-                    lines.append(f"- `{ref}`")
-        if artifact_ref:
-            lines.append(f"Ответ оператора: `{artifact_ref}`")
+        spec_package_dir = closeout.get("specPackageDirectory")
+        if isinstance(spec_package_dir, str) and spec_package_dir.strip():
+            lines.append(f"Пакет спеков: `{spec_package_dir.strip()}`")
+        implementation_plan_file = closeout.get("implementationPlanFile")
+        if isinstance(implementation_plan_file, str) and implementation_plan_file.strip():
+            lines.append(f"План: `{implementation_plan_file.strip()}`")
         return "\n".join(lines)
 
     suffix = f"\nАртефакт: `{artifact_ref}`" if artifact_ref else ""

@@ -322,7 +322,16 @@ class _GatewayHermesScopedPhaseSession:
         prompt = self._build_phase_prompt(envelope)
         from hermes_cli.oneshot import _run_agent
 
-        response = _run_agent(prompt, toolsets=[], use_config_toolsets=False)
+        model_route = self._projection.get("modelRoute") if isinstance(self._projection.get("modelRoute"), dict) else {}
+        model = str(model_route.get("model") or "").strip() or None
+        provider = str(model_route.get("provider") or "").strip() or None
+        response = _run_agent(
+            prompt,
+            model=model,
+            provider=provider,
+            toolsets=["skills", "file", "terminal"],
+            use_config_toolsets=False,
+        )
         output = _extract_json_object(response)
         artifact_refs = self._persist_solution_modeling_handoff(output, envelope=envelope)
         result: dict[str, Any] = {"status": "succeeded", "output": output}
@@ -374,6 +383,8 @@ class _GatewayHermesScopedPhaseSession:
             "You are executing one Canon current-gateway phase.\n"
             "Return ONLY one valid JSON object. No markdown, no prose, no code fences.\n"
             "The JSON object MUST validate against the provided JSON Schema.\n"
+            "Before the final JSON answer, use skill_view to load every skill named in inputs.mandatorySkills; apply those skill contracts to the output.\n"
+            "Use read_file/search_files/terminal only when the phase inputs name concrete project refs or repo roots that require reconnaissance.\n"
             "Do not use placeholders; fill fields with concise task-specific content.\n"
             "If the schema asks for handoff refs, use these exact refs where applicable:\n"
             f"- modelPackageRef/specPackageRef: {ref_prefix}/model-package\n"

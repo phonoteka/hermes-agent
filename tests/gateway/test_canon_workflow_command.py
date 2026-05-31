@@ -191,6 +191,56 @@ async def test_canon_run_live_path_uses_canon_module_workflow_resolution_without
     )
 
 
+def test_solution_modeling_phase_session_uses_route_model_and_skill_tools(monkeypatch):
+    """Live solution-modeling phases must run with skill access and the Canon-selected model route.
+
+    pre: Canon phase backend projection carries modelRoute from workflow routing authority.
+    post: gateway phase session calls oneshot agent with openai-codex/gpt-5.5 and skills/file/terminal
+          toolsets, so mandatorySkills can actually be loaded by the model.
+    raises: AssertionError while phase execution still uses the ambient gateway model with no tools.
+    """
+
+    import hermes_cli.oneshot as oneshot
+    from tools.canon_workflow_command import _GatewayHermesScopedPhaseSession
+
+    captured = {}
+
+    def fake_run_agent(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        return '{"ok": true}'
+
+    monkeypatch.setattr(oneshot, "_run_agent", fake_run_agent)
+    session = _GatewayHermesScopedPhaseSession(
+        envelope_projection={
+            "modelRoute": {"provider": "openai-codex", "model": "gpt-5.5"},
+            "hermesProfileId": "default",
+        },
+        artifacts_dir=None,
+    )
+
+    result = session.run_phase(
+        {
+            "runId": "run-skill-route",
+            "phaseId": "model_solution",
+            "objective": "Produce model package.",
+            "inputs": {"mandatorySkills": ["solution-modeling-packages", "writing-plans"]},
+            "outputSchema": {"schema": {"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}},
+        }
+    )
+
+    assert result == {
+        "status": "succeeded",
+        "output": {"ok": True},
+        "agentSessionRef": "hermes-current-gateway:run-skill-route:model_solution:1",
+    }
+    assert captured["kwargs"]["provider"] == "openai-codex"
+    assert captured["kwargs"]["model"] == "gpt-5.5"
+    assert captured["kwargs"]["toolsets"] == ["skills", "file", "terminal"]
+    assert captured["kwargs"]["use_config_toolsets"] is False
+    assert "use skill_view to load every skill named in inputs.mandatorySkills" in captured["prompt"]
+
+
 @pytest.mark.asyncio
 async def test_canon_command_rejects_dry_run_or_direct_helper_proof(monkeypatch):
     import integrations.hermes.canon_hermes.current_gateway as current_gateway

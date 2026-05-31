@@ -8,12 +8,12 @@ import types
 from tools.canon_gateway_review import resolve_telegram_canon_review
 
 
-def test_resolver_formats_completed_closeout_with_summary_plan_and_artifacts(monkeypatch):
-    """Completed callbacks must render Canon closeout content, not generic status-only text.
+def test_resolver_formats_completed_closeout_with_spec_package_dir_and_plan_file(monkeypatch):
+    """Completed callbacks must render operator-facing files, not internal artifact bureaucracy.
 
     pre: recorder returns status=completed with operatorCloseout payload from current-gateway.
-    post: resolver response includes run/status plus concise summary, plan excerpt, and artifact index.
-    raises: AssertionError while resolver still emits only `Canon review recorded: completed` text.
+    post: resolver response includes run/status/summary plus spec-package directory and plan file only.
+    raises: AssertionError while resolver still dumps internal payload refs into Telegram.
     """
 
     calls = []
@@ -31,17 +31,8 @@ def test_resolver_formats_completed_closeout_with_summary_plan_and_artifacts(mon
                 "runId": "run-1",
                 "status": "completed",
                 "summary": "Frozen package summary.",
-                "implementationPlan": {
-                    "objective": "Ship exact /ping handler.",
-                    "steps": ["Locate boundary", "Add handler"],
-                },
-                "artifactIndex": [
-                    {
-                        "label": "Implementation plan",
-                        "ref": "artifacts.solution-modeling.implementation-plan",
-                        "path": "/home/hermes/.hermes/canon-current-gateway/artifacts/artifacts.solution-modeling.implementation-plan/payload.json",
-                    }
-                ],
+                "specPackageDirectory": "/home/hermes/.hermes/canon-current-gateway/artifacts/current-gateway/run-1/spec-package",
+                "implementationPlanFile": "/home/hermes/.hermes/canon-current-gateway/artifacts/current-gateway/run-1/implementation-plan.md",
             },
         }
 
@@ -66,9 +57,12 @@ def test_resolver_formats_completed_closeout_with_summary_plan_and_artifacts(mon
     assert "run-1" in result
     assert "completed" in result
     assert "Frozen package summary." in result
-    assert "Ship exact /ping handler." in result
-    assert "artifacts.solution-modeling.implementation-plan" in result
-    assert "/home/hermes/.hermes/canon-current-gateway/artifacts/" in result
+    assert "Пакет спеков:" in result
+    assert "План:" in result
+    assert "/home/hermes/.hermes/canon-current-gateway/artifacts/current-gateway/run-1/spec-package" in result
+    assert "/home/hermes/.hermes/canon-current-gateway/artifacts/current-gateway/run-1/implementation-plan.md" in result
+    assert "artifacts.solution-modeling" not in result
+    assert "Ответ оператора" not in result
     assert calls
 
 
