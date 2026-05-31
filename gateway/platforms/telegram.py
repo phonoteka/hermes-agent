@@ -427,6 +427,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
+        # Pending Canon revise captures keyed by same-origin chat/thread.
+        self._canon_pending_revise: Dict[str, Dict[str, str]] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -460,8 +462,15 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_type: Optional[str] = None,
         thread_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        require_configured_authority: bool = False,
     ) -> bool:
-        """Return whether a Telegram inline-button caller may perform gated actions."""
+        """Return whether a Telegram inline-button caller may perform gated actions.
+
+        pre: user_id is the Telegram user that clicked an inline button.
+        post: when require_configured_authority is true, missing runner auth and missing
+              TELEGRAM_ALLOWED_USERS fail closed instead of allowing every user.
+        raises: none.
+        """
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
@@ -488,6 +497,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return bool(auth_fn(source))
             except Exception:
+                if require_configured_authority:
+                    logger.warning(
+                        "[Telegram] Callback auth authority failed for user %s; denying privileged callback",
+                        normalized_user_id,
+                        exc_info=True,
+                    )
+                    return False
                 logger.debug(
                     "[Telegram] Falling back to env-only callback auth for user %s",
                     normalized_user_id,
@@ -496,7 +512,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         allowed_csv = os.getenv("TELEGRAM_ALLOWED_USERS", "").strip()
         if not allowed_csv:
-            return True
+            return not require_configured_authority
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
@@ -506,6 +522,97 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         thread_id = metadata.get("thread_id") or metadata.get("message_thread_id")
         return str(thread_id) if thread_id is not None else None
+
+    @classmethod
+    def _canon_review_callbacks(
+        cls,
+        *,
+        run_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, str]]:
+        """Return Canon review callback descriptors for one Telegram review card.
+
+        pre: ``run_id`` is the current-gateway run id; metadata may optionally carry a
+             workflow-declared ``callbacks`` array with ``label``/``callbackData`` rows.
+        post: returns the declared callbacks unchanged when present.
+        post: legacy yes/no/revise callbacks are used only for non-declared review prompts.
+        raises: ValueError when a declared current-gateway prompt omits usable callbacks.
+        """
+
+        normalized_run_id = str(run_id or "").strip()
+        metadata = metadata if isinstance(metadata, dict) else None
+        declared_callbacks = metadata.get("callbacks") if metadata else None
+        gate_identity = None
+        if metadata:
+            candidate_gate_identity = metadata.get("gate_identity") or metadata.get("gateIdentity")
+            if isinstance(candidate_gate_identity, dict):
+                gate_identity = candidate_gate_identity
+        declared_prompt = gate_identity is not None or "callbacks" in metadata if metadata else False
+
+        normalized_callbacks: List[Dict[str, str]] = []
+        if isinstance(declared_callbacks, list):
+            for row in declared_callbacks:
+                if not isinstance(row, dict):
+                    normalized_callbacks = []
+                    break
+                label = str(row.get("label") or "").strip()
+                callback_data = str(row.get("callbackData") or row.get("callback_data") or "").strip()
+                if not label or not callback_data:
+                    normalized_callbacks = []
+                    break
+                normalized_callbacks.append({"label": label, "callbackData": callback_data})
+        if normalized_callbacks:
+            return normalized_callbacks
+        if declared_prompt:
+            raise ValueError("declared Canon review prompts require valid callbacks")
+        return [
+            {"label": "✅ Да", "callbackData": f"cg:y:{normalized_run_id}"},
+            {"label": "❌ Нет", "callbackData": f"cg:n:{normalized_run_id}"},
+            {"label": "✏️ Внести коррективы", "callbackData": f"cg:e:{normalized_run_id}"},
+        ]
+
+    @classmethod
+    def _parse_canon_review_callback_data(cls, data: str) -> Optional[Dict[str, str]]:
+        """Parse one Canon review callback payload from Telegram callback_data.
+
+        pre: ``data`` is the raw Telegram callback_data string.
+        post: returns either legacy ``choice``/``run_id`` authority or declared
+              ``gate_id``/``action_id`` authority; unrelated callback payloads return None.
+        raises: none; malformed JSON callback_data returns None so callers can fail closed.
+        """
+
+        normalized_data = str(data or "").strip()
+        if not normalized_data:
+            return None
+        if normalized_data.startswith("cg:"):
+            parts = normalized_data.split(":", 2)
+            if len(parts) != 3:
+                return None
+            choice, run_id = parts[1].strip().lower(), parts[2].strip()
+            if not choice or not run_id:
+                return None
+            return {"mode": "legacy", "choice": choice, "run_id": run_id}
+        if not normalized_data.startswith("{"):
+            return None
+        try:
+            payload = json.loads(normalized_data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        gate_id = str(payload.get("gateId") or payload.get("gate_id") or "").strip()
+        action_id = str(payload.get("action") or payload.get("actionId") or payload.get("action_id") or payload.get("a") or "").strip().lower()
+        run_id = str(payload.get("runId") or payload.get("run_id") or payload.get("r") or "").strip()
+        node_id = str(payload.get("nodeId") or payload.get("node_id") or payload.get("n") or "").strip()
+        thread_id = str(payload.get("threadId") or payload.get("thread_id") or payload.get("t") or "").strip()
+        if gate_id and action_id:
+            return {"mode": "declared", "gate_id": gate_id, "action_id": action_id}
+        if run_id and node_id and action_id:
+            result = {"mode": "declared", "run_id": run_id, "node_id": node_id, "action_id": action_id}
+            if thread_id:
+                result["thread_id"] = thread_id
+            return result
+        return None
 
     @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -2215,6 +2322,100 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_canon_review_prompt(
+        self,
+        chat_id: str,
+        message: str,
+        run_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a Canon review prompt whose buttons resolve without an agent turn.
+
+        pre: run_id is the durable Canon current-gateway run id and message is the
+             concise operator-facing review text.
+        post: sends one Telegram inline keyboard with yes/no/corrections actions whose
+              callback_data is compact enough for Telegram's 64-byte limit.
+        raises: none; failures are returned as SendResult(success=False).
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            normalized_run_id = str(run_id or "").strip()
+            if not normalized_run_id:
+                return SendResult(success=False, error="run_id is required")
+            downloadable_artifacts: List[Dict[str, Any]] = []
+            if isinstance(metadata, dict):
+                candidate_downloads = metadata.get("downloadableArtifacts") or metadata.get("downloadable_artifacts")
+                if candidate_downloads is not None:
+                    if not isinstance(candidate_downloads, list) or not candidate_downloads:
+                        return SendResult(success=False, error="Canon review downloadableArtifacts must be a non-empty list")
+                    for index, artifact in enumerate(candidate_downloads):
+                        if not isinstance(artifact, dict):
+                            return SendResult(success=False, error=f"Canon review downloadable artifact must be an object: index={index}")
+                        file_path = str(artifact.get("path") or artifact.get("filePath") or "").strip()
+                        if not file_path:
+                            return SendResult(success=False, error=f"Canon review downloadable artifact missing path: index={index}")
+                        downloadable_artifacts.append(artifact)
+                elif metadata.get("gate_identity") or metadata.get("gateIdentity"):
+                    return SendResult(success=False, error="Canon review prompt requires downloadable full artifact package")
+            preview = message if len(message) <= 3800 else message[:3800] + "..."
+            callback_rows = self._canon_review_callbacks(run_id=normalized_run_id, metadata=metadata)
+            buttons = [
+                InlineKeyboardButton(row["label"], callback_data=row["callbackData"])
+                for row in callback_rows
+            ]
+            keyboard_rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+            keyboard = InlineKeyboardMarkup(keyboard_rows)
+
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=preview,
+                # Canon review text is generated from runtime artifacts and operator input;
+                # send it as plain text so untrusted Markdown characters cannot break delivery.
+                parse_mode=None,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                ),
+            )
+            review_message_id = str(msg.message_id)
+            document_message_ids: List[str] = []
+            for artifact in downloadable_artifacts:
+                file_path = str(artifact.get("path") or artifact.get("filePath") or "").strip()
+                document_result = await self.send_document(
+                    chat_id=chat_id,
+                    file_path=file_path,
+                    caption=str(artifact.get("caption") or "Full Canon review package"),
+                    file_name=str(artifact.get("fileName") or artifact.get("file_name") or os.path.basename(file_path)),
+                    reply_to=review_message_id,
+                    metadata={
+                        **(metadata or {}),
+                        **({"thread_id": thread_id} if thread_id is not None else {}),
+                    },
+                )
+                if not getattr(document_result, "success", False):
+                    return SendResult(
+                        success=False,
+                        error=f"Canon review downloadable artifact delivery failed: {getattr(document_result, 'error', 'unknown error')}",
+                    )
+                if getattr(document_result, "message_id", None):
+                    document_message_ids.append(str(document_result.message_id))
+            return SendResult(
+                success=True,
+                message_id=review_message_id,
+                raw_response={"document_message_ids": document_message_ids},
+            )
+        except Exception as e:
+            logger.warning("[%s] send_canon_review_prompt failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -2698,6 +2899,123 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._bot.send_message(**send_kwargs)
                 except Exception as exc:
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
+            return
+
+        # --- Canon current-gateway review callbacks ---
+        canon_callback = self._parse_canon_review_callback_data(data)
+        if canon_callback is not None:
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+                require_configured_authority=True,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer this Canon review.")
+                return
+            try:
+                from tools.canon_gateway_review import resolve_telegram_canon_review
+
+                choice = canon_callback.get("choice")
+                action_id = canon_callback.get("action_id")
+                is_revise = choice == "e" or action_id == "revise"
+                if is_revise:
+                    origin_key = self._canon_revise_origin_key(
+                        chat_id=str(query_chat_id or ""),
+                        thread_id=str(query_thread_id or "") if query_thread_id is not None else None,
+                    )
+                    declared_gate_id = str(canon_callback.get("gate_id") or "")
+                    callback_thread_id = str(canon_callback.get("thread_id") or "").strip()
+                    transport_thread_id = callback_thread_id or (str(query_thread_id) if query_thread_id is not None else "")
+                    if not declared_gate_id and canon_callback.get("mode") == "declared":
+                        callback_run_id = str(canon_callback.get("run_id") or "").strip()
+                        callback_node_id = str(canon_callback.get("node_id") or "").strip()
+                        if callback_run_id and callback_node_id:
+                            if transport_thread_id:
+                                declared_gate_id = f"{callback_run_id}:telegram:{query_chat_id}:{transport_thread_id}:{callback_node_id}"
+                            else:
+                                declared_gate_id = f"{callback_run_id}:telegram:{query_chat_id}:{callback_node_id}"
+                    self._canon_pending_revise[origin_key] = {
+                        "run_id": str(canon_callback.get("run_id") or ""),
+                        "gate_id": declared_gate_id,
+                        "action_id": str(action_id or choice or ""),
+                        "chat_id": str(query_chat_id or ""),
+                        "thread_id": transport_thread_id,
+                        "prompt_message_id": str(getattr(query_message, "message_id", "") or ""),
+                    }
+                    await query.answer(text="✏️ Отправьте следующим сообщением текст корректировок")
+                    try:
+                        await query.edit_message_text(
+                            text=(
+                                "✏️ Нужны коррективы\n"
+                                "Ожидаю следующее авторизованное сообщение в этом же чате/треде как инструкцию для revise."
+                            ),
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
+                    return
+
+                resolver_kwargs: Dict[str, Any] = {
+                    "actor_id": caller_id,
+                    "actor_name": str(query_user_name or ""),
+                    "chat_id": str(query_chat_id or ""),
+                    "thread_id": str(query_thread_id or "") if query_thread_id is not None else None,
+                    "message_id": str(getattr(query_message, "message_id", "") or ""),
+                }
+                if canon_callback.get("mode") == "declared":
+                    declared_gate_id = str(canon_callback.get("gate_id") or "")
+                    callback_thread_id = str(canon_callback.get("thread_id") or "").strip()
+                    transport_thread_id = callback_thread_id or (str(query_thread_id) if query_thread_id is not None else "")
+                    if not declared_gate_id:
+                        callback_run_id = str(canon_callback.get("run_id") or "").strip()
+                        callback_node_id = str(canon_callback.get("node_id") or "").strip()
+                        if not callback_run_id or not callback_node_id:
+                            raise ValueError("compact Canon callback is missing run/node identity")
+                        if transport_thread_id:
+                            declared_gate_id = f"{callback_run_id}:telegram:{query_chat_id}:{transport_thread_id}:{callback_node_id}"
+                        else:
+                            declared_gate_id = f"{callback_run_id}:telegram:{query_chat_id}:{callback_node_id}"
+                    resolver_kwargs.update(
+                        gate_id=declared_gate_id,
+                        action_id=str(action_id or ""),
+                        thread_id=transport_thread_id,
+                    )
+                    label_map = {
+                        "approve": "✅ Принято",
+                        "reject": "❌ Отклонено",
+                        "revise": "✏️ Нужны коррективы",
+                    }
+                    label = label_map.get(str(action_id or "").lower(), "Resolved")
+                else:
+                    choice = str(choice or "")
+                    resolver_kwargs.update(
+                        run_id=str(canon_callback.get("run_id") or ""),
+                        choice=choice,
+                    )
+                    label_map = {
+                        "y": "✅ Принято",
+                        "n": "❌ Отклонено",
+                        "e": "✏️ Нужны коррективы",
+                    }
+                    label = label_map.get(choice, "Resolved")
+                await query.answer(text="Принято, обрабатываю…")
+                result_text = resolve_telegram_canon_review(**resolver_kwargs)
+                user_display = getattr(query.from_user, "first_name", "User")
+                try:
+                    await query.edit_message_text(
+                        text=f"{label} by {user_display}\n\n{result_text}",
+                        parse_mode=ParseMode.MARKDOWN,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.error("[%s] Canon review callback failed: %s", self.name, exc, exc_info=True)
+                await query.answer(text=f"Canon callback failed: {exc}")
             return
 
         # --- Update prompt callbacks ---
@@ -3796,6 +4114,147 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         return self._message_matches_mention_patterns(message)
 
+    def _canon_revise_origin_key(self, *, chat_id: str, thread_id: Optional[str]) -> str:
+        """Return stable same-origin key for Canon revise follow-up capture.
+
+        pre: chat_id identifies one Telegram chat; thread_id may be empty/None for non-thread chats.
+        post: returned key binds pending revise capture to exactly one chat/thread origin.
+        post: DM/general-thread `None`, empty, and `0` normalize to one non-thread origin key.
+        raises: none.
+        """
+
+        normalized_thread = str(thread_id or "").strip()
+        if normalized_thread == "0":
+            normalized_thread = ""
+        return f"{str(chat_id)}::{normalized_thread}"
+
+    async def _consume_pending_canon_revise(self, message: Message) -> bool:
+        """Record the next authorized same-origin message as Canon revise instructions.
+
+        pre: message is one incoming Telegram text message.
+        post: when a pending revise state exists for the same chat/thread and caller is authorized,
+              this method emits immediate progress feedback, records the revision instructions
+              durably, and clears pending state after the Canon resolver returns.
+        post: unauthorized or wrong-origin messages fail closed by returning False without mutation.
+        raises: none; failures are surfaced to chat and pending state is preserved for retry.
+        """
+
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        thread_id_obj = getattr(message, "message_thread_id", None)
+        thread_id = str(thread_id_obj) if thread_id_obj is not None else None
+        origin_key = self._canon_revise_origin_key(chat_id=chat_id, thread_id=thread_id)
+        pending = self._canon_pending_revise.get(origin_key)
+        if not pending:
+            return False
+
+        caller_id = str(getattr(getattr(message, "from_user", None), "id", "") or "")
+        caller_name = str(getattr(getattr(message, "from_user", None), "first_name", "") or "")
+        chat = getattr(message, "chat", None)
+        chat_type = str(getattr(chat, "type", "") or "")
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            thread_id=thread_id,
+            user_name=caller_name,
+            require_configured_authority=True,
+        ):
+            return False
+
+        instructions = str(getattr(message, "text", "") or "").strip()
+        if not instructions:
+            return False
+
+        try:
+            from tools.canon_gateway_review import resolve_telegram_canon_review
+
+            loop = asyncio.get_running_loop()
+            pending_run_id = str(pending.get("run_id") or "")
+            pending_gate_id = str(pending.get("gate_id") or "")
+            pending_action_id = str(pending.get("action_id") or "")
+            pending_transport_thread_id = str(pending.get("thread_id") or "").strip()
+            resolver_thread_id = pending_transport_thread_id or thread_id
+
+            def _next_review_sender(payload: Dict[str, Any]) -> Dict[str, str]:
+                """Bridge Canon's sync revise-loop sender to Telegram's async review prompt API.
+
+                pre: payload contains the next review-card message produced by Canon runtime resume.
+                post: sends a real Telegram review prompt with inline buttons in the same chat/thread
+                      and returns the delivered message id for durable Canon evidence.
+                raises: RuntimeError when Telegram delivery fails or lacks a message id.
+                """
+
+                future = asyncio.run_coroutine_threadsafe(
+                    self.send_canon_review_prompt(
+                        chat_id=chat_id,
+                        message=str(payload.get("message") or ""),
+                        run_id=pending_run_id,
+                        metadata={
+                            **({"thread_id": resolver_thread_id} if resolver_thread_id is not None else {}),
+                            **({"callbacks": payload.get("callbacks")} if isinstance(payload.get("callbacks"), list) else {}),
+                            **({"gate_identity": payload.get("gateIdentity")} if isinstance(payload.get("gateIdentity"), dict) else {}),
+                            **({"downloadableArtifacts": payload.get("downloadableArtifacts")} if isinstance(payload.get("downloadableArtifacts"), list) else {}),
+                        },
+                    ),
+                    loop,
+                )
+                send_result = future.result(timeout=30)
+                if not getattr(send_result, "success", False):
+                    raise RuntimeError(str(getattr(send_result, "error", "Canon revise review delivery failed")))
+                message_id = str(getattr(send_result, "message_id", "") or "").strip()
+                if not message_id:
+                    raise RuntimeError("Canon revise review delivery returned no message id")
+                result: Dict[str, str] = {
+                    "messageId": message_id,
+                    "chatId": str(chat_id),
+                }
+                if resolver_thread_id is not None:
+                    result["threadId"] = str(resolver_thread_id)
+                return result
+
+            resolver_kwargs: Dict[str, Any] = {
+                "actor_id": caller_id,
+                "actor_name": caller_name,
+                "chat_id": chat_id,
+                "thread_id": resolver_thread_id,
+                "message_id": str(pending.get("prompt_message_id") or getattr(message, "message_id", "") or ""),
+                "revision_instructions": instructions,
+                "sender": _next_review_sender,
+            }
+            if pending_gate_id:
+                resolver_kwargs.update(gate_id=pending_gate_id, action_id=pending_action_id or "revise")
+            else:
+                resolver_kwargs.update(run_id=pending_run_id, choice="e")
+            if self._bot:
+                progress_kwargs: Dict[str, Any] = {
+                    "chat_id": int(chat_id),
+                    "text": "Canon review text received; recording revision and resuming workflow…",
+                    "parse_mode": ParseMode.MARKDOWN,
+                    **self._link_preview_kwargs(),
+                }
+                if thread_id is not None:
+                    progress_kwargs.update(self._thread_kwargs_for_send(chat_id, thread_id, {"thread_id": thread_id}))
+                await self._bot.send_message(**progress_kwargs)
+            result_text = await asyncio.to_thread(
+                resolve_telegram_canon_review,
+                **resolver_kwargs,
+            )
+            self._canon_pending_revise.pop(origin_key, None)
+            if self._bot:
+                send_kwargs: Dict[str, Any] = {
+                    "chat_id": int(chat_id),
+                    "text": result_text,
+                    "parse_mode": ParseMode.MARKDOWN,
+                    **self._link_preview_kwargs(),
+                }
+                if thread_id is not None:
+                    send_kwargs.update(self._thread_kwargs_for_send(chat_id, thread_id, {"thread_id": thread_id}))
+                await self._bot.send_message(**send_kwargs)
+            return True
+        except Exception as exc:
+            logger.error("[%s] Canon revise follow-up failed: %s", self.name, exc, exc_info=True)
+            return False
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -3804,6 +4263,8 @@ class TelegramAdapter(BasePlatformAdapter):
         them into a single MessageEvent before dispatching.
         """
         if not update.message or not update.message.text:
+            return
+        if await self._consume_pending_canon_revise(update.message):
             return
         if not self._should_process_message(update.message):
             return
