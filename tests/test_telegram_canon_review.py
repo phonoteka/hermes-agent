@@ -2,6 +2,7 @@
 
 import asyncio
 import threading
+import time
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -101,6 +102,11 @@ async def _await_adapter_background_tasks(adapter: TelegramAdapter) -> None:
         await asyncio.gather(*tasks)
 
 
+async def _handle_callback_query_and_drain(adapter: TelegramAdapter, update) -> None:
+    await adapter._handle_callback_query(update, MagicMock())
+    await _await_adapter_background_tasks(adapter)
+
+
 @pytest.mark.asyncio
 async def test_revise_button_waits_for_next_authorized_message():
     """AC-S3-003: revise click must arm pending state and avoid immediate decision record.
@@ -129,7 +135,7 @@ async def test_revise_button_waits_for_next_authorized_message():
     update.callback_query = query
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", return_value=_outcome()) as resolver:
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     assert resolver.call_count == 0
     assert len(adapter._canon_pending_revise) == 1
@@ -438,7 +444,7 @@ async def test_canon_callback_preserves_thread_identity():
     update.callback_query = query
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", return_value=_outcome()) as resolver:
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     resolver.assert_called_once_with(
         run_id="cg-s4-run",
@@ -481,7 +487,7 @@ async def test_canon_callback_requires_gate_action_and_message_identity():
     update.callback_query = query
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", return_value=_outcome()) as resolver:
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     resolver.assert_called_once_with(
         gate_id="gate-r05",
@@ -526,7 +532,7 @@ async def test_canon_non_revise_callback_answers_before_resolver_runs():
         return _outcome()
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", side_effect=_resolver_side_effect):
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     assert call_order[:2] == ["answer", "resolver"]
 
@@ -569,7 +575,7 @@ async def test_canon_non_revise_callback_replaces_buttons_with_fixed_choice_pane
         return _outcome()
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", side_effect=_resolver_side_effect):
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     assert call_order[0][0] == "edit"
     assert "Выбор зафиксирован" in call_order[0][1]
@@ -577,6 +583,64 @@ async def test_canon_non_revise_callback_replaces_buttons_with_fixed_choice_pane
     assert "Обрабатываю" in call_order[0][1]
     assert call_order[0][2] is None
     assert call_order[1] == ("resolver", "approve")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "callback_data",
+    [
+        '{"gateId":"gate-r05","action":"approve"}',
+        '{"gateId":"gate-r05","action":"reject"}',
+        "cg:y:legacy-run",
+        "cg:n:legacy-run",
+    ],
+)
+async def test_canon_non_revise_callback_returns_before_slow_resolver_completion(callback_data: str):
+    """Non-revise Canon callbacks must not block the Telegram update loop on resume.
+
+    pre: operator clicks approve/reject and the durable Canon resolver is slow.
+    post: callback handler returns after fixed-choice feedback before resolver completion, and a
+          normal same-chat message can be routed while the resolver continues in background.
+    raises: AssertionError while a non-revise callback awaits the slow resolver inside the handler.
+    """
+
+    adapter = _make_adapter()
+    adapter._enqueue_text_event = MagicMock()
+    query = AsyncMock()
+    query.data = callback_data
+    query.message = MagicMock()
+    query.message.chat_id = 12345
+    query.message.message_id = 456
+    query.message.message_thread_id = 999
+    query.message.chat.type = "supergroup"
+    query.from_user = MagicMock()
+    query.from_user.id = 333
+    query.from_user.first_name = "Operator"
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    update = MagicMock()
+    update.callback_query = query
+    normal_update = _make_text_update(update_id=22, message_id=903, text="обычный вопрос после approve")
+
+    def _slow_resolver_side_effect(**kwargs):
+        time.sleep(0.25)
+        return _outcome("completed", status="completed", delivery_mode="inline_only")
+
+    with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", side_effect=_slow_resolver_side_effect):
+        started_at = time.monotonic()
+        await adapter._handle_callback_query(update, MagicMock())
+        elapsed = time.monotonic() - started_at
+        try:
+            assert elapsed < 0.10, (
+                "approve callback should return after fixed-choice feedback; current code blocks "
+                "until Canon resolver completion"
+            )
+            assert len(adapter._background_tasks) == 1
+
+            await adapter._handle_text_message(normal_update, MagicMock())
+            adapter._enqueue_text_event.assert_called_once()
+        finally:
+            await _await_adapter_background_tasks(adapter)
 
 
 @pytest.mark.asyncio
@@ -616,7 +680,7 @@ async def test_completed_canon_callback_sends_operator_closeout_as_new_message()
         "tools.canon_gateway_review.resolve_telegram_canon_review_outcome",
         return_value=_outcome(closeout_text, notify_chat=True, status="completed", delivery_mode="fresh_closeout"),
     ):
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     assert query.edit_message_text.call_count == 2
     first_edit = query.edit_message_text.call_args_list[0].kwargs
@@ -673,7 +737,7 @@ async def test_paused_again_canon_callback_can_send_explicit_status_message():
             delivery_mode="fresh_status",
         ),
     ):
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     final_edit = query.edit_message_text.call_args_list[-1].kwargs
     assert final_edit["reply_markup"] is None
@@ -723,7 +787,7 @@ async def test_callback_review_card_only_skips_fresh_message_even_when_notify_ch
             delivery_mode="review_card_only",
         ),
     ):
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     adapter._bot.send_message.assert_not_called()
 
@@ -766,7 +830,7 @@ async def test_callback_missing_delivery_mode_fails_closed_even_when_notify_chat
         "tools.canon_gateway_review.resolve_telegram_canon_review_outcome",
         return_value=outcome,
     ):
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     adapter._bot.send_message.assert_not_called()
 
@@ -908,7 +972,7 @@ async def test_compact_canon_callback_reconstructs_gate_identity_under_telegram_
     update.callback_query = query
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", return_value=_outcome()) as resolver:
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     resolver.assert_called_once_with(
         gate_id="sm-260526185203:telegram:-1003351905082:25613:review",
@@ -950,7 +1014,7 @@ async def test_tokenized_canon_callback_passes_opaque_authority_to_resolver_unde
     update.callback_query = query
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", return_value=_outcome()) as resolver:
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     resolver.assert_called_once_with(
         callback_token="cgcb_abc123",
@@ -993,7 +1057,7 @@ async def test_tokenized_dm_canon_callback_preserves_embedded_transport_thread_f
     update.callback_query = query
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", return_value=_outcome()) as resolver:
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     resolver.assert_called_once_with(
         callback_token="cgcb_dm123",
@@ -1036,7 +1100,7 @@ async def test_compact_canon_callback_uses_embedded_thread_token_for_dm_sentinel
     update.callback_query = query
 
     with patch("tools.canon_gateway_review.resolve_telegram_canon_review_outcome", return_value=_outcome()) as resolver:
-        await adapter._handle_callback_query(update, MagicMock())
+        await _handle_callback_query_and_drain(adapter, update)
 
     resolver.assert_called_once_with(
         gate_id="sm-260526223122:telegram:5558998798:1:review",

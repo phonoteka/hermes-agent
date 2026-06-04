@@ -2969,12 +2969,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ You are not authorized to answer this Canon review.")
                 return
             try:
-                from tools.canon_gateway_review import (
-                    enter_gateway_review_context,
-                    exit_gateway_review_context,
-                    resolve_telegram_canon_review_outcome,
-                )
-
                 choice = canon_callback.get("choice")
                 action_id = canon_callback.get("action_id")
                 is_revise = choice == "e" or action_id == "revise"
@@ -3082,36 +3076,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass
-                token = enter_gateway_review_context()
-                try:
-                    outcome = resolve_telegram_canon_review_outcome(**resolver_kwargs)
-                finally:
-                    exit_gateway_review_context(token)
-                result_text = str(outcome.get("text") or "")
-                outcome_status = str(outcome.get("status") or "").strip()
                 user_display = getattr(query.from_user, "first_name", "User")
-                try:
-                    status_line = "Статус: ✅ Завершено"
-                    if outcome_status and outcome_status.lower() != "completed":
-                        status_line = f"Статус: `{outcome_status}`"
-                    await query.edit_message_text(
-                        text=(
-                            "Выбор зафиксирован: "
-                            f"{label}\n"
-                            f"Оператор: {user_display}\n"
-                            f"{status_line}"
-                        ),
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=None,
-                    )
-                except Exception:
-                    pass
-                if self._bot and self._should_send_canon_fresh_message(outcome):
-                    await self._send_canon_fresh_message(
+                task = asyncio.create_task(
+                    self._run_canon_review_callback_resolution(
+                        query=query,
                         chat_id=int(query_chat_id),
-                        text=result_text,
                         thread_id=str(resolver_kwargs.get("thread_id") or "") or None,
+                        label=label,
+                        user_display=str(user_display or "User"),
+                        resolver_kwargs=resolver_kwargs,
                     )
+                )
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
             except Exception as exc:
                 logger.error("[%s] Canon review callback failed: %s", self.name, exc, exc_info=True)
                 await query.answer(text=f"Canon callback failed: {exc}")
@@ -4433,6 +4410,81 @@ class TelegramAdapter(BasePlatformAdapter):
                     await self._bot.send_message(**error_kwargs)
                 except Exception:
                     logger.warning("[%s] Failed to notify Canon revise failure", self.name, exc_info=True)
+
+    async def _run_canon_review_callback_resolution(
+        self,
+        *,
+        query: Any,
+        chat_id: int,
+        thread_id: Optional[str],
+        label: str,
+        user_display: str,
+        resolver_kwargs: Dict[str, Any],
+    ) -> None:
+        """Resolve one non-revise Canon callback after Telegram ACK/edit returns.
+
+        pre: the callback was authorized and the original review card already shows a fixed-choice
+             processing panel with inline buttons removed.
+        post: resolver work runs off the event loop; success updates the old card with compact
+              status and emits any structured fresh message exactly once.
+        raises: none; resolver/Telegram failures are logged and surfaced through the original card
+                when possible.
+        """
+
+        from tools.canon_gateway_review import (
+            enter_gateway_review_context,
+            exit_gateway_review_context,
+            resolve_telegram_canon_review_outcome,
+        )
+
+        try:
+            token = enter_gateway_review_context()
+            try:
+                outcome = await asyncio.to_thread(
+                    resolve_telegram_canon_review_outcome,
+                    **resolver_kwargs,
+                )
+            finally:
+                exit_gateway_review_context(token)
+            result_text = str(outcome.get("text") or "")
+            outcome_status = str(outcome.get("status") or "").strip()
+            try:
+                status_line = "Статус: ✅ Завершено"
+                if outcome_status and outcome_status.lower() != "completed":
+                    status_line = f"Статус: `{outcome_status}`"
+                await query.edit_message_text(
+                    text=(
+                        "Выбор зафиксирован: "
+                        f"{label}\n"
+                        f"Оператор: {user_display}\n"
+                        f"{status_line}"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=None,
+                )
+            except Exception:
+                logger.warning("[%s] Failed to update Canon review callback status", self.name, exc_info=True)
+            if self._bot and self._should_send_canon_fresh_message(outcome):
+                await self._send_canon_fresh_message(
+                    chat_id=chat_id,
+                    text=result_text,
+                    thread_id=thread_id,
+                )
+        except Exception as exc:
+            logger.error("[%s] Canon review callback failed: %s", self.name, exc, exc_info=True)
+            try:
+                await query.edit_message_text(
+                    text=(
+                        "Выбор зафиксирован: "
+                        f"{label}\n"
+                        f"Оператор: {user_display}\n"
+                        "Статус: ❌ Ошибка Canon callback; чат свободен."
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=None,
+                )
+            except Exception:
+                logger.warning("[%s] Failed to update Canon review callback failure", self.name, exc_info=True)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
