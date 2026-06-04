@@ -820,9 +820,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
         The resolver's ``delivery_mode`` is the authoritative transport contract:
         ``fresh_closeout`` and ``fresh_status`` send a new message, while
-        ``inline_only`` and ``review_card_only`` must not. ``notify_chat`` is
-        consulted only as a compatibility fallback for older outcomes that do
-        not declare a delivery mode.
+        ``inline_only`` and ``review_card_only`` must not. Missing or unknown
+        modes fail closed so legacy flags cannot silently choose delivery.
         """
 
         delivery_mode = str(outcome.get("delivery_mode") or "").strip()
@@ -830,7 +829,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if delivery_mode in {"inline_only", "review_card_only"}:
             return False
-        return bool(outcome.get("notify_chat"))
+        return False
 
     async def _send_canon_fresh_message(
         self,

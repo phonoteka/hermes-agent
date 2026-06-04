@@ -729,6 +729,49 @@ async def test_callback_review_card_only_skips_fresh_message_even_when_notify_ch
 
 
 @pytest.mark.asyncio
+async def test_callback_missing_delivery_mode_fails_closed_even_when_notify_chat_true():
+    """Callback transport must not use legacy notify_chat without delivery authority.
+
+    pre: resolver returns no delivery_mode but legacy notify_chat asks for a fresh message.
+    post: Telegram sends no fresh message because delivery_mode is the only authoritative
+          transport contract for Canon review outcomes.
+    raises: AssertionError while missing delivery_mode silently falls back to notify_chat.
+    """
+
+    adapter = _make_adapter()
+    query = AsyncMock()
+    query.data = '{"a":"approve","n":"review","r":"sm-missing-delivery"}'
+    query.message = MagicMock()
+    query.message.chat_id = -10012345
+    query.message.message_id = 456
+    query.message.message_thread_id = 789
+    query.message.chat.type = "supergroup"
+    query.from_user = MagicMock()
+    query.from_user.id = 333
+    query.from_user.first_name = "Operator"
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+
+    update = MagicMock()
+    update.callback_query = query
+    outcome = _outcome(
+        "Canon review recorded: `completed` for `sm-missing-delivery`.",
+        notify_chat=True,
+        status="completed",
+        delivery_mode="fresh_closeout",
+    )
+    outcome.pop("delivery_mode")
+
+    with patch(
+        "tools.canon_gateway_review.resolve_telegram_canon_review_outcome",
+        return_value=outcome,
+    ):
+        await adapter._handle_callback_query(update, MagicMock())
+
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_revise_background_completed_outcome_sends_one_fresh_closeout_message():
     """Background revise completion must keep one terminal closeout message.
 
