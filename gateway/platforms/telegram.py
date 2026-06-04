@@ -602,9 +602,20 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         gate_id = str(payload.get("gateId") or payload.get("gate_id") or "").strip()
         action_id = str(payload.get("action") or payload.get("actionId") or payload.get("action_id") or payload.get("a") or "").strip().lower()
+        callback_token = str(
+            payload.get("callbackToken")
+            or payload.get("callback_token")
+            or payload.get("k")
+            or ""
+        ).strip()
         run_id = str(payload.get("runId") or payload.get("run_id") or payload.get("r") or "").strip()
         node_id = str(payload.get("nodeId") or payload.get("node_id") or payload.get("n") or "").strip()
         thread_id = str(payload.get("threadId") or payload.get("thread_id") or payload.get("t") or "").strip()
+        if callback_token and action_id:
+            result = {"mode": "declared", "callback_token": callback_token, "action_id": action_id}
+            if thread_id:
+                result["thread_id"] = thread_id
+            return result
         if gate_id and action_id:
             return {"mode": "declared", "gate_id": gate_id, "action_id": action_id}
         if run_id and node_id and action_id:
@@ -613,23 +624,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 result["thread_id"] = thread_id
             return result
         return None
-
-    @classmethod
-    def _is_canon_operator_closeout_text(cls, text: str) -> bool:
-        """Return true when resolver output is the completed current-gateway closeout.
-
-        pre: text is the operator-facing result returned by the Canon review resolver.
-        post: returns true only for completed closeouts that include artifact-index content;
-              generic recorded/failed/revise status lines are not re-sent as fresh messages.
-        raises: none.
-        """
-
-        normalized = str(text or "")
-        return (
-            "Canon review recorded: `completed`" in normalized
-            and "Артефакты:" in normalized
-            and "artifacts." in normalized
-        )
 
     @classmethod
     def _metadata_direct_messages_topic_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -819,6 +813,49 @@ class TelegramAdapter(BasePlatformAdapter):
         if LinkPreviewOptions is not None:
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
         return {"disable_web_page_preview": True}
+
+    @staticmethod
+    def _should_send_canon_fresh_message(outcome: Dict[str, Any]) -> bool:
+        """Return whether Canon callback/revise outcome requires a fresh Telegram message.
+
+        The resolver's ``delivery_mode`` is the authoritative transport contract:
+        ``fresh_closeout`` and ``fresh_status`` send a new message, while
+        ``inline_only`` and ``review_card_only`` must not. ``notify_chat`` is
+        consulted only as a compatibility fallback for older outcomes that do
+        not declare a delivery mode.
+        """
+
+        delivery_mode = str(outcome.get("delivery_mode") or "").strip()
+        if delivery_mode in {"fresh_closeout", "fresh_status"}:
+            return True
+        if delivery_mode in {"inline_only", "review_card_only"}:
+            return False
+        return bool(outcome.get("notify_chat"))
+
+    async def _send_canon_fresh_message(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        thread_id: Optional[str],
+    ) -> None:
+        """Send Canon result text as plain Telegram text in the target thread.
+
+        @precondition self._bot is available.
+        @postcondition sends exactly one fresh Telegram message.
+        @mutates Telegram chat state only; does not mutate adapter state.
+        @sideeffects Performs Bot API IO and preserves the text verbatim by not
+        enabling Markdown parsing.
+        """
+
+        send_kwargs: Dict[str, Any] = {
+            "chat_id": chat_id,
+            "text": text,
+            **self._link_preview_kwargs(),
+        }
+        if thread_id is not None:
+            send_kwargs.update(self._thread_kwargs_for_send(str(chat_id), thread_id, {"thread_id": thread_id}))
+        await self._bot.send_message(**send_kwargs)
 
     async def _drain_polling_connections(self) -> None:
         """Reset the httpx connection pool used for getUpdates polling.
@@ -2933,7 +2970,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ You are not authorized to answer this Canon review.")
                 return
             try:
-                from tools.canon_gateway_review import resolve_telegram_canon_review
+                from tools.canon_gateway_review import (
+                    enter_gateway_review_context,
+                    exit_gateway_review_context,
+                    resolve_telegram_canon_review_outcome,
+                )
 
                 choice = canon_callback.get("choice")
                 action_id = canon_callback.get("action_id")
@@ -2944,9 +2985,10 @@ class TelegramAdapter(BasePlatformAdapter):
                         thread_id=str(query_thread_id or "") if query_thread_id is not None else None,
                     )
                     declared_gate_id = str(canon_callback.get("gate_id") or "")
+                    callback_token = str(canon_callback.get("callback_token") or "").strip()
                     callback_thread_id = str(canon_callback.get("thread_id") or "").strip()
                     transport_thread_id = callback_thread_id or (str(query_thread_id) if query_thread_id is not None else "")
-                    if not declared_gate_id and canon_callback.get("mode") == "declared":
+                    if not declared_gate_id and not callback_token and canon_callback.get("mode") == "declared":
                         callback_run_id = str(canon_callback.get("run_id") or "").strip()
                         callback_node_id = str(canon_callback.get("node_id") or "").strip()
                         if callback_run_id and callback_node_id:
@@ -2957,6 +2999,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self._canon_pending_revise[origin_key] = {
                         "run_id": str(canon_callback.get("run_id") or ""),
                         "gate_id": declared_gate_id,
+                        "callback_token": callback_token,
                         "action_id": str(action_id or choice or ""),
                         "chat_id": str(query_chat_id or ""),
                         "thread_id": transport_thread_id,
@@ -2985,9 +3028,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 }
                 if canon_callback.get("mode") == "declared":
                     declared_gate_id = str(canon_callback.get("gate_id") or "")
+                    callback_token = str(canon_callback.get("callback_token") or "").strip()
                     callback_thread_id = str(canon_callback.get("thread_id") or "").strip()
                     transport_thread_id = callback_thread_id or (str(query_thread_id) if query_thread_id is not None else "")
-                    if not declared_gate_id:
+                    if callback_token:
+                        resolver_kwargs.update(
+                            callback_token=callback_token,
+                            action_id=str(action_id or ""),
+                            thread_id=transport_thread_id,
+                        )
+                    elif not declared_gate_id:
                         callback_run_id = str(canon_callback.get("run_id") or "").strip()
                         callback_node_id = str(canon_callback.get("node_id") or "").strip()
                         if not callback_run_id or not callback_node_id:
@@ -2996,11 +3046,12 @@ class TelegramAdapter(BasePlatformAdapter):
                             declared_gate_id = f"{callback_run_id}:telegram:{query_chat_id}:{transport_thread_id}:{callback_node_id}"
                         else:
                             declared_gate_id = f"{callback_run_id}:telegram:{query_chat_id}:{callback_node_id}"
-                    resolver_kwargs.update(
-                        gate_id=declared_gate_id,
-                        action_id=str(action_id or ""),
-                        thread_id=transport_thread_id,
-                    )
+                    if not callback_token:
+                        resolver_kwargs.update(
+                            gate_id=declared_gate_id,
+                            action_id=str(action_id or ""),
+                            thread_id=transport_thread_id,
+                        )
                     label_map = {
                         "approve": "✅ Да",
                         "reject": "❌ Нет",
@@ -3032,36 +3083,36 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass
-                result_text = resolve_telegram_canon_review(**resolver_kwargs)
+                token = enter_gateway_review_context()
+                try:
+                    outcome = resolve_telegram_canon_review_outcome(**resolver_kwargs)
+                finally:
+                    exit_gateway_review_context(token)
+                result_text = str(outcome.get("text") or "")
+                outcome_status = str(outcome.get("status") or "").strip()
                 user_display = getattr(query.from_user, "first_name", "User")
                 try:
+                    status_line = "Статус: ✅ Завершено"
+                    if outcome_status and outcome_status.lower() != "completed":
+                        status_line = f"Статус: `{outcome_status}`"
                     await query.edit_message_text(
                         text=(
                             "Выбор зафиксирован: "
                             f"{label}\n"
                             f"Оператор: {user_display}\n"
-                            "Статус: ✅ Завершено\n\n"
-                            f"{result_text}"
+                            f"{status_line}"
                         ),
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=None,
                     )
                 except Exception:
                     pass
-                if self._is_canon_operator_closeout_text(result_text) and self._bot:
-                    closeout_kwargs: Dict[str, Any] = {
-                        "chat_id": query_chat_id,
-                        "text": result_text,
-                        "parse_mode": ParseMode.MARKDOWN,
-                    }
-                    closeout_kwargs.update(
-                        self._thread_kwargs_for_send(
-                            str(query_chat_id or ""),
-                            str(resolver_kwargs.get("thread_id") or "") or None,
-                            {"thread_id": resolver_kwargs.get("thread_id")},
-                        )
+                if self._bot and self._should_send_canon_fresh_message(outcome):
+                    await self._send_canon_fresh_message(
+                        chat_id=int(query_chat_id),
+                        text=result_text,
+                        thread_id=str(resolver_kwargs.get("thread_id") or "") or None,
                     )
-                    await self._bot.send_message(**closeout_kwargs)
             except Exception as exc:
                 logger.error("[%s] Canon review callback failed: %s", self.name, exc, exc_info=True)
                 await query.answer(text=f"Canon callback failed: {exc}")
@@ -4182,10 +4233,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         pre: message is one incoming Telegram text message.
         post: when a pending revise state exists for the same chat/thread and caller is authorized,
-              this method emits immediate progress feedback, records the revision instructions
-              durably, and clears pending state after the Canon resolver returns.
+              this method emits immediate progress feedback, claims and clears the one-shot capture
+              before long-running resolver work, and records the revision instructions durably.
         post: unauthorized or wrong-origin messages fail closed by returning False without mutation.
-        raises: none; failures are surfaced to chat and pending state is preserved for retry.
+        post: resolver failures still consume the pending revise capture so later ordinary messages
+              return to the normal chat path instead of being implicitly retried as revise text.
+        raises: none; failures are surfaced to chat without restoring pending interception state.
         """
 
         chat_id = str(getattr(message, "chat_id", "") or "")
@@ -4213,13 +4266,15 @@ class TelegramAdapter(BasePlatformAdapter):
         instructions = str(getattr(message, "text", "") or "").strip()
         if not instructions:
             return False
+        pending = self._canon_pending_revise.pop(origin_key, None)
+        if not pending:
+            return False
 
         try:
-            from tools.canon_gateway_review import resolve_telegram_canon_review
-
             loop = asyncio.get_running_loop()
             pending_run_id = str(pending.get("run_id") or "")
             pending_gate_id = str(pending.get("gate_id") or "")
+            pending_callback_token = str(pending.get("callback_token") or "")
             pending_action_id = str(pending.get("action_id") or "")
             pending_transport_thread_id = str(pending.get("thread_id") or "").strip()
             resolver_thread_id = pending_transport_thread_id or thread_id
@@ -4237,7 +4292,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.send_canon_review_prompt(
                         chat_id=chat_id,
                         message=str(payload.get("message") or ""),
-                        run_id=pending_run_id,
+                        run_id=(
+                            pending_run_id
+                            or str((payload.get("gateIdentity") or {}).get("runId") or "")
+                            or str(payload.get("runId") or "")
+                        ),
                         metadata={
                             **({"thread_id": resolver_thread_id} if resolver_thread_id is not None else {}),
                             **({"callbacks": payload.get("callbacks")} if isinstance(payload.get("callbacks"), list) else {}),
@@ -4270,39 +4329,111 @@ class TelegramAdapter(BasePlatformAdapter):
                 "revision_instructions": instructions,
                 "sender": _next_review_sender,
             }
-            if pending_gate_id:
+            if pending_callback_token:
+                resolver_kwargs.update(callback_token=pending_callback_token, action_id=pending_action_id or "revise")
+            elif pending_gate_id:
                 resolver_kwargs.update(gate_id=pending_gate_id, action_id=pending_action_id or "revise")
             else:
                 resolver_kwargs.update(run_id=pending_run_id, choice="e")
             if self._bot:
                 progress_kwargs: Dict[str, Any] = {
                     "chat_id": int(chat_id),
-                    "text": "Canon review text received; recording revision and resuming workflow…",
+                    "text": "Canon: коррективы записаны; workflow продолжает работу отдельно, чат свободен.",
                     "parse_mode": ParseMode.MARKDOWN,
                     **self._link_preview_kwargs(),
                 }
-                if thread_id is not None:
-                    progress_kwargs.update(self._thread_kwargs_for_send(chat_id, thread_id, {"thread_id": thread_id}))
+                if resolver_thread_id is not None:
+                    progress_kwargs.update(
+                        self._thread_kwargs_for_send(
+                            chat_id,
+                            resolver_thread_id,
+                            {"thread_id": resolver_thread_id},
+                        )
+                    )
                 await self._bot.send_message(**progress_kwargs)
-            result_text = await asyncio.to_thread(
-                resolve_telegram_canon_review,
-                **resolver_kwargs,
+            task = asyncio.create_task(
+                self._run_pending_canon_revise_resolution(
+                    chat_id=chat_id,
+                    thread_id=resolver_thread_id,
+                    resolver_kwargs=resolver_kwargs,
+                )
             )
-            self._canon_pending_revise.pop(origin_key, None)
-            if self._bot:
-                send_kwargs: Dict[str, Any] = {
-                    "chat_id": int(chat_id),
-                    "text": result_text,
-                    "parse_mode": ParseMode.MARKDOWN,
-                    **self._link_preview_kwargs(),
-                }
-                if thread_id is not None:
-                    send_kwargs.update(self._thread_kwargs_for_send(chat_id, thread_id, {"thread_id": thread_id}))
-                await self._bot.send_message(**send_kwargs)
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
             return True
         except Exception as exc:
             logger.error("[%s] Canon revise follow-up failed: %s", self.name, exc, exc_info=True)
-            return False
+            if self._bot:
+                try:
+                    error_kwargs: Dict[str, Any] = {
+                        "chat_id": int(chat_id),
+                        "text": "Canon revise не записался; revise mode закрыт, следующее сообщение пойдёт в обычный чат.",
+                        **self._link_preview_kwargs(),
+                    }
+                    if resolver_thread_id is not None:
+                        error_kwargs.update(
+                            self._thread_kwargs_for_send(
+                                chat_id,
+                                resolver_thread_id,
+                                {"thread_id": resolver_thread_id},
+                            )
+                        )
+                    await self._bot.send_message(**error_kwargs)
+                except Exception:
+                    logger.warning("[%s] Failed to notify Canon revise failure", self.name, exc_info=True)
+            return True
+
+    async def _run_pending_canon_revise_resolution(
+        self,
+        *,
+        chat_id: str,
+        thread_id: Optional[str],
+        resolver_kwargs: Dict[str, Any],
+    ) -> None:
+        """Resolve one captured Telegram revise follow-up in the background.
+
+        pre: `resolver_kwargs` already contains the one-shot revise payload and same-origin sender.
+        post: notifies the operator with either the resolver outcome or an async failure notice.
+        post: does not mutate pending revise state; the one-shot capture stays consumed even on failure.
+        raises: none; resolver and Telegram delivery failures are logged and converted into operator notice when possible.
+        """
+
+        from tools.canon_gateway_review import (
+            enter_gateway_review_context,
+            exit_gateway_review_context,
+            resolve_telegram_canon_review_outcome,
+        )
+
+        try:
+            token = enter_gateway_review_context()
+            try:
+                outcome = await asyncio.to_thread(
+                    resolve_telegram_canon_review_outcome,
+                    **resolver_kwargs,
+                )
+            finally:
+                exit_gateway_review_context(token)
+            result_text = str(outcome.get("text") or "")
+            if self._bot and self._should_send_canon_fresh_message(outcome):
+                await self._send_canon_fresh_message(
+                    chat_id=int(chat_id),
+                    text=result_text,
+                    thread_id=thread_id,
+                )
+        except Exception as exc:
+            logger.error("[%s] Canon revise follow-up failed: %s", self.name, exc, exc_info=True)
+            if self._bot:
+                try:
+                    error_kwargs: Dict[str, Any] = {
+                        "chat_id": int(chat_id),
+                        "text": "Canon revise не записался; revise mode закрыт, следующее сообщение пойдёт в обычный чат.",
+                        **self._link_preview_kwargs(),
+                    }
+                    if thread_id is not None:
+                        error_kwargs.update(self._thread_kwargs_for_send(chat_id, thread_id, {"thread_id": thread_id}))
+                    await self._bot.send_message(**error_kwargs)
+                except Exception:
+                    logger.warning("[%s] Failed to notify Canon revise failure", self.name, exc_info=True)
 
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
