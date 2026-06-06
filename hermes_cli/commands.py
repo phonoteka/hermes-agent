@@ -171,8 +171,17 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("list", "ls", "show", "create", "assign", "link", "unlink",
                             "claim", "comment", "complete", "block", "unblock", "archive",
                             "tail", "dispatch", "context", "init", "gc")),
-    CommandDef("canon", "Run Canon operator commands (/canon run|latest|inspect)", "Tools & Skills",
-               gateway_only=True, args_hint="<run|latest|inspect ...>"),
+    CommandDef(
+        "canon",
+        "Canon workflow operator surface (run/latest/inspect/list/full/timeline/artifacts/events/report/control)",
+        "Tools & Skills",
+        gateway_only=True,
+        args_hint=(
+            "<run <workflow> --inputs-json <json-object> | latest | inspect <run-id> | "
+            "list | full|timeline|artifacts|events|report|control <run-id>>"
+        ),
+        subcommands=("run", "latest", "inspect", "list", "full", "timeline", "artifacts", "events", "report", "control"),
+    ),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",

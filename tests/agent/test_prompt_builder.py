@@ -30,6 +30,7 @@ from agent.prompt_builder import (
     WSL_ENVIRONMENT_HINT,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+from runtime_context import scoped_runtime_cwd
 
 
 # =========================================================================
@@ -506,6 +507,12 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Ruff for linting" in result
         assert "Project Context" in result
+
+    def test_build_context_files_prompt_uses_runtime_cwd_when_none_passed(self, tmp_path):
+        (tmp_path / "AGENTS.md").write_text("Runtime cwd instructions.")
+        with scoped_runtime_cwd(str(tmp_path)):
+            result = build_context_files_prompt()
+        assert "Runtime cwd instructions." in result
 
     def test_loads_cursorrules(self, tmp_path):
         (tmp_path / ".cursorrules").write_text("Always use type hints.")

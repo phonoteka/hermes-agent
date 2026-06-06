@@ -10,16 +10,21 @@ import asyncio
 import json
 import re
 import shlex
-from datetime import UTC, datetime
+import uuid
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from hermes_constants import get_hermes_home
+from tools.canon_workflow_observe import to_markdown as _observe_to_markdown
 
 
 def handle_gateway_canon_command(event: Any) -> str:
     """Parse `/canon` command text and return a deterministic fail-closed response.
 
     pre: event has `.text` and optional `.source` with chat/thread/user identity attributes.
-    post: `/canon run <workflow> <task...>` without task fails closed with task-required guidance.
+    post: `/canon run <workflow> --inputs-json <json-object>` validates operator input and returns
+          acceptance/guidance only; it does not imply execution success.
     post: `/canon latest` and `/canon inspect <run-id>` query Canon durable stores when available.
     post: blocked/dry-run/non-terminal statuses are labeled non-production in operator output.
     raises: none.
@@ -27,21 +32,43 @@ def handle_gateway_canon_command(event: Any) -> str:
 
     text = (getattr(event, "text", "") or "").strip()
     args = text[len("/canon") :].strip() if text.startswith("/canon") else text
-    tokens = shlex.split(args) if args else []
-    if not tokens:
-        return "Usage: /canon <run|latest|inspect> ..."
+    if not args:
+        return "Usage: /canon <run|list|full|timeline|artifacts|events|report|control|latest|inspect> ..."
 
-    subcommand = tokens[0].lower()
+    subcommand = _extract_canon_subcommand(args)
     source = getattr(event, "source", None)
     if subcommand == "run":
-        return _handle_run(tokens=tokens, source=source)
-    if subcommand == "latest":
-        return _handle_latest(source=source)
-    if subcommand == "inspect":
+        return _handle_run(command_text=args, source=source)
+    tokens = shlex.split(args)
+    if subcommand in {"latest", "inspect"}:
+        if subcommand == "latest":
+            return _handle_latest(source=source)
         if len(tokens) < 2 or not tokens[1].strip():
             return "`/canon inspect` requires an explicit run id: /canon inspect <run-id>."
         return _handle_inspect(run_id=tokens[1].strip(), source=source)
-    return "Unsupported /canon subcommand. Usage: /canon <run|latest|inspect> ..."
+    if subcommand == "list":
+        return _handle_list(source=source)
+    if subcommand in {"full", "timeline", "artifacts", "events", "report", "control"}:
+        if len(tokens) < 2 or not tokens[1].strip():
+            return f"`/canon {subcommand}` failed closed: missing run id. Usage: /canon {subcommand} <run-id>."
+        run_id = tokens[1].strip()
+        if subcommand == "events":
+            try:
+                after_sequence, limit = _parse_events_cursor_args(tokens[2:])
+            except ValueError as exc:
+                return (
+                    f"`/canon events {run_id}` failed closed: {exc}. "
+                    "Usage: /canon events <run-id> [--after-sequence N] [--limit N]."
+                )
+            return _handle_observability_subcommand(
+                subcommand=subcommand,
+                run_id=run_id,
+                source=source,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        return _handle_observability_subcommand(subcommand=subcommand, run_id=run_id, source=source)
+    return "Unsupported /canon subcommand. Usage: /canon <run|list|full|timeline|artifacts|events|report|control|latest|inspect> ..."
 
 
 async def handle_gateway_canon_command_live(
@@ -53,47 +80,64 @@ async def handle_gateway_canon_command_live(
 
     pre: event contains message text and source identity; `send_review_prompt` is provided for run path.
     post: non-run commands keep deterministic sync behavior.
-    post: run path creates a real current-gateway awaiting-human-review run or fails closed.
+    post: run path forwards workflow/input authority through the shared gateway-owned
+          workflow facade using the active Hermes current-gateway durable root.
     raises: none.
     """
 
     text = (getattr(event, "text", "") or "").strip()
     args = text[len("/canon") :].strip() if text.startswith("/canon") else text
-    tokens = shlex.split(args) if args else []
-    if not tokens:
-        return "Usage: /canon <run|latest|inspect> ..."
+    if not args:
+        return "Usage: /canon <run|list|full|timeline|artifacts|events|report|control|latest|inspect> ..."
 
-    if tokens[0].lower() != "run":
+    if _extract_canon_subcommand(args) != "run":
         return handle_gateway_canon_command(event)
-    if send_review_prompt is None:
-        return "`/canon run` failed closed: review-delivery sender is unavailable."
 
     try:
-        return await _handle_live_run(
-            tokens=tokens,
-            source=getattr(event, "source", None),
-            message_id=str(getattr(event, "message_id", "") or ""),
+        if send_review_prompt is None:
+            raise ValueError("live /canon run requires gateway review sender authority")
+        parsed = parse_gateway_run_command(raw_command_text=args)
+        return await _run_gateway_canon_cli_command(
+            workflow=parsed["workflow"],
+            inputs=parsed["inputs"],
+            gateway_source=_gateway_source_from_live_event(event),
+            gateway_root=_canon_gateway_durable_root(),
             send_review_prompt=send_review_prompt,
         )
     except Exception as exc:
         return f"`/canon run` failed closed: {exc}"
 
 
-def _handle_run(*, tokens: list[str], source: Any) -> str:
+def _extract_canon_subcommand(args: str) -> str:
+    """Return the first `/canon` subcommand token from raw command text.
+
+    pre: args is the raw `/canon` tail with the command word first when present.
+    post: returns the lower-cased first token or the empty string when missing.
+    raises: none.
+    """
+
+    normalized = str(args or "").strip()
+    if not normalized:
+        return ""
+    return normalized.split(None, 1)[0].strip().lower()
+
+
+def _handle_run(*, command_text: str, source: Any) -> str:
     """Handle `/canon run` argument validation and topic identity echo.
 
-    pre: tokens[0] == 'run'.
-    post: requires explicit workflow and non-empty task text.
+    pre: command_text is the raw `/canon` tail beginning with `run`.
+    post: requires explicit workflow selector plus `--inputs-json <json-object>` authority.
     post: response includes source chat/thread identity when available.
     raises: none.
     """
 
-    if len(tokens) < 2 or not tokens[1].strip():
-        return "`/canon run` requires workflow name and task text: /canon run <workflow> <task>."
-    workflow = tokens[1].strip()
-    task_text = " ".join(tokens[2:]).strip()
-    if not task_text:
-        return "`/canon run` requires explicit task text after workflow name."
+    try:
+        parsed = parse_gateway_run_command(raw_command_text=command_text)
+    except ValueError as exc:
+        return str(exc)
+
+    workflow = parsed["workflow"]
+    inputs = parsed["inputs"]
 
     chat_id = str(getattr(source, "chat_id", "") or "")
     thread_id = str(getattr(source, "thread_id", "") or "")
@@ -105,141 +149,525 @@ def _handle_run(*, tokens: list[str], source: Any) -> str:
     origin_suffix = f" ({', '.join(origin_bits)})" if origin_bits else ""
 
     return (
-        "`/canon run` accepted for production gateway dispatch"
-        f"{origin_suffix}: workflow={workflow}, task={task_text}"
+        "`/canon run` accepted for Canon current-gateway dispatch"
+        f"{origin_suffix}: workflow={workflow}, inputs={json.dumps(inputs, ensure_ascii=False, sort_keys=True)}."
+        " Execution happens only through the live gateway-owned workflow facade path."
     )
 
 
-async def _handle_live_run(
+def parse_gateway_run_command(
+    tokens: list[str] | None = None,
     *,
-    tokens: list[str],
-    source: Any,
-    message_id: str,
-    send_review_prompt: Callable[..., Awaitable[dict[str, Any]]],
-) -> str:
-    """Run live current-gateway flow for one `/canon run <workflow> <task>` command.
+    raw_command_text: str | None = None,
+) -> dict[str, Any]:
+    """Parse one `/canon run` command into workflow-neutral execution authority.
 
-    pre: tokens include workflow + explicit task; source/message_id carry gateway origin identity.
-    post: routes every workflow through the generic workflow facade — no workflow
-          is hardcoded as the sole production path. Creates paused run + review
-          card delivery evidence through Canon runner authority.
-    raises: ValueError on malformed workflow/task/source identity or delivery/runtime failures.
+    pre: caller provides either tokenized `tokens` or raw `/canon` tail text beginning with `run`.
+    post: returns only `workflow` and one JSON-object `inputs` mapping.
+    raises: ValueError when workflow/input authority is missing, malformed, or mixed with
+            unsupported free-form tokens.
+    """
+
+    if raw_command_text is not None:
+        return _parse_gateway_run_command_text(raw_command_text)
+    if tokens is None:
+        raise ValueError("`/canon run` parser requires tokens or raw command text")
+    return _parse_gateway_run_command_tokens(tokens)
+
+
+def _parse_gateway_run_command_tokens(tokens: list[str]) -> dict[str, Any]:
+    """Parse tokenized `/canon run` arguments.
+
+    pre: tokens is the shlex-split tail of a `/canon` command and tokens[0] == `run`.
+    post: returns only workflow selector plus one JSON-object `inputs` mapping.
+    raises: ValueError when workflow/input authority is missing or malformed.
     """
 
     if len(tokens) < 2 or not tokens[1].strip():
-        raise ValueError("`/canon run` requires workflow name and task text: /canon run <workflow> <task>.")
+        raise ValueError(
+            "`/canon run` requires workflow selector and input authority: "
+            "/canon run <workflow> --inputs-json <json-object>."
+        )
+
     workflow = tokens[1].strip()
-    # Route ALL workflows through the generic facade; no workflow is hardcoded
-    # as the sole production path. The facade resolves workflow names to
-    # repo-relative workflowRef paths (via static mapping or dynamic registry).
-    from integrations.hermes.canon_hermes.workflow_facade import (
-        resolve_workflow_ref_for_command as _facade_resolve_workflow_ref,
-    )
-    workflow_ref = _facade_resolve_workflow_ref(workflow_name=workflow)
-    # post: workflow_ref is non-empty; ValueError is raised for unknown workflows.
-    task_text = " ".join(tokens[2:]).strip()
-    if not task_text:
-        raise ValueError("`/canon run` requires explicit task text after workflow name.")
+    inputs = _consume_inputs_json_flag(tokens[2:])
+    return {"workflow": workflow, "inputs": inputs}
 
-    import integrations.hermes.canon_hermes.current_gateway as current_gateway
 
-    build_current_gateway_request = current_gateway.build_current_gateway_request
-    from integrations.hermes.canon_hermes.current_gateway_runner import (
-        _resolve_request_workflow_path,
-        _run_current_gateway_runtime_pause,
-        build_current_gateway_runner_config,
-        pause_current_gateway_for_human_review,
-    )
+def _parse_gateway_run_command_text(raw_command_text: str) -> dict[str, Any]:
+    """Parse raw Telegram `/canon run` text without shell-tokenizing the JSON substring.
 
-    if _is_generic_review_text(task_text):
-        raise ValueError("task text is placeholder/default; provide an explicit operator task")
+    pre: raw_command_text is the raw `/canon` tail beginning with `run`.
+    post: preserves the exact substring after `--inputs-json` for JSON decoding.
+    raises: ValueError when free-form text is used or the JSON-object authority is missing.
+    """
 
-    platform_raw = getattr(source, "platform", "")
-    platform = getattr(platform_raw, "value", platform_raw)
-    if str(platform).strip().lower() != "telegram":
-        raise ValueError("live current-gateway `/canon run` is only available for Telegram origin")
+    normalized = str(raw_command_text or "").strip()
+    match = re.match(r"^run\s+(\S+)(?:\s+(.*))?$", normalized, flags=re.DOTALL)
+    if match is None:
+        raise ValueError(
+            "`/canon run` requires workflow selector and input authority: "
+            "/canon run <workflow> --inputs-json <json-object>."
+        )
 
-    chat_id = str(getattr(source, "chat_id", "") or "").strip()
-    thread_id = str(getattr(source, "thread_id", "") or "").strip()
-    user_id = str(getattr(source, "user_id", "") or "").strip()
-    user_name = str(getattr(source, "user_name", "") or "").strip()
-    if not chat_id or not thread_id or not user_id:
-        raise ValueError("source chat/thread/user identity is required for live `/canon run`")
-    if not message_id:
-        raise ValueError("event.message_id is required for live `/canon run`")
+    workflow = match.group(1).strip()
+    remainder = (match.group(2) or "").strip()
+    if not remainder.startswith("--inputs-json"):
+        raise ValueError(
+            "`/canon run` requires `--inputs-json <json-object>`; "
+            "free-form task text is not accepted."
+        )
+    raw_inputs = remainder[len("--inputs-json") :].strip()
+    if not raw_inputs:
+        raise ValueError("`--inputs-json` requires a JSON object.")
+    return {"workflow": workflow, "inputs": _parse_inputs_json_object(raw_inputs)}
 
-    run_id = f"sm-{datetime.now(UTC).strftime('%y%m%d%H%M%S')}"
-    request = build_current_gateway_request(
-        workflow_ref=workflow_ref,
-        run_id=run_id,
-        inputs={"request": task_text},
-        gateway_source={
-            "platform": "telegram",
-            "chat_id": chat_id,
-            "thread_id": thread_id,
-            "user_id": user_id,
-            "user_name": user_name,
-            "message_id": message_id,
-        },
-    )
-    phase_backend_client = create_gateway_phase_backend_client()
-    config = build_current_gateway_runner_config(phase_backend_client=phase_backend_client)
-    phase_backend_client.bind_artifacts_dir(getattr(config, "artifacts_dir", None))
-    workflow_path = _resolve_request_workflow_path(request)
-    runtime_pause = await asyncio.to_thread(
-        _run_current_gateway_runtime_pause,
-        workflow_path=str(workflow_path),
-        request=request,
-        config=config,
-    )
-    resume_handle = runtime_pause.get("resumeHandle") if isinstance(runtime_pause, dict) else None
-    if not isinstance(resume_handle, dict):
-        raise RuntimeError("runtime pause result missing resumeHandle")
 
+def _consume_inputs_json_flag(tokens: list[str]) -> dict[str, Any]:
+    """Return the only supported `/canon run` execution-authority flag value.
+
+    pre: tokens contains only the post-workflow portion of one `/canon run` command.
+    post: returns the `--inputs-json` object when present exactly once and rejects free-form extras.
+    raises: ValueError when the flag/value is missing or when unsupported extra tokens are present.
+    """
+
+    if not tokens or tokens[0] != "--inputs-json":
+        raise ValueError(
+            "`/canon run` requires `--inputs-json <json-object>`; "
+            "free-form task text is not accepted."
+        )
+    if len(tokens) < 2 or not str(tokens[1] or "").strip():
+        raise ValueError("`--inputs-json` requires a JSON object.")
+    if len(tokens) > 2:
+        raise ValueError(
+            "`/canon run` accepts only workflow selector plus `--inputs-json <json-object>` authority."
+        )
+    raw_inputs = str(tokens[1]).strip()
+    return _parse_inputs_json_object(raw_inputs)
+
+
+def _parse_inputs_json_object(raw_inputs: str) -> dict[str, Any]:
+    """Decode one `--inputs-json` payload as a JSON object.
+
+    pre: raw_inputs is the exact string supplied after `--inputs-json`.
+    post: returns the decoded JSON object.
+    raises: ValueError when the payload is invalid JSON or not an object.
+    """
+
+    candidates = [raw_inputs]
+    if len(raw_inputs) >= 2 and raw_inputs[0] == raw_inputs[-1] and raw_inputs[0] in {"'", '"'}:
+        candidates.append(raw_inputs[1:-1])
+    last_error: json.JSONDecodeError | None = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+        if not isinstance(parsed, dict):
+            raise ValueError("`--inputs-json` must be a JSON object")
+        return parsed
+    assert last_error is not None
+    raise ValueError(f"`--inputs-json` must contain valid JSON: {last_error}") from last_error
+
+
+def _require_non_empty_text(value: Any, label: str) -> str:
+    """Return one stripped non-empty string value or fail closed.
+
+    pre: value is any candidate text field and label names that field for diagnostics.
+    post: returns the stripped string when non-empty.
+    raises: ValueError when the value is blank after string coercion.
+    """
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        raise ValueError(f"{label} is required")
+    return normalized
+
+
+def _canon_gateway_durable_root() -> Path:
+    """Return the active Hermes current-gateway durable root for workflow facade runs.
+
+    pre: Hermes home resolves for the active process.
+    post: __return__ points at `<hermes_home>/canon-current-gateway` without creating it.
+    raises: none.
+    """
+
+    return Path(get_hermes_home()) / "canon-current-gateway"
+
+
+def _gateway_source_from_live_event(event: Any) -> dict[str, Any]:
+    """Project one live gateway message into Canon-visible gateway source facts.
+
+    pre: event has `.source` and `.message_id` fields from the active gateway adapter.
+    post: returns public origin facts only; no request-json data is read here.
+    raises: ValueError when the live event lacks source identity required by the Canon facade.
+    """
+
+    source = getattr(event, "source", None)
+    if source is None:
+        raise ValueError("live /canon run requires gateway source identity")
+    gateway_source = {
+        "platform": str(getattr(source, "platform", "") or ""),
+        "chat_id": str(getattr(source, "chat_id", "") or ""),
+        "thread_id": str(getattr(source, "thread_id", "") or ""),
+        "user_id": str(getattr(source, "user_id", "") or ""),
+        "user_name": str(getattr(source, "user_name", "") or ""),
+        "session_id": str(getattr(source, "session_id", "") or ""),
+        "session_key": str(getattr(source, "session_key", "") or ""),
+        "message_id": str(getattr(event, "message_id", "") or ""),
+    }
+    if not gateway_source["platform"]:
+        raise ValueError("live /canon run requires gateway platform identity")
+    if not gateway_source["user_id"]:
+        raise ValueError("live /canon run requires gateway user identity")
+    if not gateway_source["message_id"]:
+        raise ValueError("live /canon run requires gateway message identity")
+    return gateway_source
+
+
+def _gateway_source_from_launch_target(*, target: Mapping[str, Any], request_id: str) -> dict[str, Any]:
+    """Build synthetic gateway source facts for one gateway-owned local launch request.
+
+    pre: target is the validated launch target object and request_id is non-empty.
+    post: returns a current-gateway origin envelope that preserves platform/chat/thread provenance
+          while using gateway-owned synthetic user/message identities required by the Canon facade.
+    raises: ValueError when required target fields are missing.
+    """
+
+    platform = str(target.get("platform") or "").strip().lower()
+    chat_id = str(target.get("chatId") or "").strip()
+    thread_id = str(target.get("threadId") or "").strip()
+    if platform != "telegram":
+        raise ValueError("target.platform must be telegram")
+    if not chat_id:
+        raise ValueError("target.chatId is required")
+    if not request_id:
+        raise ValueError("request_id is required")
+    gateway_source = {
+        "platform": platform,
+        "chat_id": chat_id,
+        "user_id": "canon-gateway-launcher",
+        "user_name": "canon-gateway-launcher",
+        "message_id": request_id,
+        "session_key": f"canon-gateway-launch:{platform}:{chat_id}" + (f":{thread_id}" if thread_id else ""),
+    }
+    if thread_id:
+        gateway_source["thread_id"] = thread_id
+    return gateway_source
+
+
+def _load_runtime_request_authority(request_json: str) -> dict[str, Any]:
+    """Load one run request file only at execution time and validate its authority shape.
+
+    pre: request_json is an absolute existing JSON file path already accepted by parser/builder code.
+    post: returns the full request object exactly as loaded from disk once runId/inputs authority is
+          validated; parser/builder code does not synthesize or rewrite it before this seam.
+    raises: ValueError when the file is unreadable, not JSON, not an object, lacks a non-empty runId,
+            or carries non-object inputs.
+    """
+
+    request_path = Path(request_json)
+    try:
+        raw_payload = json.loads(request_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ValueError(f"request_json could not be read: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"request_json must contain valid JSON: {exc}") from exc
+    if not isinstance(raw_payload, dict):
+        raise ValueError("request_json must contain a JSON object")
+    run_id = raw_payload.get("runId")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("request_json runId is required")
+    inputs = raw_payload.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ValueError("request_json inputs must be an object")
+    return raw_payload
+
+
+def _build_runtime_facade_stores(*, workflow: str, gateway_root: Path, request_authority: Mapping[str, Any]) -> dict[str, Any]:
+    """Build the private stores/config authority passed to Canon's workflow facade.
+
+    pre: gateway_root is the current-gateway durable root for this launch.
+    post: returns only the launcher-owned private runtime authorities needed to reach the Canon-owned
+          execution seam; workflow-specific schema/profile authority is not derived here.
+    raises: none.
+    """
+
+    from integrations.hermes.canon_hermes.tool_host import HermesToolHost
+
+    stores: dict[str, Any] = {
+        "root": str(gateway_root),
+        "phase_backend_client": create_gateway_phase_backend_client(),
+        "tool_host": HermesToolHost(),
+    }
+    return stores
+
+
+def _parse_gateway_review_target(target: Any) -> tuple[str, str | None]:
+    """Parse one Canon review-delivery target into Telegram chat/thread ids.
+
+    pre: target is the Canon current-gateway delivery target string `telegram:<chat_id>` or
+         `telegram:<chat_id>:<thread_id>`.
+    post: returns the exact chat/thread ids required by Hermes gateway adapter delivery.
+    raises: ValueError when the target is blank, malformed, or not Telegram-owned.
+    """
+
+    normalized_target = str(target or "").strip()
+    if not normalized_target:
+        raise ValueError("current-gateway review sender target is required")
+    platform, separator, remainder = normalized_target.partition(":")
+    chat_id, separator_2, thread_id = remainder.partition(":")
+    if platform != "telegram" or not separator or not chat_id:
+        raise ValueError(
+            "current-gateway review sender target must be `telegram:<chat_id>` or `telegram:<chat_id>:<thread_id>`"
+        )
+    return chat_id, thread_id or None
+
+
+def _build_gateway_review_sender_bridge(
+    send_review_prompt: Callable[..., Awaitable[dict[str, Any]]] | None,
+) -> Callable[[dict[str, Any]], dict[str, Any]] | None:
+    """Adapt one Hermes async review sender to Canon's synchronous sender contract.
+
+    pre: send_review_prompt is the active Hermes gateway review-delivery coroutine or None.
+    post: returns None when no live sender is available; otherwise returns a synchronous callable
+          that parses Canon target authority and blocks for the gateway adapter delivery result.
+    raises: RuntimeError when the bridge is created outside an active asyncio loop.
+    raises: ValueError when Canon delivery payload is malformed.
+    """
+
+    if send_review_prompt is None:
+        return None
     loop = asyncio.get_running_loop()
 
-    def _sender(payload: dict[str, Any]) -> dict[str, str]:
-        """Bridge sync Canon sender hook to async Telegram adapter send call."""
+    def _sender(payload: dict[str, Any]) -> dict[str, Any]:
+        """Deliver one Canon review card through the active Hermes gateway adapter.
 
-        coro = send_review_prompt(
-            chat_id=chat_id,
-            thread_id=thread_id,
-            run_id=run_id,
-            text=str(payload.get("message") or ""),
-            callbacks=payload.get("callbacks"),
-            gate_identity=payload.get("gateIdentity"),
-            downloadable_artifacts=payload.get("downloadableArtifacts"),
+        pre: payload is the Canon current-gateway sender payload with target/run/message authority.
+        post: returns the exact gateway adapter delivery result for durable evidence persistence.
+        raises: ValueError when payload is malformed.
+        raises: Exception from the underlying Hermes gateway sender.
+        """
+
+        if not isinstance(payload, dict):
+            raise ValueError("current-gateway review sender payload must be an object")
+        chat_id, thread_id = _parse_gateway_review_target(payload.get("target"))
+        run_id = _require_non_empty_text(payload.get("runId"), "review_sender.runId")
+        text = _require_non_empty_text(payload.get("message"), "review_sender.message")
+        future = asyncio.run_coroutine_threadsafe(
+            send_review_prompt(
+                chat_id=chat_id,
+                thread_id=thread_id,
+                run_id=run_id,
+                text=text,
+                callbacks=payload.get("callbacks"),
+                gate_identity=payload.get("gateIdentity"),
+                downloadable_artifacts=payload.get("downloadableArtifacts"),
+            ),
+            loop,
         )
-        result = asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
-        normalized_message_id = str((result or {}).get("message_id") or (result or {}).get("messageId") or "").strip()
-        if not normalized_message_id:
-            raise RuntimeError("telegram review prompt did not return message id")
-        normalized_chat_id = str((result or {}).get("chatId") or (result or {}).get("chat_id") or chat_id).strip()
-        normalized_thread_id = str((result or {}).get("threadId") or (result or {}).get("thread_id") or thread_id).strip()
-        delivery_result = {
-            "messageId": normalized_message_id,
-            "chatId": normalized_chat_id,
-            "threadId": normalized_thread_id,
-        }
-        if isinstance(result, dict) and result.get("message_id"):
-            delivery_result["message_id"] = normalized_message_id
+        result = future.result()
+        if not isinstance(result, dict):
+            raise ValueError("gateway review sender must return a delivery object")
+        message_id = _require_non_empty_text(
+            result.get("messageId") or result.get("message_id"),
+            "gateway review sender messageId",
+        )
+        delivery_result: dict[str, Any] = {"messageId": message_id, "chatId": str(chat_id)}
+        if thread_id:
+            delivery_result["threadId"] = str(thread_id)
         return delivery_result
 
-    pause_result = await asyncio.to_thread(
-        pause_current_gateway_for_human_review,
-        run_id=run_id,
-        thread_id=request["threadId"],
-        node_id=str(resume_handle.get("nodeId") or ""),
-        checkpoint_id=str(resume_handle.get("checkpointId") or ""),
-        request=request,
-        workflow_path=str(workflow_path),
-        config=config,
-        sender=_sender,
+    return _sender
+
+
+def _build_runtime_facade_payload(
+    *,
+    workflow: str,
+    inputs: Mapping[str, Any],
+    gateway_source: Mapping[str, Any],
+    gateway_root: Path,
+    request_id: str | None = None,
+    target: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the workflow-neutral Hermes->Canon facade payload for one runtime launch.
+
+    pre: workflow/inputs identify the operator-approved launch request; gateway_source is the
+         gateway-owned origin identity; gateway_root points at the active current-gateway durable root.
+    post: returns a public workflow-facade payload with Hermes-minted runId, live host-mode authority,
+          durable-root, and provenance fields attached.
+    raises: ValueError when runtime input authority is invalid.
+    """
+
+    if not isinstance(inputs, Mapping):
+        raise ValueError("inputs must be an object")
+    payload: dict[str, Any] = {
+        "workflowId": workflow,
+        "runId": f"hermes-canon-{uuid.uuid4().hex}",
+        "inputs": dict(inputs),
+        "gatewaySource": dict(gateway_source),
+        "hostMode": "live",
+        "storeConfig": {"root": str(gateway_root)},
+    }
+    if request_id is not None:
+        payload["requestId"] = request_id
+    if target is not None:
+        payload["target"] = dict(target)
+    return payload
+
+
+async def execute_gateway_workflow_facade_run(
+    *,
+    workflow: str,
+    inputs: Mapping[str, Any],
+    gateway_source: Mapping[str, Any],
+    gateway_root: Path,
+    request_id: str | None = None,
+    target: Mapping[str, Any] | None = None,
+    send_review_prompt: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Execute one gateway-owned Canon workflow run through the public facade seam.
+
+    pre: workflow/inputs identify the requested run; gateway_source carries Hermes-owned origin
+         identity; gateway_root selects the durable current-gateway store root.
+    post: Canon is called through `workflow_facade.startWorkflow(...)`, never through `canon.cli`.
+    raises: Exception from payload validation or the Canon workflow facade.
+    """
+
+    from integrations.hermes.canon_hermes import workflow_facade
+
+    facade_payload = _build_runtime_facade_payload(
+        workflow=workflow,
+        inputs=inputs,
+        gateway_source=gateway_source,
+        gateway_root=gateway_root,
+        request_id=request_id,
+        target=target,
     )
-    status = str((pause_result or {}).get("status") or "unknown")
-    if status not in {"awaiting-human-review", "delivery-failed"}:
-        raise RuntimeError(f"unexpected live run status: {status}")
-    return f"`/canon run` live run `{run_id}` status `{status}` (chat_id={chat_id}, message_thread_id={thread_id})."
+    facade_stores = _build_runtime_facade_stores(
+        workflow=workflow,
+        gateway_root=gateway_root,
+        request_authority={"inputs": facade_payload["inputs"]},
+    )
+    review_sender = _build_gateway_review_sender_bridge(send_review_prompt)
+    if review_sender is not None:
+        facade_stores["review_sender"] = review_sender
+    return await asyncio.to_thread(workflow_facade.startWorkflow, facade_payload, facade_stores)
+
+
+def _run_payload_has_review_delivery_evidence(payload: dict[str, Any]) -> bool:
+    """Return True when awaiting-review status includes durable checkpoint and delivery evidence.
+
+    pre: payload is one Canon workflow facade result object.
+    post: returns True only when both checkpoint and delivery carry non-empty object values.
+    raises: none.
+    """
+
+    checkpoint = payload.get("checkpoint")
+    delivery = payload.get("delivery")
+    return isinstance(checkpoint, dict) and bool(checkpoint) and isinstance(delivery, dict) and bool(delivery)
+
+
+def _canon_run_response_ok(payload: dict[str, Any]) -> bool:
+    """Classify one Canon workflow-facade result as acceptable or fail-closed.
+
+    pre: payload is the dict returned by `workflow_facade.startWorkflow(...)`.
+    post: returns False for blocked/failed/cancelled/invalid statuses at either top level or nested
+          result level, preventing false-green operator responses.
+    post: `awaiting-human-review`/pending wait statuses require checkpoint and delivery evidence.
+    raises: none.
+    """
+
+    statuses: list[str] = []
+    top_status = str(payload.get("status") or "").strip().lower()
+    if top_status:
+        statuses.append(top_status)
+    result = payload.get("result")
+    if isinstance(result, dict):
+        nested_status = str(result.get("status") or "").strip().lower()
+        if nested_status:
+            statuses.append(nested_status)
+    if not statuses:
+        return False
+    for status in statuses:
+        if status.startswith("blocked") or status in {"failed", "error", "cancelled", "invalid"}:
+            return False
+    accepted = any(
+        status in {"completed", "success", "paused", "awaiting-human-review", "waiting", "pending-human-review"}
+        for status in statuses
+    )
+    if not accepted:
+        return False
+    if any(status in {"awaiting-human-review", "waiting", "pending-human-review"} for status in statuses):
+        return _run_payload_has_review_delivery_evidence(payload)
+    return True
+
+
+def _canon_run_reason(payload: dict[str, Any]) -> str | None:
+    """Return the most useful human-readable reason from one Canon workflow-facade payload.
+
+    pre: payload is the dict returned by `workflow_facade.startWorkflow(...)`.
+    post: returns the first non-empty reason/message/error/status string from nested result or top-level payload.
+    raises: none.
+    """
+
+    candidates: list[dict[str, Any]] = []
+    result = payload.get("result")
+    if isinstance(result, dict):
+        candidates.append(result)
+    candidates.append(payload)
+    for candidate in candidates:
+        for key in ("reason", "message", "error", "status"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _format_canon_run_response(*, workflow: str, payload: dict[str, Any]) -> str:
+    """Render one honest operator-visible `/canon run` result from workflow-facade truth.
+
+    pre: payload came from `workflow_facade.startWorkflow(...)`.
+    post: success/accepted-wait statuses report the run id and durable status; blocked/failed states
+          are returned as explicit fail-closed messages with the best available reason.
+    raises: none.
+    """
+
+    run_id = str(payload.get("runId") or "").strip() or "<unknown>"
+    status = str(payload.get("status") or "").strip() or "unknown"
+    reason = _canon_run_reason(payload)
+    if _canon_run_response_ok(payload):
+        return f"`/canon run` live run `{run_id}` status `{status}` for workflow `{workflow}`."
+    suffix = f": {reason}" if reason else ""
+    return f"`/canon run` failed closed for run `{run_id}` status `{status}`{suffix}"
+
+
+async def _run_gateway_canon_cli_command(
+    *,
+    workflow: str,
+    inputs: Mapping[str, Any],
+    gateway_source: Mapping[str, Any],
+    gateway_root: Path,
+    send_review_prompt: Callable[..., Awaitable[dict[str, Any]]] | None,
+) -> str:
+    """Execute one live `/canon run` through the public workflow facade seam.
+
+    pre: workflow is a non-empty Canon workflow selector.
+    pre: inputs is a JSON-object workflow input mapping.
+    pre: gateway_source/gateway_root identify the live current-gateway origin and durable root.
+    post: returns an honest operator-visible status string.
+    raises: any exception surfaced by the workflow facade.
+    """
+
+    payload = await execute_gateway_workflow_facade_run(
+        workflow=workflow,
+        inputs=inputs,
+        gateway_source=gateway_source,
+        gateway_root=gateway_root,
+        send_review_prompt=send_review_prompt,
+    )
+    return _format_canon_run_response(workflow=workflow, payload=payload)
 
 
 def create_gateway_phase_backend_client() -> "_GatewayHermesPhaseBackendClient":
@@ -319,19 +747,29 @@ class _GatewayHermesScopedPhaseSession:
 
         if not isinstance(envelope, dict):
             raise RuntimeError("Canon phase envelope must be an object")
-        prompt = self._build_phase_prompt(envelope)
+        workdir = self._phase_workdir(envelope)
+        prompt = self._build_phase_prompt(envelope, workdir=workdir)
         from hermes_cli.oneshot import _run_agent
 
-        model_route = self._projection.get("modelRoute") if isinstance(self._projection.get("modelRoute"), dict) else {}
-        model = str(model_route.get("model") or "").strip() or None
-        provider = str(model_route.get("provider") or "").strip() or None
-        toolsets = self._derive_authorized_toolsets(envelope)
+        model_route = self._phase_model_route()
+        model = model_route["model"] if model_route else None
+        provider = model_route["provider"] if model_route else None
+        hermes_profile_id = self._hermes_profile_id()
+        toolsets = self._derive_authorized_toolsets(envelope, hermes_profile_id=hermes_profile_id)
+        skills = self._derive_authorized_skills()
+        use_config_toolsets = toolsets is None and hermes_profile_id is not None
+        if self._phase_tool_use_disabled():
+            toolsets = []
+            use_config_toolsets = False
         response = _run_agent(
             prompt,
             model=model,
             provider=provider,
             toolsets=toolsets,
-            use_config_toolsets=False,
+            use_config_toolsets=use_config_toolsets,
+            profile=hermes_profile_id,
+            skills=skills,
+            workdir=workdir,
         )
         output = _extract_json_object(response)
         artifact_refs = self._persist_solution_modeling_handoff(output, envelope=envelope)
@@ -344,27 +782,90 @@ class _GatewayHermesScopedPhaseSession:
         result["eventCursorRefs"] = self._event_cursor_refs(envelope, agent_session_ref=agent_session_ref)
         return result
 
-    def _derive_authorized_toolsets(self, envelope: dict[str, Any]) -> list[str] | None:
-        """Resolve explicit toolset authority from projection and fail closed when required scopes are missing.
+    def _phase_model_route(self) -> dict[str, str] | None:
+        """Return the explicit Canon provider/model override for this phase.
+
+        pre: self._projection may carry modelRoute minted by Canon routing.
+        post: returns None when no route override is present; otherwise returns a complete provider/model pair.
+        raises: RuntimeError when modelRoute is malformed or only partially specifies provider/model.
+        """
+
+        raw = self._projection.get("modelRoute")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise RuntimeError("Canon phase backend projection modelRoute must be an object")
+        provider = str(raw.get("provider") or "").strip()
+        model = str(raw.get("model") or "").strip()
+        if not provider and not model:
+            return None
+        if not provider or not model:
+            raise RuntimeError("Canon phase backend projection modelRoute must include both provider and model")
+        return {"provider": provider, "model": model}
+
+    def _phase_tool_use_disabled(self) -> bool:
+        """Return whether Canon explicitly disabled tool use for this phase route.
+
+        pre: self._projection may carry a Canon-minted modelRoute object.
+        post: returns True only when modelRoute.toolUse is explicitly False.
+        raises: RuntimeError when modelRoute is present but not an object.
+        """
+
+        raw = self._projection.get("modelRoute")
+        if raw is None:
+            return False
+        if not isinstance(raw, dict):
+            raise RuntimeError("Canon phase backend projection modelRoute must be an object")
+        return raw.get("toolUse") is False
+
+    def _hermes_profile_id(self) -> str | None:
+        """Return the optional Hermes execution profile selected for this Canon phase.
+
+        pre: self._projection is the private Canon->Hermes scoped projection.
+        post: returns a stripped profile id when configured; otherwise None.
+        raises: RuntimeError when the projection carries a malformed blank/non-string id.
+        """
+
+        raw = self._projection.get("hermesProfileId")
+        if raw is None:
+            return None
+        if not isinstance(raw, str) or not raw.strip():
+            raise RuntimeError("Canon phase backend projection hermesProfileId must be a non-empty string")
+        return raw.strip()
+
+    def _derive_authorized_toolsets(self, envelope: dict[str, Any], *, hermes_profile_id: str | None) -> list[str] | None:
+        """Resolve explicit toolset overrides or defer to the selected Hermes profile.
 
         pre: envelope is the active Canon phase envelope and self._projection is Canon-minted authority.
-        post: returns a normalized ordered toolset list when authority is explicit; returns None only when
-              no explicit tool authority is required by the current phase contract.
-        raises: RuntimeError when phase contract requires tool scopes but projection provides no explicit
-                allowedScopes.toolsetRefs authority.
+        post: returns a normalized ordered toolset list when Canon sent explicit allowedScopes.toolsetRefs.
+        post: returns None for profile-owned tool defaults when hermes_profile_id is configured.
+        raises: RuntimeError when a tool-requiring phase has neither explicit toolsets nor a Hermes profile.
         """
 
         allowed_scopes = self._projection.get("allowedScopes")
         refs = allowed_scopes.get("toolsetRefs") if isinstance(allowed_scopes, dict) else None
-        authorized = self._normalize_toolset_refs(refs)
+        authorized = self._normalize_refs(refs, authority_name="allowedScopes.toolsetRefs")
         if authorized:
             return authorized
+        if hermes_profile_id is not None:
+            return None
         if self._phase_requires_tools(envelope):
             raise RuntimeError(
                 "Canon phase backend projection is missing required allowedScopes.toolsetRefs authority "
-                "for a tool-requiring phase"
+                "or hermesProfileId for a tool-requiring phase"
             )
         return None
+
+    def _derive_authorized_skills(self) -> list[str] | None:
+        """Resolve explicit skill preload overrides from Canon allowed scopes.
+
+        pre: self._projection may carry allowedScopes.skillRefs minted by Canon.
+        post: returns normalized skill ids for explicit preload overrides, or None to use profile defaults only.
+        """
+
+        allowed_scopes = self._projection.get("allowedScopes")
+        refs = allowed_scopes.get("skillRefs") if isinstance(allowed_scopes, dict) else None
+        return self._normalize_refs(refs, authority_name="allowedScopes.skillRefs")
 
     def _phase_requires_tools(self, envelope: dict[str, Any]) -> bool:
         """Return whether this phase contract explicitly requires tool access.
@@ -378,10 +879,10 @@ class _GatewayHermesScopedPhaseSession:
         mandatory_skills = inputs.get("mandatorySkills")
         return isinstance(mandatory_skills, list) and any(isinstance(item, str) and item.strip() for item in mandatory_skills)
 
-    def _normalize_toolset_refs(self, refs: Any) -> list[str] | None:
-        """Normalize projection toolset refs to bounded unique toolset names.
+    def _normalize_refs(self, refs: Any, *, authority_name: str) -> list[str] | None:
+        """Normalize projection refs to bounded unique names.
 
-        pre: refs is a potential allowedScopes.toolsetRefs projection value.
+        pre: refs is a potential Canon projection list.
         post: returns ordered unique non-empty strings when refs is list-like; otherwise None.
         raises: RuntimeError when refs is present but malformed.
         """
@@ -389,7 +890,7 @@ class _GatewayHermesScopedPhaseSession:
         if refs is None:
             return None
         if not isinstance(refs, list):
-            raise RuntimeError("Canon phase backend projection allowedScopes.toolsetRefs must be a list")
+            raise RuntimeError(f"Canon phase backend projection {authority_name} must be a list")
         normalized: list[str] = []
         for entry in refs:
             value = str(entry).strip() if isinstance(entry, str) else ""
@@ -437,7 +938,34 @@ class _GatewayHermesScopedPhaseSession:
             return "hermes-current-gateway:ref"
         return text[:max_length]
 
-    def _build_phase_prompt(self, envelope: dict[str, Any]) -> str:
+    def _phase_workdir(self, envelope: dict[str, Any]) -> str:
+        """Return the only Canon-authorized working directory for this phase.
+
+        pre: self._projection is the private Canon->Hermes scoped projection for this phase.
+        post: returns the resolved absolute executionContext.workingDirectory authority exactly when the
+              projection supplies one safe existing directory.
+        raises: RuntimeError when executionContext or executionContext.workingDirectory is missing,
+                blank, relative, nonexistent, or not a directory.
+        """
+
+        execution_context = self._projection.get("executionContext")
+        if not isinstance(execution_context, dict):
+            raise RuntimeError(
+                "Canon phase backend projection is missing required executionContext.workingDirectory authority"
+            )
+        raw = execution_context.get("workingDirectory")
+        if not isinstance(raw, str) or not raw.strip():
+            raise RuntimeError(
+                "Canon phase backend projection executionContext.workingDirectory must be an absolute existing directory"
+            )
+        candidate = Path(raw.strip()).expanduser()
+        if not candidate.is_absolute() or not candidate.is_dir():
+            raise RuntimeError(
+                "Canon phase backend projection executionContext.workingDirectory must be an absolute existing directory"
+            )
+        return str(candidate.resolve())
+
+    def _build_phase_prompt(self, envelope: dict[str, Any], *, workdir: str | None = None) -> str:
         """Build a strict JSON-only prompt from Canon envelope authority.
 
         pre: envelope carries objective, inputs, outputSchema, runId, phaseId.
@@ -476,6 +1004,13 @@ class _GatewayHermesScopedPhaseSession:
                 "- Return the refs object and freeze metadata required by the schema.\n"
                 "- Mark status as frozen and list every frozen ref; do not invent a new model.\n"
             )
+        workdir_guidance = ""
+        if workdir:
+            workdir_guidance = (
+                f"Execution working directory: {workdir}\n"
+                "All relative read_file/search_files/write_file/patch/terminal paths for this phase MUST "
+                "resolve under that directory unless a phase input explicitly names an absolute path.\n"
+            )
         return (
             "You are executing one Canon current-gateway phase.\n"
             "Return ONLY one valid JSON object. No markdown, no prose, no code fences.\n"
@@ -489,6 +1024,7 @@ class _GatewayHermesScopedPhaseSession:
             f"- specRef: {ref_prefix}/spec\n"
             f"- workingLogRef: {ref_prefix}/working-log\n"
             f"- chatSummaryRef: {ref_prefix}/chat-summary\n"
+            f"{workdir_guidance}"
             f"{solution_modeling_guidance}\n"
             f"Canon identity: runId={run_id}, phaseId={phase_id}.\n\n"
             "Phase objective:\n"
@@ -877,6 +1413,196 @@ def _handle_latest(*, source: Any) -> str:
     return _format_operator_summary(prefix="/canon latest", summary=summary)
 
 
+def _handle_list(*, source: Any) -> str:
+    """Resolve `/canon list` from Canon durable store with origin scope.
+
+    pre: source identifies gateway origin through platform + chat_id.
+    post: returns Russian markdown list of visible durable runs with count/status.
+    raises: none (fail-closed text on lookup/import/authority errors).
+    """
+
+    try:
+        listing = _load_list_summary(source=source)
+    except Exception as exc:
+        return f"`/canon list` failed closed: {exc}"
+    return _render_list_surface(listing=listing)
+
+
+def _handle_observability_subcommand(
+    *,
+    subcommand: str,
+    run_id: str,
+    source: Any,
+    after_sequence: int | None = None,
+    limit: int | None = None,
+) -> str:
+    """Handle one run-scoped observability subcommand.
+
+    pre: subcommand belongs to list/full/timeline/artifacts/events/report/control and run_id is non-empty.
+    post: returns Russian markdown without raw JSON and fail-closes when lookup fails.
+    raises: none.
+    """
+
+    try:
+        if subcommand == "events":
+            events_summary = _load_stream_events_summary(
+                run_id=run_id,
+                source=source,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+            return _render_events_surface(
+                run_id=run_id,
+                events_summary=events_summary,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+        summary = _load_inspect_summary(run_id=run_id, source=source)
+    except Exception as exc:
+        return f"`/canon {subcommand} {run_id}` failed closed: {exc}"
+    return _render_observability_surface(subcommand=subcommand, run_id=run_id, summary=summary)
+
+
+def _parse_events_cursor_args(args: list[str]) -> tuple[int | None, int | None]:
+    """Parse optional cursor arguments for `/canon events`.
+
+    pre: args are tokens after `<run-id>`.
+    post: returns optional non-negative cursor/limit integers.
+    raises: ValueError when args are unsupported, duplicated, or malformed.
+    """
+
+    after_sequence: int | None = None
+    limit: int | None = None
+    index = 0
+    while index < len(args):
+        token = str(args[index]).strip()
+        if token == "--after-sequence":
+            if after_sequence is not None:
+                raise ValueError("duplicate --after-sequence")
+            if index + 1 >= len(args):
+                raise ValueError("--after-sequence requires a value")
+            after_sequence = _parse_non_negative_int(token="--after-sequence", value=args[index + 1])
+            index += 2
+            continue
+        if token == "--limit":
+            if limit is not None:
+                raise ValueError("duplicate --limit")
+            if index + 1 >= len(args):
+                raise ValueError("--limit requires a value")
+            limit = _parse_non_negative_int(token="--limit", value=args[index + 1])
+            index += 2
+            continue
+        raise ValueError(f"unsupported events argument: {token}")
+    return after_sequence, limit
+
+
+def _parse_non_negative_int(*, token: str, value: str) -> int:
+    """Parse one non-negative integer CLI argument value.
+
+    pre: token is the argument name and value is the raw token value.
+    post: returns parsed integer value >= 0.
+    raises: ValueError when value is not a non-negative integer.
+    """
+
+    try:
+        parsed = int(str(value).strip())
+    except ValueError as exc:
+        raise ValueError(f"{token} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{token} must be a non-negative integer")
+    return parsed
+
+
+def _load_stream_events_summary(
+    *,
+    run_id: str,
+    source: Any,
+    after_sequence: int | None,
+    limit: int | None,
+) -> dict[str, Any]:
+    """Load one cursor-window events payload from Canon streamWorkflowEvents facade.
+
+    pre: run_id/source are valid operator scope identifiers.
+    post: returns stream window payload with events/cursor metadata from Canon authority.
+    raises: ImportError/ValueError/PermissionError from Canon facade or input projection.
+    """
+
+    from integrations.hermes.canon_hermes.workflow_facade import stream_workflow_events
+
+    platform_raw = getattr(source, "platform", "")
+    platform = getattr(platform_raw, "value", platform_raw)
+    payload: dict[str, Any] = {
+        "runId": run_id,
+        "origin": _gateway_origin(source),
+        "gatewaySource": {
+            "platform": str(platform),
+            "chat_id": str(getattr(source, "chat_id", "") or ""),
+        },
+    }
+    thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    if thread_id:
+        payload["gatewaySource"]["thread_id"] = thread_id
+    if after_sequence is not None:
+        payload["afterSequence"] = after_sequence
+    if limit is not None:
+        payload["limit"] = limit
+    return stream_workflow_events(payload)
+
+
+def _render_events_surface(
+    *,
+    run_id: str,
+    events_summary: dict[str, Any],
+    after_sequence: int | None,
+    limit: int | None,
+) -> str:
+    """Render `/canon events` cursor stream window as bounded Russian markdown.
+
+    pre: events_summary is streamWorkflowEvents payload from Canon facade.
+    post: output includes cursor input/output metadata and bounded event window.
+    raises: ValueError when stream payload is malformed.
+    """
+
+    if not isinstance(events_summary, dict):
+        raise ValueError("streamWorkflowEvents payload must be a mapping")
+    run_summary = events_summary.get("run")
+    if not isinstance(run_summary, dict):
+        raise ValueError("streamWorkflowEvents.run must be a mapping")
+    events = events_summary.get("events")
+    if not isinstance(events, list):
+        raise ValueError("streamWorkflowEvents.events must be a list")
+    next_cursor = events_summary.get("nextCursor")
+    has_more = events_summary.get("hasMore")
+    if has_more is not None and not isinstance(has_more, bool):
+        raise ValueError("streamWorkflowEvents.hasMore must be a boolean")
+
+    status = _to_redacted_value(run_summary.get("status") or "unknown", key="status").strip() or "unknown"
+    label = "non-production" if _is_non_production_status(status) else "production"
+    lines: list[str] = [
+        "### Поверхность: События",
+        f"- Команда: `/canon events {run_id}`",
+        f"- Область запуска: `{run_id}`",
+        f"- Статус: `{status}` ({label})",
+        f"- Курсор запроса: afterSequence={after_sequence if after_sequence is not None else '-'}, limit={limit if limit is not None else '-'}",
+        f"- Курсор ответа: nextCursor={_to_redacted_value(next_cursor, key='nextCursor')}, hasMore={_to_redacted_value(has_more, key='hasMore')}",
+        "- События:",
+    ]
+    if not events:
+        lines.append("  - <не опубликованно>")
+        return "\n".join(lines)
+
+    for event in events[:50]:
+        if isinstance(event, Mapping):
+            event_kind = _to_redacted_value(event.get("eventKind") or "unknown", key="eventKind")
+            sequence = _to_redacted_value(event.get("sequence") if "sequence" in event else "-", key="sequence")
+            node_id = _to_redacted_value(event.get("nodeId") if "nodeId" in event else "-", key="nodeId")
+            lines.append(f"  - seq={sequence}; kind={event_kind}; node={node_id}")
+            continue
+        lines.append(f"  - {_to_redacted_value(event, key='events')}")
+    return "\n".join(lines)
+
+
+
 def _handle_inspect(*, run_id: str, source: Any) -> str:
     """Resolve `/canon inspect <run-id>` from Canon durable store with origin scope.
 
@@ -890,6 +1616,267 @@ def _handle_inspect(*, run_id: str, source: Any) -> str:
     except Exception as exc:
         return f"`/canon inspect {run_id}` failed closed: {exc}"
     return _format_operator_summary(prefix=f"/canon inspect {run_id}", summary=summary)
+
+
+def _render_observability_surface(*, subcommand: str, run_id: str, summary: dict[str, Any]) -> str:
+    """Render one localized observability surface in markdown without raw JSON payloads.
+
+    pre: summary is a dictionary loaded from Canon durable inspect authority.
+    post: returns a one-screen markdown block per surface with Russian labels and fail-safe placeholders.
+    raises: ValueError when an unsupported surface is requested.
+    """
+
+    status = _to_redacted_value(summary.get("status", "unknown"), key="status")
+    if not isinstance(status, str):
+        status = str(status)
+    status = status.strip() or "unknown"
+    label = "non-production" if _is_non_production_status(status) else "production"
+    surface_map = {
+        "list": "Список",
+        "full": "Полный отчет",
+        "timeline": "Таймлайн",
+        "artifacts": "Артефакты",
+        "events": "События",
+        "report": "Отчет",
+        "control": "Контроль",
+    }
+    surface = surface_map.get(subcommand)
+    if not surface:
+        raise ValueError(f"unknown observability surface: {subcommand}")
+
+    lines: list[str] = [
+        f"### Поверхность: {surface}",
+        f"- Команда: `/canon {subcommand} {run_id}`",
+        f"- Область запуска: `{run_id}`",
+        f"- Статус: `{status}` ({label})",
+        "",
+    ]
+
+    if subcommand == "list":
+        lines.append("- Доступные поверхности:")
+        values = [
+            "- list",
+            "- full",
+            "- timeline",
+            "- artifacts",
+            "- events",
+            "- report",
+            "- control",
+        ]
+        lines.extend(values)
+        return "\n".join(lines)
+
+    if subcommand == "timeline":
+        lines.append("- Таймлайн:")
+        timeline = summary.get("timeline")
+        if isinstance(timeline, list) and timeline:
+            for item in timeline:
+                lines.append(f"  - {_to_redacted_value(item, key='timeline')}")
+        else:
+            lines.append("  - <не опубликованно>")
+        return "\n".join(lines)
+
+    if subcommand == "artifacts":
+        lines.append("- Артефакты:")
+        artifacts = _extract_observability_artifacts(summary.get("artifacts"))
+        if artifacts:
+            for artifact in artifacts:
+                lines.append(f"  - {_to_redacted_value(artifact, key='artifacts')}")
+        else:
+            lines.append("  - <не опубликованно>")
+        return "\n".join(lines)
+
+    if subcommand == "events":
+        lines.append("- События:")
+        events = summary.get("events")
+        if isinstance(events, list) and events:
+            for event_line in events:
+                lines.append(f"  - {_to_redacted_value(event_line, key='events')}")
+        else:
+            lines.append("  - <не опубликованно>")
+        return "\n".join(lines)
+
+    if subcommand == "report":
+        lines.append("- Отчет:")
+        # Canon observe authority uses `reportSummary`; keep `report` only as
+        # legacy fallback when reportSummary is absent.
+        report_payload = summary.get("reportSummary")
+        report_key = "reportSummary"
+        if report_payload is None:
+            report_payload = summary.get("report")
+            report_key = "report"
+        if isinstance(report_payload, dict):
+            rendered = _render_observability_mapping(report_payload)
+            if rendered:
+                lines.extend(rendered)
+            else:
+                lines.append("  - <не опубликованно>")
+        elif report_payload is not None:
+            lines.append(f"  - {_to_redacted_value(report_payload, key=report_key)}")
+        else:
+            lines.append("  - <не опубликованно>")
+        return "\n".join(lines)
+
+    if subcommand == "control":
+        lines.append("- Контроль:")
+        control = summary.get("control")
+        if isinstance(control, dict):
+            rendered = _render_observability_mapping(control)
+            if rendered:
+                lines.extend(rendered)
+            else:
+                lines.append("  - <не опубликованно>")
+        elif control is not None:
+            lines.append(f"  - {_to_redacted_value(control, key='control')}")
+        else:
+            lines.append("  - <не опубликованно>")
+        return "\n".join(lines)
+
+    # full output.
+    full_markdown = _observe_to_markdown(summary)
+    lines.append("- Полный отчет:")
+    if full_markdown:
+        lines.extend(f"  {line}" if line else "" for line in full_markdown.splitlines())
+    else:
+        lines.append("  - <не опубликованно>")
+    return "\n".join(lines)
+
+
+def _extract_observability_artifacts(raw_artifacts: Any) -> list[str]:
+    """Build stable artifact name list from list-like artifact summaries."""
+
+    if not isinstance(raw_artifacts, list):
+        return []
+
+    names: list[str] = []
+    for artifact in raw_artifacts:
+        if isinstance(artifact, str):
+            if artifact.strip():
+                names.append(artifact)
+            continue
+        if isinstance(artifact, dict):
+            name = artifact.get("path") or artifact.get("fileName")
+            if isinstance(name, str) and name.strip():
+                names.append(name)
+    return sorted(set(names))
+
+
+def _render_observability_compact_mapping(payload: Mapping[str, Any]) -> str:
+    """Flatten one mapping into compact operator text without raw brace syntax.
+
+    pre: payload is a small operator-facing mapping from a durable summary payload.
+    post: returns bounded `key=value` text suitable for inline markdown list values.
+    raises: none.
+    """
+
+    pairs: list[str] = []
+    for key, value in payload.items():
+        key_text = str(key)
+        if isinstance(value, Mapping):
+            pairs.append(f"{key_text}=({_render_observability_compact_mapping(value)})")
+            continue
+        if isinstance(value, list):
+            rendered_items = ", ".join(_render_observability_inline_value(item, key=key_text) for item in value[:5])
+            pairs.append(f"{key_text}={rendered_items or '-'}")
+            continue
+        pairs.append(f"{key_text}={_render_observability_inline_value(value, key=key_text)}")
+    return ", ".join(pairs) if pairs else "-"
+
+
+
+def _render_observability_inline_value(value: Any, *, key: str) -> str:
+    """Render one inline observability value without falling back to raw dict/list dumps.
+
+    pre: value is any operator-facing scalar/list/mapping and key names the source field.
+    post: mappings/lists become bounded brace-free text and null becomes '-'.
+    raises: none.
+    """
+
+    if value is None:
+        return "-"
+    if isinstance(value, Mapping):
+        return _render_observability_compact_mapping(value)
+    if isinstance(value, list):
+        rendered = ", ".join(_render_observability_inline_value(item, key=key) for item in value[:5])
+        return rendered or "-"
+    text = _to_redacted_value(value, key=key).strip()
+    return text or "-"
+
+
+
+def _render_observability_mapping(payload: Mapping[str, Any]) -> list[str]:
+    """Render a durable mapping payload as markdown lines.
+
+    pre: payload is an operator-facing dict object.
+    post: list contains short, readable bullet rows.
+    raises: none.
+    """
+
+    lines: list[str] = []
+    for key, value in payload.items():
+        key_text = str(key)
+        if isinstance(value, dict):
+            nested = _render_observability_mapping(value)
+            lines.append(f"  - {key_text}:")
+            lines.extend(f"    {line}" if line else "" for line in nested)
+            continue
+        if isinstance(value, list):
+            rendered_items = ", ".join(_render_observability_inline_value(item, key=key_text) for item in value[:5])
+            lines.append(f"  - {key_text}: {rendered_items}" if rendered_items else f"  - {key_text}: <не опубликованно>")
+            continue
+        lines.append(f"  - {key_text}: {_render_observability_inline_value(value, key=key_text)}")
+    return lines
+
+
+_SECRET_KEYS = {
+    "token",
+    "password",
+    "api_key",
+    "private_key",
+    "secret",
+    "prompt",
+    "raw_prompt",
+    "tool_stdout",
+    "transcript",
+    "raw_transcript",
+    "secret",
+}
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)(token|password|api[_-]?key|private[_-]?key|secret|prompt|raw[_-]?prompt|tool[_-]?stdout|transcript)\s*[:=]\s*([^\n;,}]*)"
+)
+_SECRET_VALUE_RE = re.compile(
+    r"(?i)(top[_-]?secret|secret[_-]?(token|value|status)?|password|api[_-]?key|private[_-]?key|bearer\s+[a-z0-9._-]+|sk-[a-z0-9_-]+)"
+)
+
+
+def _to_redacted_value(value: Any, *, key: str | None = None) -> str:
+    """Return redacted/normalized value for operator markdown.
+
+    pre: value may be scalar or a mapping/list.
+    post: redacts secret-like values and assignments.
+    raises: none.
+    """
+
+    normalized_key = (key or "").strip().lower()
+    if isinstance(value, dict) or isinstance(value, list):
+        return str(value)
+    rendered = value if isinstance(value, str) else str(value)
+    if normalized_key in _SECRET_KEYS or any(marker in normalized_key for marker in _SECRET_KEYS):
+        return "***REDACTED***"
+    redacted = _SECRET_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}={match.group(1) and '***REDACTED***'}", rendered)
+    return _SECRET_VALUE_RE.sub("***REDACTED***", redacted)
+
+
+def _load_list_summary(*, source: Any) -> dict[str, Any]:
+    """Read origin-scoped Canon run list from durable backends.
+
+    pre: Canon integration modules are importable and source carries origin identity.
+    post: returns detached durable list payload from Canon operator authority.
+    raises: ValueError/ImportError from origin or Canon integration loading.
+    """
+
+    list_runs_for_origin, journal, artifacts = _load_operator_backends(listing=True)
+    return list_runs_for_origin(origin=_gateway_origin(source), journal=journal, artifacts=artifacts)
 
 
 def _load_latest_summary(*, source: Any) -> dict[str, Any]:
@@ -916,7 +1903,7 @@ def _load_inspect_summary(*, run_id: str, source: Any) -> dict[str, Any]:
     return inspect_run_for_operator(run_id=run_id, origin=_gateway_origin(source), journal=journal, artifacts=artifacts)
 
 
-def _load_operator_backends(*, inspect: bool = False):
+def _load_operator_backends(*, inspect: bool = False, listing: bool = False):
     """Load Canon durable operator callables/backends from integration authority.
 
     pre: Canon repo integration package and durability backends are available in runtime.
@@ -929,6 +1916,7 @@ def _load_operator_backends(*, inspect: bool = False):
     from integrations.hermes.canon_hermes.current_gateway_operator_commands import (
         inspect_run_for_operator,
         latest_run_for_origin,
+        list_runs_for_origin,
     )
     from integrations.hermes.canon_hermes.current_gateway_runner import (
         build_current_gateway_runner_config,
@@ -937,6 +1925,8 @@ def _load_operator_backends(*, inspect: bool = False):
     config = build_current_gateway_runner_config()
     journal = SqliteExecutionJournal(config.journal_path)
     artifacts = LocalArtifactBackend(config.artifacts_dir)
+    if listing:
+        return list_runs_for_origin, journal, artifacts
     return (inspect_run_for_operator if inspect else latest_run_for_origin), journal, artifacts
 
 
@@ -944,18 +1934,58 @@ def _gateway_origin(source: Any) -> str:
     """Build canonical gateway-source origin string used by Canon durable operator scope.
 
     pre: source carries a non-empty platform and chat_id.
-    post: returns '<platform>:<chat_id>' so operator reads are origin-scoped.
+    post: returns '<platform>:<chat_id>:<thread_id>' when thread_id is present, otherwise
+          '<platform>:<chat_id>'.
     raises: ValueError when source identity is incomplete.
     """
 
     platform_raw = getattr(source, "platform", "")
     platform = getattr(platform_raw, "value", platform_raw)
     chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    thread_id = str(getattr(source, "thread_id", "") or "").strip()
     if not str(platform or "").strip():
         raise ValueError("source.platform is required for /canon durable lookup")
     if not chat_id:
         raise ValueError("source.chat_id is required for /canon durable lookup")
-    return f"{platform}:{chat_id}"
+    return f"{platform}:{chat_id}:{thread_id}" if thread_id else f"{platform}:{chat_id}"
+
+
+def _render_list_surface(*, listing: dict[str, Any]) -> str:
+    """Render `/canon list` origin-scoped durable run listing as Russian markdown.
+
+    pre: listing is detached mapping with origin/count/runs from Canon operator surface.
+    post: returns bounded markdown bullets with run id/status/count and redacted values.
+    raises: ValueError when listing payload is malformed.
+    """
+
+    if not isinstance(listing, dict):
+        raise ValueError("durable list payload must be a mapping")
+    origin = _to_redacted_value(listing.get("origin") or "unknown", key="origin")
+    runs = listing.get("runs")
+    if not isinstance(runs, list):
+        raise ValueError("durable list payload.runs must be a list")
+    count = listing.get("count")
+    if not isinstance(count, int) or count < 0:
+        raise ValueError("durable list payload.count must be a non-negative integer")
+
+    lines = [
+        "### Поверхность: Список запусков",
+        "- Команда: `/canon list`",
+        f"- Origin: `{origin}`",
+        f"- Видимых запусков: `{count}`",
+        "- Запуски:",
+    ]
+    if not runs:
+        lines.append("  - <пусто>")
+        return "\n".join(lines)
+
+    for item in runs:
+        if not isinstance(item, dict):
+            continue
+        run_id = _to_redacted_value(item.get("runId") or "unknown", key="runId")
+        status = _to_redacted_value(item.get("status") or "unknown", key="status")
+        lines.append(f"  - `{run_id}` — `{status}`")
+    return "\n".join(lines)
 
 
 def _format_operator_summary(*, prefix: str, summary: dict[str, Any]) -> str:
@@ -969,7 +1999,7 @@ def _format_operator_summary(*, prefix: str, summary: dict[str, Any]) -> str:
     if not isinstance(summary, dict):
         raise ValueError("durable summary must be a mapping")
     run_id = str(summary.get("runId") or "").strip() or "unknown"
-    status = str(summary.get("status") or "unknown").strip() or "unknown"
+    status = _to_redacted_value(summary.get("status") or "unknown", key="status").strip() or "unknown"
     label = "non-production" if _is_non_production_status(status) else "production"
     return f"`{prefix}` run `{run_id}` status `{status}` ({label})."
 

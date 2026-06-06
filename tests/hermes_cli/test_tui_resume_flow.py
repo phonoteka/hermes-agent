@@ -1,4 +1,5 @@
 from argparse import Namespace
+import os
 from pathlib import Path
 import sys
 import types
@@ -357,6 +358,63 @@ def test_oneshot_rejects_provider_without_model_even_before_stdio_redirect(capsy
     err = capsys.readouterr().err
     assert "--provider requires --model" in err
     assert "configured defaults" in err
+
+
+def test_oneshot_working_directory_authority_scopes_terminal_cwd_and_restores_previous_value(monkeypatch, tmp_path: Path):
+    """A scoped oneshot workdir must bind relative file/terminal tools without leaking env globally.
+
+    pre: caller supplies an absolute target repo workdir and TERMINAL_CWD already has another value.
+    post: _run_agent_in_current_profile sees TERMINAL_CWD and runtime_context cwd set to the target repo
+          only for that call, and the previous environment value is restored afterwards.
+    """
+
+    import hermes_cli.oneshot as oneshot
+    from runtime_context import get_runtime_cwd
+
+    monkeypatch.setenv("TERMINAL_CWD", "/before-canon-phase")
+    seen = {}
+
+    def fake_run_agent_in_current_profile(prompt, **kwargs):
+        seen["terminal_cwd"] = os.environ.get("TERMINAL_CWD")
+        seen["runtime_cwd"] = get_runtime_cwd()
+        seen["process_cwd"] = os.getcwd()
+        return "ok"
+
+    monkeypatch.setattr(oneshot, "_run_agent_in_current_profile", fake_run_agent_in_current_profile)
+
+    assert oneshot._run_agent("hello", workdir=str(tmp_path)) == "ok"
+    assert seen["terminal_cwd"] == str(tmp_path)
+    assert seen["runtime_cwd"] == str(tmp_path)
+    assert seen["process_cwd"] != str(tmp_path)
+    assert os.environ["TERMINAL_CWD"] == "/before-canon-phase"
+    assert get_runtime_cwd() == "/before-canon-phase"
+
+
+@pytest.mark.parametrize("bad_workdir", ["relative/path", "/definitely/missing/hermes-oneshot-workdir"])
+def test_oneshot_working_directory_authority_rejects_malformed_values_before_agent(
+    monkeypatch, bad_workdir: str
+):
+    """Oneshot must consume only explicit safe workdir authority.
+
+    pre: caller passes a relative or nonexistent workdir override.
+    post: _run_agent raises before invoking the current-profile agent builder.
+    """
+
+    import hermes_cli.oneshot as oneshot
+
+    called = False
+
+    def fake_run_agent_in_current_profile(prompt, **kwargs):
+        nonlocal called
+        called = True
+        return "ok"
+
+    monkeypatch.setattr(oneshot, "_run_agent_in_current_profile", fake_run_agent_in_current_profile)
+
+    with pytest.raises(RuntimeError, match="absolute existing directory"):
+        oneshot._run_agent("hello", workdir=bad_workdir)
+
+    assert called is False
 
 
 def test_oneshot_accepts_plugin_toolset_after_discovery(monkeypatch):

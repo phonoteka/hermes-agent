@@ -24,8 +24,10 @@ except ModuleNotFoundError:
     # means UTF-8 stdio setup is skipped on Windows; POSIX is unaffected.
     pass
 
+import argparse
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
@@ -40,7 +42,7 @@ import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -62,6 +64,8 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+_CANON_GATEWAY_PROCESSING_STALE_SECS_DEFAULT = 300.0
+_CANON_GATEWAY_PROCESSING_TIMEOUT_GRACE_SECS = 30.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 
@@ -8439,24 +8443,24 @@ class GatewayRunner:
             output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
-    def _make_canon_review_prompt_sender(
+    def _make_platform_canon_review_prompt_sender(
         self,
-        event: MessageEvent,
         *,
+        platform: Platform,
         delivery_observer: Optional[Dict[str, Any]] = None,
     ):
-        """Return one live-adapter Canon review sender bound to the event source.
+        """Return one adapter-bound Canon review sender for the selected gateway platform.
 
-        pre: event.source identifies the platform whose adapter must deliver the review card.
-        post: returned async callable sends through the active adapter's send_canon_review_prompt
-              surface and optionally records delivery metadata for later evidence export.
+        pre: platform names the active adapter that must deliver the review card.
+        post: returned async callable sends through that adapter's send_canon_review_prompt surface
+              and optionally records delivery metadata for later evidence export.
         raises: none.
         """
 
         async def _send_review_prompt(
             *,
             chat_id: str,
-            thread_id: str,
+            thread_id: str | None,
             run_id: str,
             text: str,
             callbacks: Optional[List[Dict[str, str]]] = None,
@@ -8471,14 +8475,15 @@ class GatewayRunner:
             raises: RuntimeError when adapter/surface is unavailable.
             """
 
-            source = event.source
-            adapter = self.adapters.get(source.platform) if source else None
+            adapter = self.adapters.get(platform)
             if adapter is None:
                 raise RuntimeError("gateway adapter is unavailable for review delivery")
             send_method = getattr(adapter, "send_canon_review_prompt", None)
             if not callable(send_method):
                 raise RuntimeError("platform adapter does not support Canon review prompt delivery")
-            metadata: Dict[str, Any] = {"thread_id": thread_id}
+            metadata: Dict[str, Any] = {}
+            if thread_id is not None:
+                metadata["thread_id"] = thread_id
             if callbacks is not None:
                 metadata["callbacks"] = callbacks
             if gate_identity is not None:
@@ -8506,9 +8511,9 @@ class GatewayRunner:
                 delivery_observer.update(
                     {
                         "chat_id": str(chat_id),
-                        "thread_id": str(thread_id),
                         "run_id": str(run_id),
                         "message_id": str(message_id),
+                        **({"thread_id": str(thread_id)} if thread_id is not None else {}),
                     }
                 )
             result = {
@@ -8521,6 +8526,28 @@ class GatewayRunner:
             return result
 
         return _send_review_prompt
+
+    def _make_canon_review_prompt_sender(
+        self,
+        event: MessageEvent,
+        *,
+        delivery_observer: Optional[Dict[str, Any]] = None,
+    ):
+        """Return one live-adapter Canon review sender bound to the event source.
+
+        pre: event.source identifies the platform whose adapter must deliver the review card.
+        post: returned async callable sends through the active adapter's send_canon_review_prompt
+              surface and optionally records delivery metadata for later evidence export.
+        raises: RuntimeError when the event lacks source platform identity.
+        """
+
+        source = event.source
+        if source is None:
+            raise RuntimeError("live Canon review sender requires event source identity")
+        return self._make_platform_canon_review_prompt_sender(
+            platform=source.platform,
+            delivery_observer=delivery_observer,
+        )
 
     async def _dispatch_live_canon_command(
         self,
@@ -8573,40 +8600,36 @@ class GatewayRunner:
 
         This gate is independent of _check_slash_access (which validates
         user-level command permissions). It enforces /canon-specific
-        invariants: task text presence, topic/thread identity, and
-        capability/scope authorization for the target workflow.
+        invariants: workflow selector presence, `--inputs-json` authority,
+        and capability/scope authorization for the target workflow.
         """
-        import shlex
-
         text = (getattr(event, "text", "") or "").strip()
         if not text.startswith("/canon"):
             return "`/canon` gate requires a /canon command."
 
         args = text[len("/canon"):].strip()
-        tokens = shlex.split(args) if args else []
-        if not tokens or tokens[0].lower() != "run":
+        if not args:
+            return None
+        command_name, _, remainder = args.partition(" ")
+        if command_name.lower() != "run":
             # Non-run subcommands bypass the /canon run gates.
             return None
 
-        if len(tokens) < 2 or not tokens[1].strip():
+        workflow_name, _, after_workflow = remainder.strip().partition(" ")
+        if not workflow_name:
             return (
-                "`/canon run` requires workflow name and task text: "
-                "/canon run <workflow> <task>."
+                "`/canon run` requires workflow selector plus `--inputs-json <json-object>`: "
+                "/canon run <workflow> --inputs-json <json-object>."
             )
-        task_text = " ".join(tokens[2:]).strip()
-        if not task_text:
+        if not after_workflow.strip():
             return (
-                "`/canon run` requires explicit task text after workflow name: "
-                "/canon run <workflow> <task>."
+                "`/canon run` requires `--inputs-json <json-object>` after the workflow name: "
+                "/canon run <workflow> --inputs-json <json-object>."
             )
-
-        source = getattr(event, "source", None)
-        thread_id = str(getattr(source, "thread_id", "") or "").strip() if source else ""
-        if not thread_id:
+        if "--inputs-json" not in after_workflow:
             return (
-                "`/canon run` requires a topic/thread identity to anchor the "
-                "review card delivery and callback routing. "
-                "Run /canon from a forum topic or thread."
+                "`/canon run` requires `--inputs-json <json-object>` after the workflow name: "
+                "/canon run <workflow> --inputs-json <json-object>."
             )
 
         return None
@@ -8626,6 +8649,9 @@ class GatewayRunner:
             try:
                 requests_dir = _requests_dir()
                 requests_dir.mkdir(parents=True, exist_ok=True)
+                for processing_path in sorted(requests_dir.glob("*.request.processing.json")):
+                    if self._canon_gateway_processing_request_is_stale(processing_path):
+                        await self._process_canon_gateway_launch_request(processing_path)
                 for request_path in sorted(requests_dir.glob("*.request.json")):
                     try:
                         claimed_path = request_path.with_suffix(".processing.json")
@@ -8641,6 +8667,169 @@ class GatewayRunner:
                 logger.debug("Canon gateway launch watcher tick error: %s", exc, exc_info=True)
             await asyncio.sleep(interval)
 
+    def _canon_gateway_processing_request_is_stale(self, request_path: Path) -> bool:
+        """Return True when a claimed Canon launch request is safe to recover.
+
+        pre: request_path may be any path under the Canon CLI-run request directory.
+        post: returns True only for `*.request.processing.json` files whose mtime is older
+              than the request timeout plus grace, or the default stale threshold.
+        post: returns False for fresh/in-flight files so an active gateway is not duplicated.
+        raises: none; unreadable or malformed files fall back to the default stale threshold.
+        """
+
+        if not request_path.name.endswith(".request.processing.json"):
+            return False
+        try:
+            age_seconds = time.time() - request_path.stat().st_mtime
+        except OSError:
+            return False
+        stale_after = _CANON_GATEWAY_PROCESSING_STALE_SECS_DEFAULT
+        try:
+            payload = json.loads(request_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                timeout_seconds = float(payload.get("timeoutSeconds") or 0)
+                if timeout_seconds > 0:
+                    stale_after = max(
+                        stale_after,
+                        timeout_seconds + _CANON_GATEWAY_PROCESSING_TIMEOUT_GRACE_SECS,
+                    )
+        except Exception:
+            pass
+        return age_seconds >= stale_after
+
+    def _canon_gateway_durable_root(self) -> Path:
+        """Return the profile-scoped durable root used for Canon current-gateway runs.
+
+        pre: Hermes home resolves for the active process.
+        post: __return__ points at `<hermes_home>/canon-current-gateway` without creating it.
+        raises: none.
+        """
+
+        return Path(get_hermes_home()) / "canon-current-gateway"
+
+    def _canon_gateway_result_reason(self, result: Any) -> str | None:
+        """Extract the most useful durable failure/wait reason from a Canon result payload.
+
+        pre: result is any value returned under the workflow facade payload's `result` key.
+        post: returns the first non-empty string from `reason`, `error`, `message`, or `status`.
+        raises: none.
+        """
+
+        if not isinstance(result, dict):
+            return None
+        for key in ("reason", "error", "message", "status"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _canon_gateway_status_is_ok(self, status: str | None) -> bool:
+        """Classify one Canon durable status as operator-acceptable or fail-closed.
+
+        pre: status is None or a Canon top-level/nested status string.
+        post: returns True only for success/accepted-wait states and False otherwise.
+        raises: none.
+        """
+
+        normalized = str(status or "").strip().lower()
+        if not normalized:
+            return False
+        if normalized in {"completed", "success", "paused", "awaiting-human-review", "waiting", "pending-human-review"}:
+            return True
+        if normalized.startswith("blocked"):
+            return False
+        if normalized in {"failed", "error", "cancelled", "invalid"}:
+            return False
+        return False
+
+    def _canon_gateway_response_ok(self, canon_payload: dict[str, Any]) -> bool:
+        """Return the fail-closed gateway `ok` verdict for one workflow-facade result payload.
+
+        pre: canon_payload is the dict returned by `workflow_facade.startWorkflow(...)`.
+        post: blocked/failed/cancelled nested result statuses force False even when the top-level
+              status looks completed, preventing false-green wrapper success.
+        post: awaiting-human-review requires checkpoint and delivery evidence.
+        raises: none.
+        """
+
+        top_status = canon_payload.get("status")
+        result = canon_payload.get("result")
+        nested_status = result.get("status") if isinstance(result, dict) else None
+        bad_statuses = {"failed", "error", "cancelled", "invalid"}
+        for candidate in (top_status, nested_status):
+            normalized = str(candidate or "").strip().lower()
+            if normalized.startswith("blocked") or normalized in bad_statuses:
+                return False
+        normalized_status = str(top_status or nested_status or "")
+        if not self._canon_gateway_status_is_ok(normalized_status):
+            return False
+        if str(normalized_status).strip().lower() in {"awaiting-human-review", "waiting", "pending-human-review"}:
+            checkpoint = canon_payload.get("checkpoint")
+            delivery = canon_payload.get("delivery")
+            return isinstance(checkpoint, dict) and bool(checkpoint) and isinstance(delivery, dict) and bool(delivery)
+        return True
+
+    def _append_canon_gateway_origin_evidence(
+        self,
+        *,
+        run_id: str | None,
+        workflow: str,
+        request_id: str,
+        chat_id: str,
+        thread_id: str | None,
+    ) -> None:
+        """Persist one wrapper-owned durable origin row for origin-scoped observability.
+
+        pre: run_id is the Canon durable run id for an accepted CLI launch, or falsey when the
+             workflow facade did not return launch identity.
+        post: when run_id is falsey, no journal row is written.
+        post: otherwise the Canon durable journal gains exactly one wrapper-owned event whose
+              payload carries runtimeContext.gateway_source plus structured runtimeContext.gateway.
+        post: chat-only launches persist `telegram:<chat_id>` and omit `runtimeContext.gateway.threadId`;
+              topic launches persist `telegram:<chat_id>:<thread_id>` and preserve the real thread id.
+        raises: RuntimeError when the wrapper-owned row is rejected by the Canon journal API.
+        raises: sqlite3.Error/ValueError when durable append fails.
+        """
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return
+        normalized_thread_id = str(thread_id or "").strip()
+        from canon.journal import SqliteExecutionJournal
+
+        gateway_source = f"telegram:{chat_id}" + (f":{normalized_thread_id}" if normalized_thread_id else "")
+        gateway_metadata = {
+            "platform": "telegram",
+            "chatId": chat_id,
+        }
+        durable_thread_key = normalized_thread_id or gateway_source
+        if normalized_thread_id:
+            gateway_metadata["threadId"] = normalized_thread_id
+        payload = {
+            "requestId": request_id,
+            "workflow": workflow,
+            "runtimeContext": {
+                "gateway_source": gateway_source,
+                "gateway": gateway_metadata,
+            },
+        }
+        encoded_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        journal = SqliteExecutionJournal(self._canon_gateway_durable_root() / "journal.sqlite3")
+        stored = journal.append(
+            {
+                "runId": normalized_run_id,
+                "threadId": durable_thread_key,
+                "workflowRef": workflow,
+                "eventKind": "current-gateway.request.accepted",
+                "nodeId": "current-gateway.request.accepted",
+                "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "payloadDigest": hashlib.sha256(encoded_payload.encode("utf-8")).hexdigest(),
+                "payload": payload,
+            }
+        )
+        if stored == "REJECTED":
+            raise RuntimeError("durable origin evidence row was rejected by the Canon journal API")
+
     async def _process_canon_gateway_launch_request(self, request_path: Path) -> None:
         """Execute one claimed Canon gateway-local launch request file.
 
@@ -8648,20 +8837,23 @@ class GatewayRunner:
         post: writes one response JSON file with gateway pid/cwd, target identity, and launch result.
         raises: none; failures are converted to fail-closed response payloads.
         """
-        from tools.canon_gateway_launch import _response_file
+        from tools.canon_gateway_launch import _response_file, _validate_request_id
 
         response_payload: Dict[str, Any]
-        request_id = request_path.name.split(".", 1)[0]
+        request_id = _validate_request_id(request_path.name.split(".", 1)[0], field_name="request filename requestId")
+        payload: Dict[str, Any] | None = None
         try:
             payload = json.loads(request_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("request payload must be a JSON object")
-            request_id = str(payload.get("requestId") or request_id).strip() or request_id
+            payload_request_id = str(payload.get("requestId") or "").strip()
+            if payload_request_id:
+                request_id = _validate_request_id(payload_request_id)
             response_payload = await self._execute_canon_gateway_launch_request(payload)
         except Exception as exc:
             response_payload = {
                 "ok": False,
-                "api": "canon_gateway_local_launch.v1",
+                "api": str(payload.get("api") or "canon_gateway_cli_run.v1") if isinstance(payload, dict) else "canon_gateway_cli_run.v1",
                 "requestId": request_id,
                 "error": str(exc),
                 "gateway": {"pid": os.getpid(), "cwd": os.getcwd()},
@@ -8684,87 +8876,92 @@ class GatewayRunner:
         tmp_path.replace(response_path)
 
     async def _execute_canon_gateway_launch_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Run one validated local Canon launch request through the live gateway handler.
+        """Run one validated local Canon launch request through the shared gateway-owned facade seam.
 
         pre: payload is the decoded gateway-local request object.
-        post: returns structured evidence containing the gateway pid/cwd, target chat/thread,
-              live handler response, run id, status, and delivery message id when available.
+        post: validates the transport envelope, requires public workflow + inputs authority,
+              calls the public Canon workflow facade, and returns structured durable truth.
         raises: ValueError when payload fields are malformed or unsupported.
-        raises: RuntimeError when the active Telegram adapter or live Canon path fails closed.
+        raises: any exception surfaced by the shared workflow facade.
         """
+        from tools.canon_workflow_command import (
+            _gateway_source_from_launch_target,
+            execute_gateway_workflow_facade_run,
+        )
+        from tools.canon_gateway_launch import _validate_request_id
+
         api = str(payload.get("api") or "").strip()
         action = str(payload.get("action") or "").strip()
         request_id = str(payload.get("requestId") or "").strip()
-        if api != "canon_gateway_local_launch.v1":
+        if api != "canon_gateway_cli_run.v1":
             raise ValueError(f"unsupported api: {api or '<missing>'}")
-        if action != "launch_solution_modeling":
+        if action != "run":
             raise ValueError(f"unsupported action: {action or '<missing>'}")
         if not request_id:
             raise ValueError("requestId is required")
+        request_id = _validate_request_id(request_id)
+        workflow = str(payload.get("workflow") or "").strip()
+        if not workflow:
+            raise ValueError("workflow is required")
         target = payload.get("target")
         if not isinstance(target, dict):
             raise ValueError("target must be an object")
         if str(target.get("platform") or "").strip().lower() != "telegram":
             raise ValueError("target.platform must be telegram")
         chat_id = str(target.get("chatId") or "").strip()
-        thread_id = str(target.get("threadId") or "").strip()
-        task_text = str(payload.get("taskText") or "").strip()
+        thread_id = str(target.get("threadId") or "").strip() or None
         if not chat_id:
             raise ValueError("target.chatId is required")
-        if not thread_id:
-            raise ValueError("target.threadId is required")
-        if not task_text:
-            raise ValueError("taskText is required")
-        if task_text == "Model a solution and pause for human review.":
-            raise ValueError("taskText must not equal the packaged default Canon task text")
-        if Platform.TELEGRAM not in self.adapters:
-            raise RuntimeError("active gateway has no Telegram adapter for Canon local launch")
+        inputs = payload.get("inputs")
+        if not isinstance(inputs, dict):
+            raise ValueError("inputs must be an object")
 
-        event = MessageEvent(
-            text=f"/canon run solution-modeling {task_text}",
-            source=SessionSource(
-                platform=Platform.TELEGRAM,
-                user_id=f"canon-local-launch:{request_id}",
-                chat_id=chat_id,
-                user_name="Canon Local Launch",
-                chat_type="thread" if thread_id else "group",
-                thread_id=thread_id,
-            ),
-            message_id=f"canon-local-launch:{request_id}",
-            internal=True,
+        canon_payload = await execute_gateway_workflow_facade_run(
+            workflow=workflow,
+            inputs=inputs,
+            gateway_source=_gateway_source_from_launch_target(target=target, request_id=request_id),
+            gateway_root=self._canon_gateway_durable_root(),
+            request_id=request_id,
+            target=target,
+            send_review_prompt=self._make_platform_canon_review_prompt_sender(platform=Platform.TELEGRAM),
         )
-        delivery_observer: Dict[str, Any] = {}
-        response_text = await self._dispatch_live_canon_command(event, delivery_observer=delivery_observer)
+        run_result = canon_payload.get("result")
+        reason = self._canon_gateway_result_reason(run_result)
+        response_ok = self._canon_gateway_response_ok(canon_payload)
+        if response_ok:
+            self._append_canon_gateway_origin_evidence(
+                run_id=canon_payload.get("runId"),
+                workflow=workflow,
+                request_id=request_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
 
-        run_id = None
-        status = None
-        match = re.search(r"live run `([^`]+)` status `([^`]+)`", response_text)
-        if match:
-            run_id, status = match.group(1), match.group(2)
+        target_payload: Dict[str, Any] = {
+            "platform": "telegram",
+            "chatId": chat_id,
+        }
+        if thread_id:
+            target_payload["threadId"] = thread_id
 
         return {
-            "ok": True,
+            "ok": response_ok,
             "api": api,
             "action": action,
             "requestId": request_id,
-            "command": event.text,
+            "workflow": workflow,
+            "inputs": dict(inputs),
             "gateway": {"pid": os.getpid(), "cwd": os.getcwd()},
-            "target": {
-                "platform": "telegram",
-                "chatId": chat_id,
-                "threadId": thread_id,
-            },
+            "target": target_payload,
             "run": {
-                "runId": run_id,
-                "status": status,
-                "artifactRoot": f".agent/live-solution-modeling/{run_id}" if run_id else None,
+                "runId": canon_payload.get("runId"),
+                "status": canon_payload.get("status"),
+                "checkpoint": canon_payload.get("checkpoint"),
+                "delivery": canon_payload.get("delivery"),
+                "result": run_result,
+                "artifacts": canon_payload.get("artifacts"),
+                "reason": reason,
             },
-            "delivery": {
-                "messageId": delivery_observer.get("message_id"),
-                "chatId": delivery_observer.get("chat_id"),
-                "threadId": delivery_observer.get("thread_id"),
-            },
-            "responseText": response_text,
         }
 
     async def _handle_status_command(self, event: MessageEvent) -> str:

@@ -25,15 +25,21 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from typing import Optional
+
+from runtime_context import scoped_runtime_cwd
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
-    if not toolsets:
+    return _normalize_string_refs(toolsets)
+
+
+def _normalize_string_refs(refs: object = None) -> list[str] | None:
+    if not refs:
         return None
 
-    raw_items = [toolsets] if isinstance(toolsets, str) else toolsets
+    raw_items = [refs] if isinstance(refs, str) else refs
     if not isinstance(raw_items, (list, tuple)):
         raw_items = [raw_items]
 
@@ -43,8 +49,8 @@ def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
             normalized.extend(part.strip() for part in item.split(","))
         else:
             normalized.append(str(item).strip())
-
     return [item for item in normalized if item] or None
+
 
 
 def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
@@ -215,12 +221,107 @@ def _create_session_db_for_oneshot():
         return None
 
 
+@contextmanager
+def _temporary_profile_env(profile: Optional[str] = None):
+    """Temporarily switch the oneshot process to one Hermes profile home.
+
+    pre: profile is None/empty or a Hermes profile id accepted by hermes_cli.profiles.
+    post: HERMES_HOME/HERMES_PROFILE are restored after the scoped model run.
+    raises: profile resolution errors when a named profile does not exist.
+    """
+
+    profile_id = (profile or "").strip()
+    if not profile_id:
+        yield
+        return
+
+    from hermes_cli.profiles import resolve_profile_env
+
+    old_home = os.environ.get("HERMES_HOME")
+    old_profile = os.environ.get("HERMES_PROFILE")
+    os.environ["HERMES_HOME"] = resolve_profile_env(profile_id)
+    os.environ["HERMES_PROFILE"] = profile_id
+    try:
+        yield
+    finally:
+        if old_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = old_home
+        if old_profile is None:
+            os.environ.pop("HERMES_PROFILE", None)
+        else:
+            os.environ["HERMES_PROFILE"] = old_profile
+
+
+@contextmanager
+def _temporary_terminal_cwd_env(workdir: Optional[str] = None):
+    """Temporarily bind oneshot tool cwd through TERMINAL_CWD.
+
+    pre: workdir is None/empty or an absolute existing directory path.
+    post: TERMINAL_CWD and runtime_context cwd are set only for the scoped agent run and restored afterwards.
+    raises: RuntimeError when workdir is malformed, relative, or absent on disk.
+    """
+
+    target = (workdir or "").strip() if isinstance(workdir, str) else ""
+    if not target:
+        yield
+        return
+    raw_path = os.path.expanduser(target)
+    if not os.path.isabs(raw_path):
+        raise RuntimeError("Hermes oneshot workdir must be an absolute existing directory")
+    path = os.path.abspath(raw_path)
+    if not os.path.isdir(path):
+        raise RuntimeError("Hermes oneshot workdir must be an absolute existing directory")
+    old_cwd = os.environ.get("TERMINAL_CWD")
+    os.environ["TERMINAL_CWD"] = path
+    try:
+        with scoped_runtime_cwd(path):
+            yield
+    finally:
+        if old_cwd is None:
+            os.environ.pop("TERMINAL_CWD", None)
+        else:
+            os.environ["TERMINAL_CWD"] = old_cwd
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    profile: Optional[str] = None,
+    skills: object = None,
+    workdir: Optional[str] = None,
+) -> str:
+    """Run one prompt through a normal Hermes oneshot agent, optionally under a profile/workdir.
+
+    pre: profile is None/empty or names a configured Hermes profile; explicit model/provider/toolsets
+         are fine-grained overrides over that profile's config. workdir is None/empty or an absolute
+         existing directory that owns relative file/terminal tool resolution for this one turn.
+    post: profile config and TERMINAL_CWD are scoped to this agent turn and restored afterwards.
+    """
+
+    with _temporary_profile_env(profile):
+        with _temporary_terminal_cwd_env(workdir):
+            return _run_agent_in_current_profile(
+                prompt,
+                model=model,
+                provider=provider,
+                toolsets=toolsets,
+                use_config_toolsets=use_config_toolsets,
+                skills=skills,
+            )
+
+
+def _run_agent_in_current_profile(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    use_config_toolsets: bool = True,
+    skills: object = None,
 ) -> str:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns the final response string."""
@@ -299,6 +400,17 @@ def _run_agent(
     toolsets_list = _normalize_toolsets(toolsets)
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
+
+    skill_refs = _normalize_string_refs(skills)
+    if skill_refs:
+        from agent.skill_commands import build_preloaded_skills_prompt
+
+        skills_prompt, _loaded_skills, missing_skills = build_preloaded_skills_prompt(skill_refs)
+        if missing_skills:
+            missing_label = ", ".join(missing_skills)
+            raise RuntimeError(f"Hermes oneshot requested missing skill override(s): {missing_label}")
+        if skills_prompt:
+            prompt = f"{skills_prompt}\n\n{prompt}"
 
     session_db = _create_session_db_for_oneshot()
 
