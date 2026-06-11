@@ -45,8 +45,18 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from runtime_context import get_runtime_cwd
 from typing import Optional, Dict, Any, List
+import sys
+
+try:
+    from runtime_context import get_runtime_cwd
+except ModuleNotFoundError as exc:
+    if exc.name != "runtime_context":
+        raise
+    _HERMES_ROOT = str(Path(__file__).resolve().parents[1])
+    if _HERMES_ROOT not in sys.path:
+        sys.path.insert(0, _HERMES_ROOT)
+    from runtime_context import get_runtime_cwd
 
 logger = logging.getLogger(__name__)
 

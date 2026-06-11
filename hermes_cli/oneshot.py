@@ -26,9 +26,18 @@ import logging
 import os
 import sys
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from pathlib import Path
 from typing import Optional
 
-from runtime_context import scoped_runtime_cwd
+try:
+    from runtime_context import scoped_runtime_cwd
+except ModuleNotFoundError as exc:
+    if exc.name != "runtime_context":
+        raise
+    _HERMES_ROOT = str(Path(__file__).resolve().parents[1])
+    if _HERMES_ROOT not in sys.path:
+        sys.path.insert(0, _HERMES_ROOT)
+    from runtime_context import scoped_runtime_cwd
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
