@@ -52,6 +52,11 @@ def to_markdown(summary: Mapping[str, Any] | dict[str, Any]) -> str:
     if workflow_ref:
         lines.append(f"- workflow: `{workflow_ref}`")
 
+    blocked_summary_lines = _render_blocked_runtime_summary(summary)
+    if blocked_summary_lines:
+        lines.append("")
+        lines.extend(blocked_summary_lines)
+
     lines.append("- **артефакты:**")
     if artifacts:
         lines.extend(f"  - {artifact}" for artifact in artifacts)
@@ -69,6 +74,60 @@ def to_markdown(summary: Mapping[str, Any] | dict[str, Any]) -> str:
         lines.extend(report_summary_lines)
 
     return "\n".join(lines)
+
+
+def _render_blocked_runtime_summary(summary: Mapping[str, Any]) -> list[str]:
+    """Render compact blocked-runtime breadcrumbs when durable blocked truth is present.
+
+    pre: summary is one Canon observe summary mapping.
+    post: returns empty list unless the run is durably blocked; otherwise includes reason and
+          durable breadcrumb pointers without dumping raw payloads.
+    raises: none.
+    """
+
+    status = _text(summary.get("status"), "", key="status")
+    current_state = _text(summary.get("currentState"), "", key="currentState")
+    if current_state != "blocked" and not status.startswith("blocked-"):
+        return []
+
+    lines: list[str] = ["## Блокировка выполнения"]
+    diagnosis = _text(summary.get("diagnosisRu"), "", key="diagnosisRu")
+    reason = _text(summary.get("reason"), "", key="reason")
+    if diagnosis:
+        lines.append(f"- состояние: {diagnosis}")
+    if reason:
+        lines.append(f"- причина: {reason}")
+
+    for label, key in (
+        ("checkpointId", "checkpointId"),
+        ("runtimeCheckpointId", "runtimeCheckpointId"),
+        ("artifactRef", "artifactRef"),
+        ("failingNodeId", "failingNodeId"),
+    ):
+        rendered = _breadcrumb_value(summary, key=key)
+        if rendered:
+            lines.append(f"- {label}: `{rendered}`")
+    return lines
+
+
+def _breadcrumb_value(summary: Mapping[str, Any], *, key: str) -> str:
+    """Return one compact breadcrumb value from blocked summary fields.
+
+    pre: summary is one Canon observe summary mapping and key names one blocked breadcrumb field.
+    post: returns a redacted compact string or empty string when the field is absent.
+    raises: none.
+    """
+
+    value = summary.get(key)
+    if isinstance(value, str) and value.strip():
+        return _redact_secret_value(value.strip(), key=key)
+    if key == "artifactRef":
+        artifact_refs = summary.get("artifactRefs")
+        if isinstance(artifact_refs, list):
+            for item in artifact_refs:
+                if isinstance(item, str) and item.strip():
+                    return _redact_secret_value(item.strip(), key=key)
+    return ""
 
 
 def _render_report_summary(raw_report_summary: Any) -> list[str]:

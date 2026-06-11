@@ -189,6 +189,40 @@ def test_observe_markdown_renders_report_summary_compact_and_redacted() -> None:
     assert "***REDACTED***" in rendered
 
 
+def test_observe_markdown_renders_blocked_runtime_reason_and_breadcrumbs() -> None:
+    """Blocked durable summaries should surface concise reason and breadcrumb pointers.
+
+    pre: summary contains blocked runtime status plus durable reason/checkpoint/artifact breadcrumbs.
+    post: markdown includes blocked section with reason and breadcrumbs without raw JSON syntax.
+    raises: AssertionError when blocked context is omitted.
+    """
+
+    module = importlib.import_module("tools.canon_workflow_observe")
+
+    rendered = module.to_markdown(
+        {
+            "status": "blocked-runtime-failed",
+            "currentState": "blocked",
+            "diagnosisRu": "заблокировано",
+            "reason": "Missing durable terminal artifact token=TOP_SECRET_TOKEN_FOR_TEST",
+            "checkpointId": "current-gateway:run-blocked-1",
+            "runtimeCheckpointId": "runtime-checkpoint://blocked-1",
+            "artifactRef": "current-gateway/run-blocked-1/blocked-result",
+            "failingNodeId": "phase.modeling",
+        }
+    )
+
+    assert "Блокировка выполнения" in rendered
+    assert "причина: Missing durable terminal artifact" in rendered
+    assert "checkpointId: `current-gateway:run-blocked-1`" in rendered
+    assert "runtimeCheckpointId: `runtime-checkpoint://blocked-1`" in rendered
+    assert "artifactRef: `current-gateway/run-blocked-1/blocked-result`" in rendered
+    assert "failingNodeId: `phase.modeling`" in rendered
+    assert "TOP_SECRET_TOKEN_FOR_TEST" not in rendered
+    assert "{" not in rendered
+    assert "}" not in rendered
+
+
 def test_canon_workflow_observe_tool_registers_in_registry() -> None:
     """Tool module import must register canon_workflow_observe in the global registry."""
 
@@ -240,7 +274,14 @@ def test_canon_workflow_observe_tool_latest_list_and_full_render_from_durable_tr
     def _inspect(*, run_id: str, origin: str, journal: object, artifacts: object) -> dict:
         return {
             "runId": run_id,
-            "status": "running",
+            "status": "blocked-runtime-failed",
+            "currentState": "blocked",
+            "diagnosisRu": "заблокировано",
+            "reason": "Phase result missing artifactRef token=TOP_SECRET_TOKEN_FOR_TEST",
+            "checkpointId": f"current-gateway:{run_id}",
+            "runtimeCheckpointId": f"runtime-checkpoint://{run_id}",
+            "artifactRef": f"current-gateway/{run_id}/blocked-result",
+            "failingNodeId": "phase.modeling",
             "reportSummary": {"api_key": "AK_TEST_123", "eventCount": 3},
             "artifacts": [{"fileName": "artifact.json"}],
         }
@@ -275,8 +316,15 @@ def test_canon_workflow_observe_tool_latest_list_and_full_render_from_durable_tr
     report = json.loads(module._handle_tool({"origin": "telegram:-100123", "surface": "report", "run_id": "run-42"}))
     assert report["success"] is True
     assert report["surface"] == "report"
+    assert "Блокировка выполнения" in report["markdown"]
+    assert "причина: Phase result missing artifactRef" in report["markdown"]
+    assert "checkpointId: `current-gateway:run-42`" in report["markdown"]
+    assert "runtimeCheckpointId: `runtime-checkpoint://run-42`" in report["markdown"]
+    assert "artifactRef: `current-gateway/run-42/blocked-result`" in report["markdown"]
+    assert "failingNodeId: `phase.modeling`" in report["markdown"]
     assert "eventCount: 3" in report["markdown"]
     assert "artifact.json" not in report["markdown"]
+    assert "TOP_SECRET_TOKEN_FOR_TEST" not in report["markdown"]
     assert "AK_TEST_123" not in report["markdown"]
     assert "***REDACTED***" in report["markdown"]
 

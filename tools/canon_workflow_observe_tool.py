@@ -279,6 +279,18 @@ def _render_run_scoped_markdown(*, surface: str, summary: Mapping[str, Any]) -> 
     if report_summary is None:
         report_summary = normalized_summary.get("report")
     report_view: dict[str, Any] = {"status": normalized_summary.get("status", "unknown")}
+    for key in (
+        "currentState",
+        "diagnosisRu",
+        "reason",
+        "checkpointId",
+        "runtimeCheckpointId",
+        "artifactRef",
+        "artifactRefs",
+        "failingNodeId",
+    ):
+        if key in normalized_summary:
+            report_view[key] = normalized_summary[key]
     if report_summary is not None:
         report_view["reportSummary"] = report_summary
     return _to_markdown(report_view)
