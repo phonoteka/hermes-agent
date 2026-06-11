@@ -488,32 +488,40 @@ def _build_runtime_facade_payload(
     inputs: Mapping[str, Any],
     gateway_source: Mapping[str, Any],
     gateway_root: Path,
+    run_id: str | None = None,
     request_id: str | None = None,
     target: Mapping[str, Any] | None = None,
+    request_authority: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the workflow-neutral Hermes->Canon facade payload for one runtime launch.
 
     pre: workflow/inputs identify the operator-approved launch request; gateway_source is the
          gateway-owned origin identity; gateway_root points at the active current-gateway durable root.
-    post: returns a public workflow-facade payload with Hermes-minted runId, live host-mode authority,
-          durable-root, and provenance fields attached.
+    post: returns a public workflow-facade payload with explicit or Hermes-minted runId, live host-mode
+          authority, durable-root, and optional requestAuthority provenance attached.
     raises: ValueError when runtime input authority is invalid.
     """
 
     if not isinstance(inputs, Mapping):
         raise ValueError("inputs must be an object")
+    if request_authority is not None and not isinstance(request_authority, Mapping):
+        raise ValueError("request_authority must be an object")
     payload: dict[str, Any] = {
         "workflowId": workflow,
-        "runId": f"hermes-canon-{uuid.uuid4().hex}",
+        "runId": str(run_id).strip() if run_id is not None else f"hermes-canon-{uuid.uuid4().hex}",
         "inputs": dict(inputs),
         "gatewaySource": dict(gateway_source),
         "hostMode": "live",
         "storeConfig": {"root": str(gateway_root)},
     }
+    if not payload["runId"]:
+        raise ValueError("run_id must be non-empty when supplied")
     if request_id is not None:
         payload["requestId"] = request_id
     if target is not None:
         payload["target"] = dict(target)
+    if request_authority is not None:
+        payload["requestAuthority"] = dict(request_authority)
     return payload
 
 
@@ -523,8 +531,10 @@ async def execute_gateway_workflow_facade_run(
     inputs: Mapping[str, Any],
     gateway_source: Mapping[str, Any],
     gateway_root: Path,
+    run_id: str | None = None,
     request_id: str | None = None,
     target: Mapping[str, Any] | None = None,
+    request_authority: Mapping[str, Any] | None = None,
     send_review_prompt: Callable[..., Awaitable[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Execute one gateway-owned Canon workflow run through the public facade seam.
@@ -542,13 +552,19 @@ async def execute_gateway_workflow_facade_run(
         inputs=inputs,
         gateway_source=gateway_source,
         gateway_root=gateway_root,
+        run_id=run_id,
         request_id=request_id,
         target=target,
+        request_authority=request_authority,
     )
     facade_stores = _build_runtime_facade_stores(
         workflow=workflow,
         gateway_root=gateway_root,
-        request_authority={"inputs": facade_payload["inputs"]},
+        request_authority=(
+            dict(request_authority)
+            if request_authority is not None
+            else {"inputs": facade_payload["inputs"]}
+        ),
     )
     review_sender = _build_gateway_review_sender_bridge(send_review_prompt)
     if review_sender is not None:
@@ -727,9 +743,9 @@ class _GatewayHermesScopedPhaseSession:
     """Run one Canon phase as a bounded Hermes session with explicit toolset authority.
 
     pre: envelope_projection is Canon-minted identity/scope authority for one phase.
-    post: run_phase returns a backend payload with schema-shaped JSON output from a real model call;
-          it never fabricates default approval content when model output is absent or invalid.
-    raises: RuntimeError when model response is missing, non-JSON, or artifact persistence fails.
+    post: run_phase returns a backend payload with the parsed JSON object when available, otherwise
+          returns the raw model response string so Canon validation can classify schema mismatches.
+    raises: RuntimeError when artifact persistence or backend authority checks fail.
     """
 
     def __init__(self, *, envelope_projection: dict[str, Any], artifacts_dir: Path | None) -> None:
@@ -740,9 +756,10 @@ class _GatewayHermesScopedPhaseSession:
         """Execute one live model call and return Canon phase backend output.
 
         pre: envelope carries objective, inputs, outputSchema, and Canon identity fields.
-        post: returns {"status":"succeeded", "output": <json>} only after parsing a JSON object;
-              solution-modeling handoff refs are persisted under the current Canon artifact root.
-        raises: RuntimeError when the live model cannot provide valid JSON or artifact writes fail.
+        post: returns {"status":"succeeded", "output": <dict|raw-string>} while preserving
+              top-level backend continuation refs for Canon retry/validation flow.
+        post: solution-modeling handoff refs are persisted only when output contains a modelPackage object.
+        raises: RuntimeError when artifact writes or backend authority checks fail.
         """
 
         if not isinstance(envelope, dict):
@@ -771,7 +788,7 @@ class _GatewayHermesScopedPhaseSession:
             skills=skills,
             workdir=workdir,
         )
-        output = _extract_json_object(response)
+        output = self._parse_phase_output_or_raw(response)
         artifact_refs = self._persist_solution_modeling_handoff(output, envelope=envelope)
         result: dict[str, Any] = {"status": "succeeded", "output": output}
         if artifact_refs:
@@ -781,6 +798,21 @@ class _GatewayHermesScopedPhaseSession:
         result["agentCheckpointRef"] = self._agent_checkpoint_ref(envelope)
         result["eventCursorRefs"] = self._event_cursor_refs(envelope, agent_session_ref=agent_session_ref)
         return result
+
+    def _parse_phase_output_or_raw(self, response_text: Any) -> dict[str, Any] | str:
+        """Return a parsed object result when possible, else preserve the raw model payload.
+
+        pre: response_text is the raw final response from Hermes oneshot execution.
+        post: returns the decoded object when the response contains one JSON object.
+        post: returns the original string payload when the response is non-JSON or decodes to a non-object.
+        raises: none.
+        """
+
+        raw_text = str(response_text or "")
+        try:
+            return _extract_json_object(raw_text)
+        except RuntimeError:
+            return raw_text
 
     def _phase_model_route(self) -> dict[str, str] | None:
         """Return the explicit Canon provider/model override for this phase.
@@ -1035,11 +1067,11 @@ class _GatewayHermesScopedPhaseSession:
             f"{json.dumps(output_schema, ensure_ascii=False, sort_keys=True, indent=2)}\n"
         )
 
-    def _persist_solution_modeling_handoff(self, output: dict[str, Any], *, envelope: dict[str, Any]) -> list[str]:
+    def _persist_solution_modeling_handoff(self, output: Any, *, envelope: dict[str, Any]) -> list[str]:
         """Persist distinct solution-modeling handoff artifacts for human review and downstream specs.
 
-        pre: output is the parsed model JSON for a Canon phase and may contain
-             modelPackage.specPackageHandoff refs.
+        pre: output is the parsed model JSON object or a raw non-object model response string.
+        pre: only object outputs may contain modelPackage.specPackageHandoff refs.
         post: every declared handoff ref is readable from the configured Canon artifact store; each
               ref contains an artifact-specific human-readable markdown projection instead of a clone
               of the same modelPackage payload.

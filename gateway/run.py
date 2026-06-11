@@ -8879,8 +8879,9 @@ class GatewayRunner:
         """Run one validated local Canon launch request through the shared gateway-owned facade seam.
 
         pre: payload is the decoded gateway-local request object.
-        post: validates the transport envelope, requires public workflow + inputs authority,
-              calls the public Canon workflow facade, and returns structured durable truth.
+        post: validates the transport envelope, requires exactly one of inline `inputs` or Canon CLI
+              `requestJson` authority, calls the public Canon workflow facade, and returns structured
+              durable truth.
         raises: ValueError when payload fields are malformed or unsupported.
         raises: any exception surfaced by the shared workflow facade.
         """
@@ -8912,17 +8913,45 @@ class GatewayRunner:
         thread_id = str(target.get("threadId") or "").strip() or None
         if not chat_id:
             raise ValueError("target.chatId is required")
-        inputs = payload.get("inputs")
-        if not isinstance(inputs, dict):
-            raise ValueError("inputs must be an object")
+        has_inputs = "inputs" in payload
+        has_request_json = "requestJson" in payload
+        if has_inputs == has_request_json:
+            raise ValueError("exactly one of inputs or requestJson must be present")
+
+        request_authority: Dict[str, Any] | None = None
+        run_id: str | None = None
+        if has_inputs:
+            inputs = payload.get("inputs")
+            if not isinstance(inputs, dict):
+                raise ValueError("inputs must be an object")
+        else:
+            request_json = str(payload.get("requestJson") or "").strip()
+            if not request_json:
+                raise ValueError("requestJson must be a non-empty path")
+            request_path = Path(request_json).expanduser().resolve(strict=True)
+            if not request_path.is_file():
+                raise ValueError("requestJson must point to a JSON file")
+            request_authority = json.loads(request_path.read_text(encoding="utf-8"))
+            if not isinstance(request_authority, dict):
+                raise ValueError("requestJson must contain a JSON object")
+            if str(request_authority.get("schemaVersion") or "").strip() != "run-request.schema.v2":
+                raise ValueError("requestJson.schemaVersion must be run-request.schema.v2")
+            run_id = str(request_authority.get("runId") or "").strip()
+            if not run_id:
+                raise ValueError("requestJson.runId is required")
+            inputs = request_authority.get("inputs")
+            if not isinstance(inputs, dict):
+                raise ValueError("requestJson.inputs must be an object")
 
         canon_payload = await execute_gateway_workflow_facade_run(
             workflow=workflow,
             inputs=inputs,
             gateway_source=_gateway_source_from_launch_target(target=target, request_id=request_id),
             gateway_root=self._canon_gateway_durable_root(),
+            run_id=run_id,
             request_id=request_id,
             target=target,
+            request_authority=request_authority,
             send_review_prompt=self._make_platform_canon_review_prompt_sender(platform=Platform.TELEGRAM),
         )
         run_result = canon_payload.get("result")

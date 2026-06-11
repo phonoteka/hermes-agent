@@ -698,6 +698,90 @@ def test_phase_with_profile_and_tool_use_false_disables_profile_toolsets(monkeyp
     assert captured["kwargs"]["use_config_toolsets"] is False
 
 
+def test_phase_session_preserves_plain_text_output_for_canon_validation(monkeypatch, tmp_path: Path):
+    """Non-JSON model text must flow through as succeeded raw output with continuation refs.
+
+    pre: Hermes oneshot returns plain text instead of a JSON object.
+    post: run_phase does not raise the local JSON-object parse RuntimeError.
+    post: the raw text and backend refs are preserved for Canon validation/retry handling.
+    """
+
+    import hermes_cli.oneshot as oneshot
+    from tools.canon_workflow_command import _GatewayHermesScopedPhaseSession
+
+    def fake_run_agent(prompt, **kwargs):
+        return "not json"
+
+    monkeypatch.setattr(oneshot, "_run_agent", fake_run_agent)
+    session = _GatewayHermesScopedPhaseSession(
+        envelope_projection={
+            "executionContext": {"workingDirectory": str(tmp_path)},
+            "modelRoute": {"provider": "openai-codex", "model": "gpt-5.4"},
+        },
+        artifacts_dir=None,
+    )
+
+    result = session.run_phase(
+        {
+            "runId": "run-invalid-json-text",
+            "phaseId": "proof_loop_red_prep",
+            "objective": "Return phase output.",
+            "inputs": {},
+            "outputSchema": {"schema": {"type": "object"}},
+        }
+    )
+
+    assert result == {
+        "status": "succeeded",
+        "output": "not json",
+        "agentSessionRef": "hermes-current-gateway:run-invalid-json-text:proof_loop_red_prep:1",
+        "agentCheckpointRef": "hermes-current-gateway:checkpoint:run-invalid-json-text:proof_loop_red_prep:1",
+        "eventCursorRefs": [
+            "hermes-current-gateway:run-invalid-json-text:proof_loop_red_prep:1:events:run-invalid-json-text:proof_loop_red_prep:cursor:1"
+        ],
+    }
+
+
+@pytest.mark.parametrize("raw_output", ['[1, 2, 3]', '"hello"', '42', 'true', 'null'])
+def test_phase_session_preserves_json_non_object_output_for_canon_validation(
+    monkeypatch, tmp_path: Path, raw_output: str
+):
+    """JSON scalars/arrays must stay raw so Canon validation, not Hermes parsing, classifies them."""
+
+    import hermes_cli.oneshot as oneshot
+    from tools.canon_workflow_command import _GatewayHermesScopedPhaseSession
+
+    def fake_run_agent(prompt, **kwargs):
+        return raw_output
+
+    monkeypatch.setattr(oneshot, "_run_agent", fake_run_agent)
+    session = _GatewayHermesScopedPhaseSession(
+        envelope_projection={
+            "executionContext": {"workingDirectory": str(tmp_path)},
+            "modelRoute": {"provider": "openai-codex", "model": "gpt-5.4"},
+        },
+        artifacts_dir=None,
+    )
+
+    result = session.run_phase(
+        {
+            "runId": "run-invalid-json-shape",
+            "phaseId": "proof_loop_red_prep",
+            "objective": "Return phase output.",
+            "inputs": {},
+            "outputSchema": {"schema": {"type": "object"}},
+        }
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["output"] == raw_output
+    assert result["agentSessionRef"] == "hermes-current-gateway:run-invalid-json-shape:proof_loop_red_prep:1"
+    assert result["agentCheckpointRef"] == "hermes-current-gateway:checkpoint:run-invalid-json-shape:proof_loop_red_prep:1"
+    assert result["eventCursorRefs"] == [
+        "hermes-current-gateway:run-invalid-json-shape:proof_loop_red_prep:1:events:run-invalid-json-shape:proof_loop_red_prep:cursor:1"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_canon_command_rejects_dry_run_or_direct_helper_proof(monkeypatch):
     sender = AsyncMock(return_value={"message_id": "unused"})
@@ -827,6 +911,115 @@ def test_canon_inspect_reads_durable_summary_and_marks_completed_as_production(m
 
 
 @pytest.mark.asyncio
+async def test_gateway_local_launch_request_accepts_request_json_only_and_preserves_request_authority(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Gateway launcher must accept Canon CLI requestJson-only envelopes.
+
+    pre: the incoming transport envelope carries exactly one requestJson path authority and the
+         loaded file is a run-request.schema.v2 object with request-owned runId/inputs.
+    post: the watcher loads that file, forwards matching public runId/inputs plus preserved
+          private requestAuthority into startWorkflow, and returns the loaded inputs in the
+          gateway-owned response envelope.
+    raises: AssertionError while requestJson-only Canon CLI envelopes are still rejected.
+    """
+
+    import gateway.run as gateway_run
+    from integrations.hermes.canon_hermes import workflow_facade
+
+    runner = _make_runner()
+    observed: dict[str, object] = {}
+    request_json = tmp_path / "request.json"
+    request_json.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "run-request.schema.v2",
+                "workflowRef": "src/canon_workflows/packs/third_workflow/workflow.json",
+                "runId": "run-third-workflow-1",
+                "inputs": {"request": "Compare blue and green with three bullet criteria."},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def _fake_start_workflow(payload, stores=None):
+        observed["payload"] = payload
+        observed["stores"] = stores
+        delivery = stores["review_sender"](
+            {
+                "target": "telegram:-100123456:777",
+                "runId": "run-third-workflow-1",
+                "message": "Review launch",
+                "callbacks": [{"label": "Approve", "actionId": "approve"}],
+                "gateIdentity": {"id": "gate-launch-1"},
+                "downloadableArtifacts": [],
+            }
+        )
+        return {
+            "status": "awaiting-human-review",
+            "runId": "run-third-workflow-1",
+            "checkpoint": {"checkpointId": "current-gateway:run-third-workflow-1"},
+            "delivery": {"kind": "sent", **delivery},
+        }
+
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: str(tmp_path / "hermes-home"))
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+    monkeypatch.setattr(workflow_facade, "startWorkflow", _fake_start_workflow)
+
+    payload = {
+        "api": "canon_gateway_cli_run.v1",
+        "action": "run",
+        "requestId": "cg-launch-request-json-only",
+        "workflow": "third-workflow",
+        "requestJson": str(request_json),
+        "target": {"platform": "telegram", "chatId": "-100123456", "threadId": "777"},
+    }
+
+    result = await runner._execute_canon_gateway_launch_request(payload)
+
+    assert result["ok"] is True
+    assert result["workflow"] == "third-workflow"
+    assert result["inputs"] == {"request": "Compare blue and green with three bullet criteria."}
+    start_payload = observed["payload"]
+    assert start_payload["workflowId"] == "third-workflow"
+    assert start_payload["runId"] == "run-third-workflow-1"
+    assert start_payload["inputs"] == {"request": "Compare blue and green with three bullet criteria."}
+    assert start_payload["requestAuthority"] == {
+        "schemaVersion": "run-request.schema.v2",
+        "workflowRef": "src/canon_workflows/packs/third_workflow/workflow.json",
+        "runId": "run-third-workflow-1",
+        "inputs": {"request": "Compare blue and green with three bullet criteria."},
+    }
+    stores = observed["stores"]
+    assert stores["root"] == str(tmp_path / "hermes-home" / "canon-current-gateway")
+    assert hasattr(stores["phase_backend_client"], "start_scoped_session")
+    assert hasattr(stores["tool_host"], "call_tool")
+    assert callable(stores["review_sender"])
+    assert runner._test_observed["review_prompt"] == {
+        "chat_id": "-100123456",
+        "message": "Review launch",
+        "run_id": "run-third-workflow-1",
+        "metadata": {
+            "thread_id": "777",
+            "callbacks": [{"label": "Approve", "actionId": "approve"}],
+            "gate_identity": {"id": "gate-launch-1"},
+            "downloadableArtifacts": [],
+        },
+    }
+    assert result["run"]["runId"] == "run-third-workflow-1"
+    assert result["run"]["status"] == "awaiting-human-review"
+    assert result["run"]["checkpoint"] == {"checkpointId": "current-gateway:run-third-workflow-1"}
+    assert result["run"]["delivery"] == {
+        "kind": "sent",
+        "messageId": "review-msg-1",
+        "chatId": "-100123456",
+        "threadId": "777",
+    }
+
+
+@pytest.mark.asyncio
 async def test_gateway_local_launch_request_uses_gateway_owned_executor_and_preserves_runtime_request_authority(
     monkeypatch,
     tmp_path: Path,
@@ -920,6 +1113,63 @@ async def test_gateway_local_launch_request_uses_gateway_owned_executor_and_pres
         "chatId": "-100123456",
         "threadId": "777",
     }
+
+
+@pytest.mark.asyncio
+async def test_gateway_local_launch_request_rejects_both_inputs_and_request_json(monkeypatch, tmp_path: Path):
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    request_json = tmp_path / "request.json"
+    request_json.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "run-request.schema.v2",
+                "workflowRef": "src/canon_workflows/packs/third_workflow/workflow.json",
+                "runId": "run-third-workflow-1",
+                "inputs": {"request": "from request json"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: str(tmp_path / "hermes-home"))
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    payload = {
+        "api": "canon_gateway_cli_run.v1",
+        "action": "run",
+        "requestId": "cg-launch-both-authorities",
+        "workflow": "third-workflow",
+        "inputs": {"request": "from inline payload"},
+        "requestJson": str(request_json),
+        "target": {"platform": "telegram", "chatId": "-100123456", "threadId": "777"},
+    }
+
+    with pytest.raises(ValueError, match="exactly one"):
+        await runner._execute_canon_gateway_launch_request(payload)
+
+
+@pytest.mark.asyncio
+async def test_gateway_local_launch_request_rejects_missing_inputs_and_request_json(monkeypatch, tmp_path: Path):
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: str(tmp_path / "hermes-home"))
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    payload = {
+        "api": "canon_gateway_cli_run.v1",
+        "action": "run",
+        "requestId": "cg-launch-missing-authority",
+        "workflow": "third-workflow",
+        "target": {"platform": "telegram", "chatId": "-100123456", "threadId": "777"},
+    }
+
+    with pytest.raises(ValueError, match="exactly one"):
+        await runner._execute_canon_gateway_launch_request(payload)
 
 
 @pytest.mark.asyncio
