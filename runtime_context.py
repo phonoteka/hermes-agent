@@ -50,6 +50,20 @@ def get_runtime_cwd(default: str | None = None) -> str | None:
     return default
 
 
+def get_scoped_runtime_cwd(default: str | None = None) -> str | None:
+    """Return only the explicit scoped runtime cwd, never env fallback.
+
+    This distinguishes per-scope authority from ambient legacy fallback so
+    callers can rank explicit runtime binding above other cwd sources without
+    letting ``TERMINAL_CWD`` outrank a live terminal cwd.
+    """
+
+    scoped = _RUNTIME_CWD.get()
+    if scoped:
+        return scoped
+    return default
+
+
 @contextmanager
 def scoped_runtime_cwd(path: str | None) -> Iterator[None]:
     """Bind a runtime cwd override for the current logical execution scope.

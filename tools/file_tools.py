@@ -10,14 +10,14 @@ from pathlib import Path
 import sys
 
 try:
-    from runtime_context import get_runtime_cwd
+    from runtime_context import get_runtime_cwd, get_scoped_runtime_cwd
 except ModuleNotFoundError as exc:
     if exc.name != "runtime_context":
         raise
     _HERMES_ROOT = str(Path(__file__).resolve().parents[1])
     if _HERMES_ROOT not in sys.path:
         sys.path.insert(0, _HERMES_ROOT)
-    from runtime_context import get_runtime_cwd
+    from runtime_context import get_runtime_cwd, get_scoped_runtime_cwd
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
@@ -127,13 +127,63 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
     return None
 
 
+def _effective_file_tool_cwd(task_id: str = "default") -> Path:
+    """Return the authoritative cwd for relative file-tool path resolution."""
+    scoped_cwd = get_scoped_runtime_cwd(None)
+    live_cwd = _get_live_tracking_cwd(task_id)
+
+    if scoped_cwd:
+        effective_cwd = Path(scoped_cwd).resolve()
+        if live_cwd:
+            cached_env_cwd = Path(live_cwd).resolve()
+            if cached_env_cwd != effective_cwd:
+                logger.info(
+                    "file_tool.cwd_authority_mismatch",
+                    extra={
+                        "file_tool.cwd_authority": "scoped_runtime_cwd",
+                        "file_tool.cached_env_cwd": str(cached_env_cwd),
+                        "file_tool.effective_cwd": str(effective_cwd),
+                        "file_tool.task_id": task_id,
+                    },
+                )
+        return effective_cwd
+
+    if live_cwd:
+        return Path(live_cwd)
+
+    return Path(get_runtime_cwd(os.getcwd()))
+
+
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path:
     """Resolve *filepath* against the task's live terminal cwd when possible."""
     p = Path(filepath).expanduser()
     if not p.is_absolute():
-        base = _get_live_tracking_cwd(task_id) or get_runtime_cwd(os.getcwd())
-        p = Path(base) / p
+        p = _effective_file_tool_cwd(task_id) / p
     return p.resolve()
+
+
+def _rewrite_v4a_patch_paths_for_task(patch_content: str, task_id: str = "default") -> str:
+    """Rewrite relative V4A file headers to absolute task-scoped paths."""
+    import re
+
+    header_re = re.compile(r'^(\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*)(.+)$')
+    rewritten_lines: list[str] = []
+    for line in patch_content.splitlines(keepends=True):
+        match = header_re.match(line.rstrip("\r\n"))
+        if not match:
+            rewritten_lines.append(line)
+            continue
+
+        prefix, raw_path = match.groups()
+        candidate = Path(raw_path.strip()).expanduser()
+        if candidate.is_absolute():
+            rewritten_lines.append(line)
+            continue
+
+        resolved = _resolve_path_for_task(raw_path.strip(), task_id)
+        line_ending = line[len(line.rstrip("\r\n")):]
+        rewritten_lines.append(f"{prefix}{resolved}{line_ending}")
+    return "".join(rewritten_lines)
 
 
 def _is_blocked_device(filepath: str) -> bool:
@@ -550,7 +600,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        result = file_ops.read_file(str(_resolved), offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -728,7 +778,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
     internally.
     """
     try:
-        resolved = str(_resolve_path(filepath))
+        resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         return
     with _read_tracker_lock:
@@ -821,11 +871,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            dispatch_path = _resolved or path
+            result = file_ops.write_file(dispatch_path, content)
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
-            _update_read_timestamp(path, task_id)
+            _update_read_timestamp(dispatch_path, task_id)
             return json.dumps(result_dict, ensure_ascii=False)
 
         # Serialize the read→modify→write region per-path so concurrent
@@ -837,14 +888,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
             cross_warning = file_state.check_stale(task_id, _resolved)
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning
             if effective_warning:
                 result_dict["_warning"] = effective_warning
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
-            _update_read_timestamp(path, task_id)
+            _update_read_timestamp(_resolved, task_id)
             if not result_dict.get("error"):
                 file_state.note_write(task_id, _resolved)
         return json.dumps(result_dict, ensure_ascii=False)
@@ -918,11 +969,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
-                result = file_ops.patch_replace(path, old_string, new_string, replace_all)
+                dispatch_path = _path_to_resolved.get(path) or path
+                result = file_ops.patch_replace(dispatch_path, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                result = file_ops.patch_v4a(_rewrite_v4a_patch_paths_for_task(patch, task_id))
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -933,8 +985,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             # consecutive edits by this task don't trigger false warnings.
             if not result_dict.get("error"):
                 for _p in _paths_to_check:
-                    _update_read_timestamp(_p, task_id)
                     _r = _path_to_resolved.get(_p)
+                    _update_read_timestamp(_r or _p, task_id)
                     if _r:
                         file_state.note_write(task_id, _r)
         # Hint when old_string not found — saves iterations where the agent
@@ -994,9 +1046,10 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 "already_searched": count,
             }, ensure_ascii=False)
 
+        resolved_path = _resolve_path_for_task(path, task_id)
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern, path=str(resolved_path), target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         if hasattr(result, 'matches'):
