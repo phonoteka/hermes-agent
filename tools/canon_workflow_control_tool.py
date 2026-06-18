@@ -13,7 +13,14 @@ from typing import Any
 from tools.registry import registry
 
 _ALLOWED_ACTIONS = ("pause", "resume", "cancel", "restart")
-_ALLOWED_ARGUMENTS = frozenset({"action", "origin", "run_id", "checkpoint_id", "reason"})
+_PUBLIC_RESTART_CHECKPOINT_CLASS = "public-gate-resume-alias"
+_CHECKPOINT_IDENTITY_CLASSES = (
+    _PUBLIC_RESTART_CHECKPOINT_CLASS,
+    "current-gateway-run-checkpoint",
+    "current-gateway-callback-token-checkpoint",
+    "runtime-checkpoint-evidence",
+)
+_ALLOWED_ARGUMENTS = frozenset({"action", "origin", "run_id", "checkpoint_id", "checkpoint_identity_class", "reason"})
 
 CANON_WORKFLOW_CONTROL_SCHEMA = {
     "name": "canon_workflow_control",
@@ -40,6 +47,14 @@ CANON_WORKFLOW_CONTROL_SCHEMA = {
             "checkpoint_id": {
                 "type": "string",
                 "description": "Required checkpoint id for restart.",
+            },
+            "checkpoint_identity_class": {
+                "type": "string",
+                "enum": list(_CHECKPOINT_IDENTITY_CLASSES),
+                "description": (
+                    "Optional checkpoint identity class for restart. Only public-gate-resume-alias "
+                    "is accepted as workflow restart authority; evidence-only classes fail closed."
+                ),
             },
             "reason": {
                 "type": "string",
@@ -167,6 +182,37 @@ def _normalize_optional_reason(value: Any) -> str | None:
     return reason or None
 
 
+def _normalize_checkpoint_identity_class(value: Any) -> str | None:
+    """Normalize one optional checkpoint identity class.
+
+    pre: value is JSON-like caller input.
+    post: returns a known checkpoint identity class or None when omitted.
+    raises: ValueError when the class is outside the public Canon checkpoint taxonomy.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text not in _CHECKPOINT_IDENTITY_CLASSES:
+        raise ValueError("checkpoint_identity_class must be one of: " + ", ".join(_CHECKPOINT_IDENTITY_CLASSES))
+    return text
+
+
+def _validate_checkpoint_identity_for_action(action: str, checkpoint_identity_class: str | None) -> None:
+    """Fail closed when checkpoint identity metadata would widen workflow control authority.
+
+    pre: action is normalized and checkpoint_identity_class is either None or a known taxonomy class.
+    post: returns only when the selected action can legally carry the supplied class.
+    raises: ValueError when non-restart actions carry checkpoint class metadata or restart uses evidence-only classes.
+    """
+
+    if checkpoint_identity_class is None:
+        return
+    if action != "restart":
+        raise ValueError("checkpoint_identity_class is only accepted for restart")
+    if checkpoint_identity_class != _PUBLIC_RESTART_CHECKPOINT_CLASS:
+        raise ValueError("restart accepts only checkpoint_identity_class=public-gate-resume-alias")
+
 
 def _normalize_required_text(value: Any, field_name: str) -> str:
     """Normalize one required non-empty text field.
@@ -183,18 +229,23 @@ def _normalize_required_text(value: Any, field_name: str) -> str:
 
 
 
-def _build_facade_payload(*, action: str, origin: str, run_id: Any, checkpoint_id: Any, reason: Any) -> dict[str, Any]:
+def _build_facade_payload(
+    *, action: str, origin: str, run_id: Any, checkpoint_id: Any, checkpoint_identity_class: Any, reason: Any
+) -> dict[str, Any]:
     """Build one workflow-facade payload from validated public tool inputs.
 
     pre: action and origin are normalized public control values.
     post: returns only workflow-level facade fields needed for the selected action.
-    raises: ValueError when the selected action is missing its required run/checkpoint identifier.
+    raises: ValueError when the selected action is missing its required run/checkpoint identifier or widens checkpoint authority.
     """
 
     payload: dict[str, Any] = {"origin": origin}
     normalized_reason = _normalize_optional_reason(reason)
+    normalized_checkpoint_class = _normalize_checkpoint_identity_class(checkpoint_identity_class)
+    _validate_checkpoint_identity_for_action(action, normalized_checkpoint_class)
     if action == "restart":
         payload["checkpointId"] = _normalize_required_text(checkpoint_id, "checkpoint_id")
+        payload["checkpointIdentityClass"] = normalized_checkpoint_class or _PUBLIC_RESTART_CHECKPOINT_CLASS
         return payload
     payload["runId"] = _normalize_required_text(run_id, "run_id")
     if normalized_reason is not None:
@@ -240,6 +291,8 @@ def _success_payload(*, action: str, payload: dict[str, Any], result: dict[str, 
         response["run_id"] = str(payload["runId"])
     if "checkpointId" in payload:
         response["checkpoint_id"] = str(payload["checkpointId"])
+    if "checkpointIdentityClass" in payload:
+        response["checkpoint_identity_class"] = str(payload["checkpointIdentityClass"])
     return response
 
 
@@ -261,6 +314,7 @@ def _handle_tool(args: dict[str, Any], **_: Any) -> str:
             origin=origin,
             run_id=args.get("run_id"),
             checkpoint_id=args.get("checkpoint_id"),
+            checkpoint_identity_class=args.get("checkpoint_identity_class"),
             reason=args.get("reason"),
         )
         stores = _resolve_durable_stores()

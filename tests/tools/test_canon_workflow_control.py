@@ -26,10 +26,16 @@ def test_canon_workflow_control_tool_registers_and_exposes_workflow_actions() ->
 
     parameters = tool_module.CANON_WORKFLOW_CONTROL_SCHEMA["parameters"]
     properties = parameters["properties"]
-    assert set(properties) == {"action", "origin", "run_id", "checkpoint_id", "reason"}
+    assert set(properties) == {"action", "origin", "run_id", "checkpoint_id", "checkpoint_identity_class", "reason"}
     assert parameters["required"] == ["action", "origin"]
     assert parameters["additionalProperties"] is False
     assert properties["action"]["enum"] == ["pause", "resume", "cancel", "restart"]
+    assert properties["checkpoint_identity_class"]["enum"] == [
+        "public-gate-resume-alias",
+        "current-gateway-run-checkpoint",
+        "current-gateway-callback-token-checkpoint",
+        "runtime-checkpoint-evidence",
+    ]
     assert "phaseId" not in properties
     assert "nodeId" not in properties
     assert "start_phase" not in properties
@@ -79,7 +85,14 @@ def test_canon_workflow_control_tool_dispatches_workflow_actions(monkeypatch) ->
     resume = json.loads(module._handle_tool({"action": "resume", "origin": "telegram:-100123", "run_id": "run-1"}))
     cancel = json.loads(module._handle_tool({"action": "cancel", "origin": "telegram:-100123", "run_id": "run-1"}))
     restart = json.loads(
-        module._handle_tool({"action": "restart", "origin": "telegram:-100123", "checkpoint_id": "checkpoint-1"})
+        module._handle_tool(
+            {
+                "action": "restart",
+                "origin": "telegram:-100123",
+                "checkpoint_id": "checkpoint-1",
+                "checkpoint_identity_class": "public-gate-resume-alias",
+            }
+        )
     )
 
     assert [item[0] for item in observed] == ["pause", "resume", "cancel", "restart"]
@@ -87,7 +100,11 @@ def test_canon_workflow_control_tool_dispatches_workflow_actions(monkeypatch) ->
     assert observed[0][1] == {"origin": "telegram:-100123", "runId": "run-1", "reason": "operator"}
     assert observed[1][1] == {"origin": "telegram:-100123", "runId": "run-1"}
     assert observed[2][1] == {"origin": "telegram:-100123", "runId": "run-1"}
-    assert observed[3][1] == {"origin": "telegram:-100123", "checkpointId": "checkpoint-1"}
+    assert observed[3][1] == {
+        "origin": "telegram:-100123",
+        "checkpointId": "checkpoint-1",
+        "checkpointIdentityClass": "public-gate-resume-alias",
+    }
 
     assert pause == {
         "success": True,
@@ -107,6 +124,7 @@ def test_canon_workflow_control_tool_dispatches_workflow_actions(monkeypatch) ->
         "action": "restart",
         "origin": "telegram:-100123",
         "checkpoint_id": "checkpoint-1",
+        "checkpoint_identity_class": "public-gate-resume-alias",
         "result": {"checkpointId": "checkpoint-1", "eventKind": "workflow.restart.requested"},
     }
 
@@ -131,6 +149,26 @@ def test_canon_workflow_control_tool_fails_closed_for_invalid_input_without_faca
     unexpected_field = json.loads(
         module._handle_tool({"action": "cancel", "origin": "telegram:-100123", "run_id": "run-1", "active_handle": "forbidden"})
     )
+    private_checkpoint_class = json.loads(
+        module._handle_tool(
+            {
+                "action": "restart",
+                "origin": "telegram:-100123",
+                "checkpoint_id": "current-gateway:run-1",
+                "checkpoint_identity_class": "current-gateway-run-checkpoint",
+            }
+        )
+    )
+    misplaced_checkpoint_class = json.loads(
+        module._handle_tool(
+            {
+                "action": "cancel",
+                "origin": "telegram:-100123",
+                "run_id": "run-1",
+                "checkpoint_identity_class": "public-gate-resume-alias",
+            }
+        )
+    )
 
     assert invalid_action["success"] is False
     assert "action" in invalid_action["error"]
@@ -138,4 +176,8 @@ def test_canon_workflow_control_tool_fails_closed_for_invalid_input_without_faca
     assert "run_id" in missing_run["error"]
     assert unexpected_field["success"] is False
     assert "unsupported" in unexpected_field["error"]
+    assert private_checkpoint_class["success"] is False
+    assert "public-gate-resume-alias" in private_checkpoint_class["error"]
+    assert misplaced_checkpoint_class["success"] is False
+    assert "restart" in misplaced_checkpoint_class["error"]
     assert call_count["count"] == 0

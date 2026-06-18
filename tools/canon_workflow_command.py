@@ -24,7 +24,17 @@ _CANON_TOP_LEVEL_USAGE = (
 )
 _CANON_CONTROL_USAGE = (
     "Usage: /canon control <run-id> <pause|resume|cancel|restart> "
-    "[--reason TEXT] | /canon control <run-id> restart --checkpoint-id <checkpoint-id> [--reason TEXT]."
+    "[--reason TEXT] | /canon control <run-id> restart --checkpoint-id <checkpoint-id> "
+    "[--checkpoint-class public-gate-resume-alias] [--reason TEXT]."
+)
+_PUBLIC_RESTART_CHECKPOINT_CLASS = "public-gate-resume-alias"
+_CHECKPOINT_IDENTITY_CLASSES = frozenset(
+    {
+        _PUBLIC_RESTART_CHECKPOINT_CLASS,
+        "current-gateway-run-checkpoint",
+        "current-gateway-callback-token-checkpoint",
+        "runtime-checkpoint-evidence",
+    }
 )
 _PHASE_LIKE_CONTROL_ARGS = frozenset(
     {
@@ -1559,6 +1569,7 @@ def _handle_control_subcommand(*, tokens: list[str], source: Any) -> str:
         action = parsed["action"]
         if action == "restart":
             payload["checkpointId"] = parsed["checkpoint_id"]
+            payload["checkpointIdentityClass"] = parsed["checkpoint_identity_class"] or _PUBLIC_RESTART_CHECKPOINT_CLASS
         else:
             payload["runId"] = parsed["run_id"]
         if parsed.get("reason") is not None and action != "restart":
@@ -1603,6 +1614,7 @@ def _parse_control_command(tokens: list[str]) -> dict[str, str | None]:
 
     reason: str | None = None
     checkpoint_id: str | None = None
+    checkpoint_identity_class: str | None = None
     index = 3
     while index < len(tokens):
         token = str(tokens[index]).strip()
@@ -1627,15 +1639,36 @@ def _parse_control_command(tokens: list[str]) -> dict[str, str | None]:
             checkpoint_id = _require_non_empty_text(tokens[index + 1], "checkpoint_id")
             index += 2
             continue
+        if token in {"--checkpoint-class", "--checkpoint-identity-class"}:
+            if action != "restart":
+                raise ValueError("checkpoint class is allowed only for restart")
+            if checkpoint_identity_class is not None:
+                raise ValueError("duplicate checkpoint class")
+            if index + 1 >= len(tokens):
+                raise ValueError(f"{token} requires a value")
+            candidate_class = _require_non_empty_text(tokens[index + 1], "checkpoint_class")
+            if candidate_class not in _CHECKPOINT_IDENTITY_CLASSES:
+                raise ValueError("checkpoint class must be one of: " + ", ".join(sorted(_CHECKPOINT_IDENTITY_CLASSES)))
+            if candidate_class != _PUBLIC_RESTART_CHECKPOINT_CLASS:
+                raise ValueError("restart accepts only checkpoint class public-gate-resume-alias")
+            checkpoint_identity_class = candidate_class
+            index += 2
+            continue
         raise ValueError(f"unsupported control argument: {token}")
 
     if action == "restart":
         if checkpoint_id is None:
             raise ValueError("restart requires --checkpoint-id <checkpoint-id>")
-        return {"action": action, "run_id": run_id, "checkpoint_id": checkpoint_id, "reason": reason}
+        return {
+            "action": action,
+            "run_id": run_id,
+            "checkpoint_id": checkpoint_id,
+            "checkpoint_identity_class": checkpoint_identity_class,
+            "reason": reason,
+        }
     if checkpoint_id is not None:
         raise ValueError("checkpoint authority is allowed only for restart")
-    return {"action": action, "run_id": run_id, "checkpoint_id": None, "reason": reason}
+    return {"action": action, "run_id": run_id, "checkpoint_id": None, "checkpoint_identity_class": None, "reason": reason}
 
 
 def _render_control_result(*, action: str, result: Any, payload: dict[str, Any]) -> str:
@@ -1652,6 +1685,10 @@ def _render_control_result(*, action: str, result: Any, payload: dict[str, Any])
         mapping.get("checkpointId") or payload.get("checkpointId") or "-",
         key="checkpointId",
     )
+    checkpoint_identity_class = _to_redacted_value(
+        mapping.get("checkpointIdentityClass") or payload.get("checkpointIdentityClass") or "-",
+        key="checkpointIdentityClass",
+    )
     status = _to_redacted_value(mapping.get("status") or mapping.get("result") or "unknown", key="status")
     event_kind = _to_redacted_value(mapping.get("eventKind") or mapping.get("event_kind") or "-", key="eventKind")
     lines = [
@@ -1659,6 +1696,7 @@ def _render_control_result(*, action: str, result: Any, payload: dict[str, Any])
         f"- Действие: `{action}`",
         f"- Run ID: `{run_id}`",
         f"- Checkpoint ID: `{checkpoint_id}`" if action == "restart" or checkpoint_id != "-" else None,
+        f"- Checkpoint class: `{checkpoint_identity_class}`" if checkpoint_identity_class != "-" else None,
         f"- eventKind: `{event_kind}`",
         f"- Статус: `{status}`",
     ]

@@ -983,7 +983,10 @@ def test_canon_control_pause_resume_restart_route_to_workflow_facade(monkeypatch
         _make_event('/canon control run-resume-1 resume --reason "continue now"', thread_id="777")
     )
     restart_result = handle_gateway_canon_command(
-        _make_event('/canon control ignored-run restart --checkpoint-id checkpoint-42 --reason "ignored by facade"', thread_id="777")
+        _make_event(
+            '/canon control ignored-run restart --checkpoint-id checkpoint-42 --checkpoint-class public-gate-resume-alias --reason "ignored by facade"',
+            thread_id="777",
+        )
     )
 
     assert calls == [
@@ -999,7 +1002,11 @@ def test_canon_control_pause_resume_restart_route_to_workflow_facade(monkeypatch
         ),
         (
             "restart",
-            {"origin": "telegram:-100123456:777", "checkpointId": "checkpoint-42"},
+            {
+                "origin": "telegram:-100123456:777",
+                "checkpointId": "checkpoint-42",
+                "checkpointIdentityClass": "public-gate-resume-alias",
+            },
             None,
         ),
     ]
@@ -1007,6 +1014,7 @@ def test_canon_control_pause_resume_restart_route_to_workflow_facade(monkeypatch
     assert "Действие: `resume`" in resume_result
     assert "Действие: `restart`" in restart_result
     assert "checkpoint-42" in restart_result
+    assert "public-gate-resume-alias" in restart_result
     assert "run-restarted-9" in restart_result
 
 
@@ -1030,11 +1038,22 @@ def test_canon_control_rejects_phase_level_or_missing_action(monkeypatch):
     missing_action = handle_gateway_canon_command(_make_event("/canon control run-missing"))
     phase_like = handle_gateway_canon_command(_make_event("/canon control run-bad cancel_phase"))
     missing_checkpoint = handle_gateway_canon_command(_make_event("/canon control run-bad restart"))
+    private_checkpoint_class = handle_gateway_canon_command(
+        _make_event(
+            "/canon control ignored-run restart --checkpoint-id current-gateway:run-1 --checkpoint-class current-gateway-run-checkpoint"
+        )
+    )
+    misplaced_checkpoint_class = handle_gateway_canon_command(
+        _make_event("/canon control run-bad cancel --checkpoint-class public-gate-resume-alias")
+    )
 
     assert calls == []
     assert "Usage: /canon control <run-id> <pause|resume|cancel|restart>" in missing_action
     assert "Usage: /canon control <run-id> <pause|resume|cancel|restart>" in phase_like
     assert "--checkpoint-id <checkpoint-id>" in missing_checkpoint
+    assert "public-gate-resume-alias" in private_checkpoint_class
+    assert "checkpoint class" in private_checkpoint_class.lower()
+    assert "only for restart" in misplaced_checkpoint_class
 
 
 @pytest.mark.asyncio
