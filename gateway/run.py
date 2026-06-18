@@ -66,6 +66,7 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _CANON_GATEWAY_PROCESSING_STALE_SECS_DEFAULT = 300.0
 _CANON_GATEWAY_PROCESSING_TIMEOUT_GRACE_SECS = 30.0
+_CANON_GATEWAY_LAUNCH_LOCAL_MAX_CONCURRENCY = 4
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 
@@ -1205,7 +1206,11 @@ class GatewayRunner:
         self._restart_detached = False
         self._restart_via_service = False
         self._stop_task: Optional[asyncio.Task] = None
-        
+        self._canon_gateway_launch_active_processing_paths: set[Path] = set()
+        self._canon_gateway_launch_active_request_ids: set[str] = set()
+        self._canon_gateway_launch_tasks: set[asyncio.Task] = set()
+        self._canon_gateway_launch_max_concurrency = _CANON_GATEWAY_LAUNCH_LOCAL_MAX_CONCURRENCY
+
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
@@ -8634,6 +8639,117 @@ class GatewayRunner:
 
         return None
 
+    def _ensure_canon_gateway_launch_task_state(self) -> None:
+        """Initialize Canon launch watcher task-tracking state for legacy/test runners.
+
+        pre: none.
+        post: the watcher/task bookkeeping attributes exist even when tests bypass __init__.
+        raises: none.
+        """
+        if not hasattr(self, "_canon_gateway_launch_active_processing_paths"):
+            self._canon_gateway_launch_active_processing_paths = set()
+        if not hasattr(self, "_canon_gateway_launch_active_request_ids"):
+            self._canon_gateway_launch_active_request_ids = set()
+        if not hasattr(self, "_canon_gateway_launch_tasks"):
+            self._canon_gateway_launch_tasks = set()
+        if not hasattr(self, "_canon_gateway_launch_max_concurrency"):
+            self._canon_gateway_launch_max_concurrency = _CANON_GATEWAY_LAUNCH_LOCAL_MAX_CONCURRENCY
+
+    def _canon_gateway_launch_request_id_from_path(self, request_path: Path) -> str | None:
+        """Return the filename-owned request id for one Canon launch request path.
+
+        pre: request_path is any request/processing path under the Canon request directory.
+        post: returns the validated filename request id, or None when the filename is malformed.
+        raises: none.
+        """
+        from tools.canon_gateway_launch import _validate_request_id
+
+        try:
+            return _validate_request_id(request_path.name.split(".", 1)[0], field_name="request filename requestId")
+        except ValueError:
+            return None
+
+    def _prune_canon_gateway_launch_tasks(self) -> None:
+        """Drop finished Canon launch tasks and surface fail-closed diagnostics.
+
+        pre: watcher bookkeeping state exists.
+        post: `_canon_gateway_launch_tasks` keeps only unfinished tasks.
+        raises: none; task failures are logged because response files already encode per-request failure.
+        """
+        self._ensure_canon_gateway_launch_task_state()
+        done_tasks = {task for task in self._canon_gateway_launch_tasks if task.done()}
+        if not done_tasks:
+            return
+        self._canon_gateway_launch_tasks.difference_update(done_tasks)
+        for task in done_tasks:
+            if task.cancelled():
+                continue
+            try:
+                task.result()
+            except Exception as exc:
+                logger.warning("Canon gateway-local launch task failed: %s", exc, exc_info=True)
+
+    def _canon_gateway_launch_path_is_active(self, request_path: Path) -> bool:
+        """Return True when this gateway process already owns the claimed request path.
+
+        pre: watcher bookkeeping state exists.
+        post: returns True when the path or filename request id is tracked by an unfinished local task.
+        raises: none.
+        """
+        self._ensure_canon_gateway_launch_task_state()
+        request_id = self._canon_gateway_launch_request_id_from_path(request_path)
+        if request_path in self._canon_gateway_launch_active_processing_paths:
+            return True
+        return bool(request_id) and request_id in self._canon_gateway_launch_active_request_ids
+
+    def _canon_gateway_launch_has_capacity(self) -> bool:
+        """Return True when the watcher may schedule another local launch task.
+
+        pre: watcher bookkeeping state exists.
+        post: returns False once the number of unfinished watcher-owned launch tasks reaches the local cap.
+        raises: none.
+        """
+        self._ensure_canon_gateway_launch_task_state()
+        self._prune_canon_gateway_launch_tasks()
+        return len(self._canon_gateway_launch_tasks) < int(self._canon_gateway_launch_max_concurrency)
+
+    def _schedule_canon_gateway_launch_request(self, request_path: Path) -> bool:
+        """Track and schedule one claimed Canon launch request without blocking the watcher loop.
+
+        pre: request_path is already a claimed `*.processing.json` file.
+        post: returns True and schedules exactly one task when under the local concurrency cap.
+        post: returns False without scheduling when the file is already active or the cap is full.
+        raises: none.
+        """
+        self._ensure_canon_gateway_launch_task_state()
+        self._prune_canon_gateway_launch_tasks()
+        if self._canon_gateway_launch_path_is_active(request_path):
+            return False
+        if len(self._canon_gateway_launch_tasks) >= int(self._canon_gateway_launch_max_concurrency):
+            logger.warning(
+                "Canon gateway-local launch watcher at concurrency cap (%s); skipping %s this tick",
+                self._canon_gateway_launch_max_concurrency,
+                request_path.name,
+            )
+            return False
+
+        request_id = self._canon_gateway_launch_request_id_from_path(request_path)
+        self._canon_gateway_launch_active_processing_paths.add(request_path)
+        if request_id:
+            self._canon_gateway_launch_active_request_ids.add(request_id)
+
+        async def _run_claimed_request() -> None:
+            try:
+                await self._process_canon_gateway_launch_request(request_path)
+            finally:
+                self._canon_gateway_launch_active_processing_paths.discard(request_path)
+                if request_id:
+                    self._canon_gateway_launch_active_request_ids.discard(request_id)
+
+        task = asyncio.create_task(_run_claimed_request())
+        self._canon_gateway_launch_tasks.add(task)
+        return True
+
     async def _canon_gateway_launch_watcher(self, interval: float = 0.5) -> None:
         """Process profile-scoped local Canon launch requests for the active gateway.
 
@@ -8644,15 +8760,21 @@ class GatewayRunner:
         """
         from tools.canon_gateway_launch import _requests_dir
 
+        self._ensure_canon_gateway_launch_task_state()
         await asyncio.sleep(2)
         while self._running:
             try:
                 requests_dir = _requests_dir()
                 requests_dir.mkdir(parents=True, exist_ok=True)
+                self._prune_canon_gateway_launch_tasks()
                 for processing_path in sorted(requests_dir.glob("*.request.processing.json")):
+                    if self._canon_gateway_launch_path_is_active(processing_path):
+                        continue
                     if self._canon_gateway_processing_request_is_stale(processing_path):
-                        await self._process_canon_gateway_launch_request(processing_path)
+                        self._schedule_canon_gateway_launch_request(processing_path)
                 for request_path in sorted(requests_dir.glob("*.request.json")):
+                    if not self._canon_gateway_launch_has_capacity():
+                        break
                     try:
                         claimed_path = request_path.with_suffix(".processing.json")
                         request_path.replace(claimed_path)
@@ -8660,7 +8782,7 @@ class GatewayRunner:
                         continue
                     except OSError:
                         continue
-                    await self._process_canon_gateway_launch_request(claimed_path)
+                    self._schedule_canon_gateway_launch_request(claimed_path)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

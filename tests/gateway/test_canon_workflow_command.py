@@ -910,6 +910,133 @@ def test_canon_inspect_reads_durable_summary_and_marks_completed_as_production(m
     assert observed.get("source") is not None
 
 
+def test_canon_control_cancel_routes_to_workflow_facade_and_not_observability(monkeypatch):
+    import tools.canon_workflow_command as canon_cmd
+    from integrations.hermes.canon_hermes import workflow_facade
+
+    observed: dict[str, object] = {}
+
+    def _fail_observability(**kwargs):
+        raise AssertionError("/canon control must not dispatch to observability")
+
+    def _fake_cancel_workflow(payload, stores=None):
+        observed["payload"] = payload
+        observed["stores"] = stores
+        return {
+            "action": "cancel",
+            "status": "cancelled",
+            "eventKind": "run.cancelled",
+            "runId": payload["runId"],
+        }
+
+    monkeypatch.setattr(canon_cmd, "_handle_observability_subcommand", _fail_observability)
+    monkeypatch.setattr(workflow_facade, "cancel_workflow", _fake_cancel_workflow)
+
+    result = handle_gateway_canon_command(
+        _make_event('/canon control run-cancel-1 cancel --reason "operator requested stop"', thread_id="777")
+    )
+
+    assert observed["payload"] == {
+        "origin": "telegram:-100123456:777",
+        "runId": "run-cancel-1",
+        "reason": "operator requested stop",
+    }
+    assert observed["stores"] is None
+    assert "Контроль workflow" in result
+    assert "Действие: `cancel`" in result
+    assert "run-cancel-1" in result
+    assert "run.cancelled" in result
+    assert "cancelled" in result
+
+
+def test_canon_control_pause_resume_restart_route_to_workflow_facade(monkeypatch):
+    from integrations.hermes.canon_hermes import workflow_facade
+
+    calls: list[tuple[str, dict[str, object], object]] = []
+
+    def _fake_pause(payload, stores=None):
+        calls.append(("pause", payload, stores))
+        return {"action": "pause", "status": "paused", "eventKind": "run.paused", "runId": payload["runId"]}
+
+    def _fake_resume(payload, stores=None):
+        calls.append(("resume", payload, stores))
+        return {"action": "resume", "status": "running", "eventKind": "run.resumed", "runId": payload["runId"]}
+
+    def _fake_restart(payload, stores=None):
+        calls.append(("restart", payload, stores))
+        return {
+            "action": "restart",
+            "status": "queued",
+            "eventKind": "run.restarted_from_checkpoint",
+            "checkpointId": payload["checkpointId"],
+            "runId": "run-restarted-9",
+        }
+
+    monkeypatch.setattr(workflow_facade, "pause_workflow", _fake_pause)
+    monkeypatch.setattr(workflow_facade, "resume_workflow", _fake_resume)
+    monkeypatch.setattr(workflow_facade, "restart_workflow_from_checkpoint", _fake_restart)
+
+    pause_result = handle_gateway_canon_command(
+        _make_event('/canon control run-pause-1 pause --reason "hold please"', thread_id="777")
+    )
+    resume_result = handle_gateway_canon_command(
+        _make_event('/canon control run-resume-1 resume --reason "continue now"', thread_id="777")
+    )
+    restart_result = handle_gateway_canon_command(
+        _make_event('/canon control ignored-run restart --checkpoint-id checkpoint-42 --reason "ignored by facade"', thread_id="777")
+    )
+
+    assert calls == [
+        (
+            "pause",
+            {"origin": "telegram:-100123456:777", "runId": "run-pause-1", "reason": "hold please"},
+            None,
+        ),
+        (
+            "resume",
+            {"origin": "telegram:-100123456:777", "runId": "run-resume-1", "reason": "continue now"},
+            None,
+        ),
+        (
+            "restart",
+            {"origin": "telegram:-100123456:777", "checkpointId": "checkpoint-42"},
+            None,
+        ),
+    ]
+    assert "Действие: `pause`" in pause_result
+    assert "Действие: `resume`" in resume_result
+    assert "Действие: `restart`" in restart_result
+    assert "checkpoint-42" in restart_result
+    assert "run-restarted-9" in restart_result
+
+
+def test_canon_control_rejects_phase_level_or_missing_action(monkeypatch):
+    from integrations.hermes.canon_hermes import workflow_facade
+
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def _record(name: str):
+        def _inner(payload, stores=None):
+            calls.append((name, payload))
+            return {"action": name, "status": "unexpected"}
+
+        return _inner
+
+    monkeypatch.setattr(workflow_facade, "pause_workflow", _record("pause"))
+    monkeypatch.setattr(workflow_facade, "resume_workflow", _record("resume"))
+    monkeypatch.setattr(workflow_facade, "cancel_workflow", _record("cancel"))
+    monkeypatch.setattr(workflow_facade, "restart_workflow_from_checkpoint", _record("restart"))
+
+    missing_action = handle_gateway_canon_command(_make_event("/canon control run-missing"))
+    phase_like = handle_gateway_canon_command(_make_event("/canon control run-bad cancel_phase"))
+    missing_checkpoint = handle_gateway_canon_command(_make_event("/canon control run-bad restart"))
+
+    assert calls == []
+    assert "Usage: /canon control <run-id> <pause|resume|cancel|restart>" in missing_action
+    assert "Usage: /canon control <run-id> <pause|resume|cancel|restart>" in phase_like
+    assert "--checkpoint-id <checkpoint-id>" in missing_checkpoint
+
+
 @pytest.mark.asyncio
 async def test_gateway_local_launch_request_accepts_request_json_only_and_preserves_request_authority(
     monkeypatch,
@@ -1765,6 +1892,117 @@ async def test_gateway_launch_watcher_recovers_stale_processing_request_after_re
     await runner._canon_gateway_launch_watcher(interval=0.01)
 
     assert processed == [processing_path]
+
+
+@pytest.mark.asyncio
+async def test_canon_gateway_launch_watcher_continues_after_scheduling_long_request(monkeypatch, tmp_path: Path):
+    """Watcher ticks must keep claiming queued requests while one launch is still running.
+
+    pre: the first claimed request stays in-flight long enough for at least one more watcher scan.
+    post: the watcher schedules the first request without awaiting it inline, then claims/schedules the
+          second pending request before the first finishes.
+    raises: AssertionError while the watcher blocks the queue behind one long request.
+    """
+
+    import asyncio
+    import gateway.run as gateway_run
+    import tools.canon_gateway_launch as launch_tool
+
+    runner = _make_runner()
+    runner._running = True
+    runner._canon_gateway_launch_active_processing_paths = set()
+    runner._canon_gateway_launch_active_request_ids = set()
+    runner._canon_gateway_launch_tasks = set()
+    requests_dir = tmp_path / "requests"
+    requests_dir.mkdir()
+    first_request = requests_dir / "cg-launch-first.request.json"
+    first_request.write_text("{}", encoding="utf-8")
+    second_request = requests_dir / "cg-launch-second.request.json"
+    second_request.write_text("{}", encoding="utf-8")
+
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+    processed: list[Path] = []
+    original_sleep = asyncio.sleep
+
+    async def _fake_process(path: Path) -> None:
+        processed.append(path)
+        if path.name.startswith("cg-launch-first"):
+            first_started.set()
+            await release_first.wait()
+            return
+        second_started.set()
+        runner._running = False
+
+    async def _fast_sleep(_delay: float) -> None:
+        await original_sleep(0)
+
+    monkeypatch.setattr(launch_tool, "_requests_dir", lambda: requests_dir)
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _fast_sleep)
+    runner._process_canon_gateway_launch_request = _fake_process
+
+    watcher_task = asyncio.create_task(runner._canon_gateway_launch_watcher(interval=0.01))
+    try:
+        await asyncio.wait_for(first_started.wait(), timeout=0.2)
+        await asyncio.wait_for(second_started.wait(), timeout=0.2)
+    finally:
+        release_first.set()
+        runner._running = False
+        await asyncio.wait_for(watcher_task, timeout=0.2)
+
+    assert processed[:2] == [
+        requests_dir / "cg-launch-first.request.processing.json",
+        requests_dir / "cg-launch-second.request.processing.json",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_canon_gateway_launch_watcher_does_not_reprocess_active_processing_file(monkeypatch, tmp_path: Path):
+    """Watcher stale recovery must skip processing files already owned by this gateway process.
+
+    pre: one claimed processing file looks stale on disk but its path/request id is already tracked as active.
+    post: stale recovery ignores that file instead of launching a duplicate in-process execution.
+    raises: AssertionError while fresh active processing files are treated as stale orphaned work.
+    """
+
+    import asyncio
+    import gateway.run as gateway_run
+    import tools.canon_gateway_launch as launch_tool
+
+    runner = _make_runner()
+    runner._running = True
+    requests_dir = tmp_path / "requests"
+    requests_dir.mkdir()
+    processing_path = requests_dir / "cg-launch-active.request.processing.json"
+    processing_path.write_text(json.dumps({"requestId": "cg-launch-active"}), encoding="utf-8")
+    stale_time = time.time() - 600
+    os.utime(processing_path, (stale_time, stale_time))
+    runner._canon_gateway_launch_active_processing_paths = {processing_path}
+    runner._canon_gateway_launch_active_request_ids = {"cg-launch-active"}
+    runner._canon_gateway_launch_tasks = set()
+
+    processed: list[Path] = []
+    original_sleep = asyncio.sleep
+    sleep_calls = 0
+
+    async def _fake_process(path: Path) -> None:
+        processed.append(path)
+
+    async def _fast_sleep(_delay: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls > 3:
+            runner._running = False
+        await original_sleep(0)
+
+    monkeypatch.setattr(launch_tool, "_requests_dir", lambda: requests_dir)
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _fast_sleep)
+    runner._process_canon_gateway_launch_request = _fake_process
+
+    await runner._canon_gateway_launch_watcher(interval=0.01)
+
+    assert processed == []
 
 
 def test_gateway_local_launch_processing_stale_threshold_respects_timeout_plus_grace(tmp_path: Path):

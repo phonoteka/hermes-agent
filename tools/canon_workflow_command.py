@@ -19,6 +19,33 @@ from hermes_constants import get_hermes_home
 from tools.canon_workflow_observe import to_markdown as _observe_to_markdown
 
 
+_CANON_TOP_LEVEL_USAGE = (
+    "Usage: /canon <run|control|list|full|timeline|artifacts|events|report|latest|inspect> ..."
+)
+_CANON_CONTROL_USAGE = (
+    "Usage: /canon control <run-id> <pause|resume|cancel|restart> "
+    "[--reason TEXT] | /canon control <run-id> restart --checkpoint-id <checkpoint-id> [--reason TEXT]."
+)
+_PHASE_LIKE_CONTROL_ARGS = frozenset(
+    {
+        "phaseid",
+        "nodeid",
+        "start_phase",
+        "resume_phase",
+        "cancel_phase",
+        "inspect_phase",
+        "--phase-id",
+        "--node-id",
+        "--start-phase",
+        "--resume-phase",
+        "--cancel-phase",
+        "--inspect-phase",
+        "--phaseid",
+        "--nodeid",
+    }
+)
+
+
 def handle_gateway_canon_command(event: Any) -> str:
     """Parse `/canon` command text and return a deterministic fail-closed response.
 
@@ -33,7 +60,7 @@ def handle_gateway_canon_command(event: Any) -> str:
     text = (getattr(event, "text", "") or "").strip()
     args = text[len("/canon") :].strip() if text.startswith("/canon") else text
     if not args:
-        return "Usage: /canon <run|list|full|timeline|artifacts|events|report|control|latest|inspect> ..."
+        return _CANON_TOP_LEVEL_USAGE
 
     subcommand = _extract_canon_subcommand(args)
     source = getattr(event, "source", None)
@@ -48,7 +75,9 @@ def handle_gateway_canon_command(event: Any) -> str:
         return _handle_inspect(run_id=tokens[1].strip(), source=source)
     if subcommand == "list":
         return _handle_list(source=source)
-    if subcommand in {"full", "timeline", "artifacts", "events", "report", "control"}:
+    if subcommand == "control":
+        return _handle_control_subcommand(tokens=tokens, source=source)
+    if subcommand in {"full", "timeline", "artifacts", "events", "report"}:
         if len(tokens) < 2 or not tokens[1].strip():
             return f"`/canon {subcommand}` failed closed: missing run id. Usage: /canon {subcommand} <run-id>."
         run_id = tokens[1].strip()
@@ -68,7 +97,7 @@ def handle_gateway_canon_command(event: Any) -> str:
                 limit=limit,
             )
         return _handle_observability_subcommand(subcommand=subcommand, run_id=run_id, source=source)
-    return "Unsupported /canon subcommand. Usage: /canon <run|list|full|timeline|artifacts|events|report|control|latest|inspect> ..."
+    return f"Unsupported /canon subcommand. {_CANON_TOP_LEVEL_USAGE}"
 
 
 async def handle_gateway_canon_command_live(
@@ -88,7 +117,7 @@ async def handle_gateway_canon_command_live(
     text = (getattr(event, "text", "") or "").strip()
     args = text[len("/canon") :].strip() if text.startswith("/canon") else text
     if not args:
-        return "Usage: /canon <run|list|full|timeline|artifacts|events|report|control|latest|inspect> ..."
+        return _CANON_TOP_LEVEL_USAGE
 
     if _extract_canon_subcommand(args) != "run":
         return handle_gateway_canon_command(event)
@@ -778,6 +807,7 @@ class _GatewayHermesScopedPhaseSession:
         if self._phase_tool_use_disabled():
             toolsets = []
             use_config_toolsets = False
+        accepted_payload_holder: dict[str, dict[str, Any]] = {}
         response = _run_agent(
             prompt,
             model=model,
@@ -787,8 +817,16 @@ class _GatewayHermesScopedPhaseSession:
             profile=hermes_profile_id,
             skills=skills,
             workdir=workdir,
+            final_response_validator=self._build_final_response_validator(
+                envelope=envelope,
+                accepted_payload_sink=lambda payload: accepted_payload_holder.__setitem__("payload", payload),
+            ),
         )
-        output = self._parse_phase_output_or_raw(response)
+        output = (
+            accepted_payload_holder["payload"]
+            if "payload" in accepted_payload_holder
+            else self._parse_phase_output_or_raw(response)
+        )
         artifact_refs = self._persist_solution_modeling_handoff(output, envelope=envelope)
         result: dict[str, Any] = {"status": "succeeded", "output": output}
         if artifact_refs:
@@ -798,6 +836,52 @@ class _GatewayHermesScopedPhaseSession:
         result["agentCheckpointRef"] = self._agent_checkpoint_ref(envelope)
         result["eventCursorRefs"] = self._event_cursor_refs(envelope, agent_session_ref=agent_session_ref)
         return result
+
+    def _build_final_response_validator(
+        self,
+        *,
+        envelope: dict[str, Any],
+        accepted_payload_sink: Callable[[dict[str, Any]], None],
+    ) -> Callable[[str, dict[str, Any]], dict[str, Any]]:
+        """Return one Canon-owned final-response validator callback for this phase.
+
+        pre: envelope carries Canon outputSchema authority for the active phase.
+        post: accepted payloads are recorded through accepted_payload_sink so adapter success returns
+              the Canon-validated payload instead of a raw-text fallback path.
+        raises: RuntimeError when outputSchema authority is malformed.
+        """
+
+        output_schema_authority = envelope.get("outputSchema")
+        if not isinstance(output_schema_authority, dict):
+            raise RuntimeError("Canon phase envelope requires object outputSchema authority")
+        output_schema = output_schema_authority.get("schema")
+        if not isinstance(output_schema, dict):
+            raise RuntimeError("Canon phase envelope outputSchema requires object schema authority")
+
+        from canon.agent_final_output_validation import validate_agent_final_response_candidate
+        from canon.phase_execution import PhaseOutputValidationError
+
+        def _validator(candidate_text: str, metadata: dict[str, Any]) -> dict[str, Any]:
+            source_attempt = metadata.get("validation_attempt", 1)
+            payload: dict[str, Any]
+            try:
+                payload = validate_agent_final_response_candidate(
+                    candidate_text,
+                    envelope=envelope,
+                    output_schema=output_schema,
+                    source_attempt=int(source_attempt),
+                )
+            except PhaseOutputValidationError as exc:
+                return {
+                    "accepted": False,
+                    "retryable": True,
+                    "feedback": exc.feedback,
+                    "feedback_message": json.dumps(exc.feedback, sort_keys=True),
+                }
+            accepted_payload_sink(payload)
+            return {"accepted": True}
+
+        return _validator
 
     def _parse_phase_output_or_raw(self, response_text: Any) -> dict[str, Any] | str:
         """Return a parsed object result when possible, else preserve the raw model payload.
@@ -1460,6 +1544,130 @@ def _handle_list(*, source: Any) -> str:
     return _render_list_surface(listing=listing)
 
 
+def _handle_control_subcommand(*, tokens: list[str], source: Any) -> str:
+    """Execute one workflow-level `/canon control` action through Canon facade authority.
+
+    pre: tokens is the shlex-split `/canon` tail beginning with `control`.
+    post: accepts only workflow-level pause/resume/cancel/restart syntax and never reuses read-only
+          observability rendering.
+    raises: none.
+    """
+
+    try:
+        parsed = _parse_control_command(tokens)
+        payload = {"origin": _gateway_origin(source)}
+        action = parsed["action"]
+        if action == "restart":
+            payload["checkpointId"] = parsed["checkpoint_id"]
+        else:
+            payload["runId"] = parsed["run_id"]
+        if parsed.get("reason") is not None and action != "restart":
+            payload["reason"] = parsed["reason"]
+
+        from integrations.hermes.canon_hermes import workflow_facade
+
+        if action == "pause":
+            result = workflow_facade.pause_workflow(payload)
+        elif action == "resume":
+            result = workflow_facade.resume_workflow(payload)
+        elif action == "cancel":
+            result = workflow_facade.cancel_workflow(payload)
+        else:
+            result = workflow_facade.restart_workflow_from_checkpoint(payload)
+        return _render_control_result(action=action, result=result, payload=payload)
+    except ValueError as exc:
+        return f"`/canon control` failed closed: {exc}. {_CANON_CONTROL_USAGE}"
+    except Exception as exc:
+        run_label = str(tokens[1]).strip() if len(tokens) > 1 else "<run-id>"
+        return f"`/canon control {run_label}` failed closed: {exc}"
+
+
+def _parse_control_command(tokens: list[str]) -> dict[str, str | None]:
+    """Parse workflow-level `/canon control` syntax and reject phase-like authority.
+
+    pre: tokens is the shlex-split `/canon` tail beginning with `control`.
+    post: returns action plus authoritative run/checkpoint selectors and optional reason.
+    raises: ValueError when syntax is missing, unsupported, or phase-like.
+    """
+
+    if len(tokens) < 2 or not str(tokens[1] or "").strip():
+        raise ValueError("missing run id")
+    run_id = str(tokens[1]).strip()
+    if len(tokens) < 3 or not str(tokens[2] or "").strip():
+        raise ValueError("missing control action")
+    action = str(tokens[2]).strip().lower()
+    if action in _PHASE_LIKE_CONTROL_ARGS:
+        raise ValueError(f"phase-level control is forbidden: {action}")
+    if action not in {"pause", "resume", "cancel", "restart"}:
+        raise ValueError(f"unsupported control action: {action}")
+
+    reason: str | None = None
+    checkpoint_id: str | None = None
+    index = 3
+    while index < len(tokens):
+        token = str(tokens[index]).strip()
+        normalized_token = token.lower()
+        if normalized_token in _PHASE_LIKE_CONTROL_ARGS:
+            raise ValueError(f"phase-level control is forbidden: {token}")
+        if token == "--reason":
+            if reason is not None:
+                raise ValueError("duplicate --reason")
+            if index + 1 >= len(tokens):
+                raise ValueError("--reason requires text")
+            reason = _require_non_empty_text(tokens[index + 1], "reason")
+            index += 2
+            continue
+        if token == "--checkpoint-id":
+            if action != "restart":
+                raise ValueError("--checkpoint-id is allowed only for restart")
+            if checkpoint_id is not None:
+                raise ValueError("duplicate --checkpoint-id")
+            if index + 1 >= len(tokens):
+                raise ValueError("--checkpoint-id requires a value")
+            checkpoint_id = _require_non_empty_text(tokens[index + 1], "checkpoint_id")
+            index += 2
+            continue
+        raise ValueError(f"unsupported control argument: {token}")
+
+    if action == "restart":
+        if checkpoint_id is None:
+            raise ValueError("restart requires --checkpoint-id <checkpoint-id>")
+        return {"action": action, "run_id": run_id, "checkpoint_id": checkpoint_id, "reason": reason}
+    if checkpoint_id is not None:
+        raise ValueError("checkpoint authority is allowed only for restart")
+    return {"action": action, "run_id": run_id, "checkpoint_id": None, "reason": reason}
+
+
+def _render_control_result(*, action: str, result: Any, payload: dict[str, Any]) -> str:
+    """Render one workflow control result as concise operator markdown.
+
+    pre: payload is the forwarded facade payload and result is any facade return value.
+    post: output names action, durable identity, eventKind, and status without read-only observability framing.
+    raises: none.
+    """
+
+    mapping = result if isinstance(result, Mapping) else {}
+    run_id = _to_redacted_value(mapping.get("runId") or payload.get("runId") or "-", key="runId")
+    checkpoint_id = _to_redacted_value(
+        mapping.get("checkpointId") or payload.get("checkpointId") or "-",
+        key="checkpointId",
+    )
+    status = _to_redacted_value(mapping.get("status") or mapping.get("result") or "unknown", key="status")
+    event_kind = _to_redacted_value(mapping.get("eventKind") or mapping.get("event_kind") or "-", key="eventKind")
+    lines = [
+        "### Контроль workflow",
+        f"- Действие: `{action}`",
+        f"- Run ID: `{run_id}`",
+        f"- Checkpoint ID: `{checkpoint_id}`" if action == "restart" or checkpoint_id != "-" else None,
+        f"- eventKind: `{event_kind}`",
+        f"- Статус: `{status}`",
+    ]
+    reason = payload.get("reason")
+    if reason is not None:
+        lines.append(f"- Причина: `{_to_redacted_value(reason, key='reason')}`")
+    return "\n".join(line for line in lines if line is not None)
+
+
 def _handle_observability_subcommand(
     *,
     subcommand: str,
@@ -1470,7 +1678,7 @@ def _handle_observability_subcommand(
 ) -> str:
     """Handle one run-scoped observability subcommand.
 
-    pre: subcommand belongs to list/full/timeline/artifacts/events/report/control and run_id is non-empty.
+    pre: subcommand belongs to list/full/timeline/artifacts/events/report and run_id is non-empty.
     post: returns Russian markdown without raw JSON and fail-closes when lookup fails.
     raises: none.
     """
@@ -1670,7 +1878,6 @@ def _render_observability_surface(*, subcommand: str, run_id: str, summary: dict
         "artifacts": "Артефакты",
         "events": "События",
         "report": "Отчет",
-        "control": "Контроль",
     }
     surface = surface_map.get(subcommand)
     if not surface:
@@ -1693,7 +1900,6 @@ def _render_observability_surface(*, subcommand: str, run_id: str, summary: dict
             "- artifacts",
             "- events",
             "- report",
-            "- control",
         ]
         lines.extend(values)
         return "\n".join(lines)

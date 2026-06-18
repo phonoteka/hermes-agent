@@ -69,7 +69,7 @@ def test_canon_observability_subcommands_produce_markdown_without_raw_json(monke
         },
     )
 
-    for subcommand in ["full", "timeline", "artifacts", "events", "report", "control"]:
+    for subcommand in ["full", "timeline", "artifacts", "events", "report"]:
         result = handle_gateway_canon_command(_make_event(f"/canon {subcommand} run-obs-1"))
 
         assert "unsupported" not in result.lower()
