@@ -15,7 +15,7 @@ import sys
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
@@ -169,6 +169,8 @@ def run_oneshot(
     usage_file: Optional[str] = None,
     resume: Optional[str] = None,
     reasoning: object = None,
+    final_response_validator: Optional[Callable[[str, dict[str, Any]], Any]] = None,
+    max_final_response_validation_retries: int = 2,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -225,6 +227,8 @@ def run_oneshot(
                 skills=skills,
                 resume=resume,
                 reasoning=reasoning,
+                final_response_validator=final_response_validator,
+                max_final_response_validation_retries=max_final_response_validation_retries,
             )
         except BaseException as exc:  # noqa: BLE001
             # Capture anything escaping the agent (OSError from prompt_toolkit on a non-TTY pipe,
@@ -418,6 +422,8 @@ def _run_agent(
     skills: object = None,
     resume: Optional[str] = None,
     reasoning: object = None,
+    final_response_validator: Optional[Callable[[str, dict[str, Any]], Any]] = None,
+    max_final_response_validation_retries: int = 2,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn, run one conversation, and return
     ``(final_response, run_result)``. Imports are local to keep CLI startup cheap."""
@@ -500,7 +506,12 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt, conversation_history=conversation_history or None)
+        result = agent.run_conversation(
+            prompt,
+            conversation_history=conversation_history or None,
+            final_response_validator=final_response_validator,
+            max_final_response_validation_retries=max_final_response_validation_retries,
+        )
         return (result.get("final_response") or "", result)
     finally:
         _close_agent(agent, session_db)

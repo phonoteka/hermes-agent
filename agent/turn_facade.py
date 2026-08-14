@@ -8,7 +8,7 @@ MRO unchanged.
 import logging
 import uuid
 from contextlib import suppress
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.lazy_forward import forward as _forward
 
@@ -28,6 +28,8 @@ class TurnFacadeMixin:
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
         turn_author: Optional[Dict[str, Any]] = None,
         relay_metadata: Optional[Dict[str, Any]] = None,
+        final_response_validator: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+        max_final_response_validation_retries: int = 2,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
@@ -137,6 +139,8 @@ class TurnFacadeMixin:
                         persist_user_display_metadata=persist_user_display_metadata,
                         persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
                         turn_author=turn_author,
+                        final_response_validator=final_response_validator,
+                        max_final_response_validation_retries=max_final_response_validation_retries,
                     )
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
@@ -199,8 +203,22 @@ class TurnFacadeMixin:
                     with suppress(Exception):
                         _review_queue.note_turn_finished()
 
-    def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+    def chat(
+        self,
+        message: str,
+        stream_callback: Optional[callable] = None,
+        final_response_validator: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+        max_final_response_validation_retries: int = 2,
+    ) -> str:
         """Final response string of one turn; ``stream_callback`` receives each text delta."""
-        return self.run_conversation(message, stream_callback=stream_callback)["final_response"]
+        result = self.run_conversation(
+            message,
+            stream_callback=stream_callback,
+            final_response_validator=final_response_validator,
+            max_final_response_validation_retries=max_final_response_validation_retries,
+        )
+        if result.get("final_response_validation_failed"):
+            raise RuntimeError(result.get("error") or "Agent conversation failed")
+        return result["final_response"]
 
     _run_codex_app_server_turn = _forward("agent.codex_runtime", "run_codex_app_server_turn")

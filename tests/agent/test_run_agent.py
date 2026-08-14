@@ -213,6 +213,262 @@ def test_malformed_memory_config_still_builds_default_store():
     assert agent._memory_store.user_profile_enabled is True
 
 
+def _make_output_validation_agent(monkeypatch, normalized_messages, request_messages):
+    """Build a deterministic agent double for the generic final-output seam."""
+    with patch("agent.process_bootstrap.OpenAI") as mock_openai, patch("run_agent.ContextCompressor") as mock_comp:
+        mock_openai.return_value = MagicMock()
+        compressor = MagicMock()
+        compressor.context_length = 100000
+        compressor.threshold_tokens = 50000
+        compressor.protect_first_n = 2
+        compressor.protect_last_n = 2
+        compressor.should_compress.return_value = False
+        compressor.last_prompt_tokens = 0
+        mock_comp.return_value = compressor
+        agent = AIAgent(
+            model="fake-model",
+            provider="openrouter",
+            api_key="[REDACTED]",
+            base_url="https://example.com/v1",
+            enabled_toolsets=[],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=None,
+        )
+
+    class _Transport:
+        def build_kwargs(self, *, model, messages, tools=None, max_tokens=None, **kwargs):
+            request_messages.append(json.loads(json.dumps(messages)))
+            return {"model": model, "messages": messages, "tools": tools}
+
+        def validate_response(self, response):
+            return True
+
+        def normalize_response(self, response, **kwargs):
+            return response.normalized_message
+
+    responses = [
+        SimpleNamespace(
+            choices=[object()],
+            usage=None,
+            model=agent.model,
+            normalized_message=message,
+        )
+        for message in normalized_messages
+    ]
+    transport = _Transport()
+    monkeypatch.setattr(agent, "_get_transport", lambda: transport)
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda *args, **kwargs: responses.pop(0))
+    monkeypatch.setattr(agent, "_ensure_db_session", lambda: None)
+    monkeypatch.setattr(agent, "_cleanup_dead_connections", lambda: False)
+    monkeypatch.setattr(agent, "_persist_session", lambda messages, history: None)
+    monkeypatch.setattr(agent, "_emit_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_touch_activity", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_sync_external_memory_for_turn", lambda **kwargs: None)
+    monkeypatch.setattr(agent, "_safe_print", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_vprint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_buffer_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_clear_status_buffer", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_try_activate_fallback", lambda *args, **kwargs: False)
+    return agent
+
+
+def test_generic_output_validation_retries_in_same_conversation(monkeypatch):
+    request_messages = []
+    agent = _make_output_validation_agent(
+        monkeypatch,
+        [
+            SimpleNamespace(content="rejected", tool_calls=None, finish_reason="stop"),
+            SimpleNamespace(content="accepted", tool_calls=None, finish_reason="stop"),
+        ],
+        request_messages,
+    )
+    attempts = []
+
+    def validator(candidate, metadata):
+        attempts.append((candidate, metadata["validation_attempt"], metadata["session_id"]))
+        metadata["messages"][0]["_validator_mutation_probe"] = True
+        return {
+            "accepted": candidate == "accepted",
+            "retryable": True,
+            "feedback": {"reason": "correct the output"},
+            "feedback_message": "Fix the answer.",
+        }
+
+    result = agent.run_conversation(
+        "answer",
+        final_response_validator=validator,
+        max_final_response_validation_retries=1,
+    )
+
+    assert result["final_response"] == "accepted"
+    assert result["failed"] is False
+    assert len(attempts) == 2
+    assert attempts[0][0:2] == ("rejected", 1)
+    assert attempts[1][0:2] == ("accepted", 2)
+    assert attempts[0][2] == attempts[1][2]
+    assert attempts[0][2]
+    assert all(not item.get("_validator_mutation_probe") for item in result["messages"])
+    assert len(request_messages) == 2
+    second_request = request_messages[1]
+    assert any(item["role"] == "assistant" and item["content"] == "rejected" for item in second_request)
+    assert any(item["role"] == "user" and item["content"] == "Fix the answer." for item in second_request)
+    assert second_request[-1]["role"] == "user"
+
+
+def test_generic_output_validation_exhaustion_is_fail_closed(monkeypatch):
+    request_messages = []
+    agent = _make_output_validation_agent(
+        monkeypatch,
+        [SimpleNamespace(content="rejected", tool_calls=None, finish_reason="stop")],
+        request_messages,
+    )
+    result = agent.run_conversation(
+        "answer",
+        final_response_validator=lambda *_: {
+            "accepted": False,
+            "retryable": True,
+            "feedback": {"reason": "invalid"},
+            "feedback_message": "Fix the answer.",
+        },
+        max_final_response_validation_retries=0,
+    )
+
+    assert result["final_response"] is None
+    assert result["failed"] is True
+    assert result["failure"] == {
+        "kind": "output-validation-error",
+        "operation": "final-response-validation",
+        "retryable": True,
+        "message": "Fix the answer.",
+        "validationFeedback": {"reason": "invalid"},
+    }
+    assert len(request_messages) == 1
+
+
+def test_generic_output_validation_exception_is_fail_closed(monkeypatch):
+    agent = _make_output_validation_agent(
+        monkeypatch,
+        [SimpleNamespace(content="candidate", tool_calls=None, finish_reason="stop")],
+        [],
+    )
+    result = agent.run_conversation(
+        "answer",
+        final_response_validator=lambda *_: (_ for _ in ()).throw(RuntimeError("validator boom")),
+    )
+
+    assert result["final_response"] is None
+    assert result["failed"] is True
+    assert result["failure"] == {
+        "kind": "host-validation-error",
+        "operation": "final-response-validation",
+        "retryable": False,
+        "message": "final_response_validator failed",
+    }
+
+
+def test_generic_output_validation_rejects_non_boolean_control():
+    from agent.conversation_loop import _normalize_final_response_validation_result
+
+    with pytest.raises(TypeError, match="must be boolean"):
+        _normalize_final_response_validation_result({"accepted": "false"})
+
+
+def test_chat_forwards_generic_output_validator(monkeypatch):
+    agent = AIAgent.__new__(AIAgent)
+    captured = {}
+
+    def fake_run_conversation(message, **kwargs):
+        captured["message"] = message
+        captured.update(kwargs)
+        return {"failed": False, "final_response": "accepted"}
+
+    monkeypatch.setattr(agent, "run_conversation", fake_run_conversation)
+    validator = object()
+
+    assert agent.chat(
+        "hello",
+        final_response_validator=validator,
+        max_final_response_validation_retries=4,
+    ) == "accepted"
+    assert captured["message"] == "hello"
+    assert captured["final_response_validator"] is validator
+    assert captured["max_final_response_validation_retries"] == 4
+
+
+def test_generic_output_validation_rejects_invalid_feedback(monkeypatch):
+    agent = _make_output_validation_agent(
+        monkeypatch,
+        [SimpleNamespace(content="candidate", tool_calls=None, finish_reason="stop")],
+        [],
+    )
+
+    result = agent.run_conversation(
+        "answer",
+        final_response_validator=lambda *_: {
+            "accepted": False,
+            "retryable": False,
+            "feedback": {1: "non-string key"},
+            "feedback_message": "Fix the answer.",
+        },
+    )
+
+    assert result["final_response"] is None
+    assert result["failed"] is True
+    assert result["failure"] == {
+        "kind": "host-validation-error",
+        "operation": "final-response-validation",
+        "retryable": False,
+        "message": "final_response_validator returned invalid validationFeedback",
+    }
+
+
+def test_generic_output_validation_rejects_negative_retry_budget(monkeypatch):
+    agent = _make_output_validation_agent(monkeypatch, [], [])
+
+    with pytest.raises(ValueError, match="greater than or equal to zero"):
+        agent.run_conversation(
+            "answer",
+            final_response_validator=lambda *_: True,
+            max_final_response_validation_retries=-1,
+        )
+
+
+def test_chat_raises_on_generic_output_validation_failure(monkeypatch):
+    agent = AIAgent.__new__(AIAgent)
+    validator = object()
+
+    monkeypatch.setattr(
+        agent,
+        "run_conversation",
+        lambda *_args, **_kwargs: {
+            "failed": True,
+            "final_response_validation_failed": True,
+            "final_response": None,
+            "error": "Final response validator rejected the candidate",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="validator rejected"):
+        agent.chat("hello", final_response_validator=validator)
+
+
+def test_generic_output_validation_noop_control(monkeypatch):
+    request_messages = []
+    agent = _make_output_validation_agent(
+        monkeypatch,
+        [SimpleNamespace(content="unchanged", tool_calls=None, finish_reason="stop")],
+        request_messages,
+    )
+
+    result = agent.run_conversation("answer")
+
+    assert result["final_response"] == "unchanged"
+    assert result["failed"] is False
+    assert len(request_messages) == 1
+
+
 @pytest.fixture()
 def agent_with_memory_tool():
     """Agent whose valid_tool_names includes 'memory'."""

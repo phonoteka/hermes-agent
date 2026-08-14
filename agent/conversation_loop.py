@@ -13,7 +13,9 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+from agent.turn_final_response_validation import _normalize_final_response_validation_result
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
@@ -1301,6 +1303,9 @@ class _LoopState:
     # a consecutive-ineffective-attempt backstop, rearmed only after a provider response
     # reports a prompt below threshold.
     max_compression_attempts: Any
+    final_response_validator: Any = None
+    max_final_response_validation_retries: int = 2
+    final_response_validation_retries: int = 0
     api_call_count: int = 0
     final_response: Any = None
     interrupted: bool = False
@@ -1434,6 +1439,8 @@ def _run_conversation_turn(
     persist_user_platform_id: Optional[str] = None,
     turn_author: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    final_response_validator: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    max_final_response_validation_retries: int = 2,
 ) -> Dict[str, Any]:
     """Run a complete conversation with tool calling until completion; returns the result dict.
 
@@ -1500,6 +1507,8 @@ def _run_conversation_turn(
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
+        final_response_validator=final_response_validator,
+        max_final_response_validation_retries=max_final_response_validation_retries,
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
@@ -1584,6 +1593,8 @@ def run_conversation(
     persist_user_platform_id: Optional[str] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_author: Optional[Dict[str, Any]] = None,
+    final_response_validator: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
+    max_final_response_validation_retries: int = 2,
 ) -> Dict[str, Any]:
     """Run one turn (see ``_run_conversation_turn``) and export the current-turn boundary.
 
@@ -1592,6 +1603,13 @@ def run_conversation(
     ``{turn_id, current_turn_user_idx}`` pair is stamped beside the exact ``messages`` it
     addresses, after every history rewrite including post-turn micro-compaction.
     """
+    if isinstance(max_final_response_validation_retries, bool) or not isinstance(
+        max_final_response_validation_retries, int
+    ):
+        raise TypeError("max_final_response_validation_retries must be a non-boolean integer")
+    if max_final_response_validation_retries < 0:
+        raise ValueError("max_final_response_validation_retries must be greater than or equal to zero")
+
     from agent.turn_context import export_current_turn_boundary
 
     result = _run_conversation_turn(
@@ -1608,6 +1626,8 @@ def run_conversation(
         persist_user_platform_id=persist_user_platform_id,
         moa_config=moa_config,
         turn_author=turn_author,
+        final_response_validator=final_response_validator,
+        max_final_response_validation_retries=max_final_response_validation_retries,
     )
     return export_current_turn_boundary(agent, result, user_message)
 

@@ -14,6 +14,13 @@ from typing import Any, Dict, Optional
 from agent.message_metadata import append_message
 from agent.turn_empty_response import recover_empty_response
 from agent.turn_stop_gates import apply_stop_gates
+from agent.turn_final_response_validation import (
+    _DEFAULT_FINAL_RESPONSE_VALIDATION_FEEDBACK,
+    _bounded_failure_text,
+    _detach_validation_feedback,
+    validate_candidate,
+    validation_metadata,
+)
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -38,6 +45,7 @@ class FinalResponseVerdict:
     codex_ack_continuations: Any
     truncated_response_parts: Any
     length_continue_retries: Any
+    final_response_validation_retries: int
     _pending_verification_response: Any
     _pending_verification_response_previewed: Any
     result: Optional[Dict[str, Any]] = None
@@ -46,9 +54,11 @@ class FinalResponseVerdict:
 def finish_text_response(
     agent: Any, *, assistant_message: Any, response: Any, finish_reason: Any, messages: Any,
     api_messages: Any, conversation_history: Any, api_call_count: Any, user_message: Any,
-    active_system_prompt: Any, final_response: Any, _turn_exit_reason: Any,
+    effective_task_id: Any, active_system_prompt: Any, final_response: Any, _turn_exit_reason: Any,
     _preflight_compression_blocked: Any, codex_ack_continuations: Any,
     truncated_response_parts: Any, length_continue_retries: Any,
+    final_response_validator: Any, max_final_response_validation_retries: int,
+    final_response_validation_retries: int,
     _pending_verification_response: Any, _pending_verification_response_previewed: Any,
 ) -> FinalResponseVerdict:
     """Finish (or defer) a text-only assistant response in the original guard order. Every
@@ -67,6 +77,7 @@ def finish_text_response(
             codex_ack_continuations=codex_ack_continuations,
             truncated_response_parts=truncated_response_parts,
             length_continue_retries=length_continue_retries,
+            final_response_validation_retries=final_response_validation_retries,
             _pending_verification_response=_pending_verification_response,
             _pending_verification_response_previewed=_pending_verification_response_previewed,
             result=result,
@@ -242,6 +253,113 @@ def finish_text_response(
     if _sg.continue_turn:
         final_response = None
         return _verdict("continue")
+
+    if final_response_validator is not None:
+        # Validate only after all built-in stop gates accept the candidate. The validator
+        # receives a detached snapshot so host code cannot mutate the live transcript.
+        final_msg["content"] = final_response
+        metadata = validation_metadata(
+            messages,
+            api_call_count=api_call_count,
+            finish_reason=finish_reason,
+            agent=agent,
+            effective_task_id=effective_task_id,
+            validation_attempt=final_response_validation_retries + 1,
+        )
+        # The loop stores the effective task id on the agent for phase helpers; callers
+        # without that attribute still get the stable empty value expected by the contract.
+        try:
+            validation_control = validate_candidate(final_response_validator, final_response, metadata)
+        except Exception:
+            result = {
+                "final_response": None,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "failed": True,
+                "final_response_validation_failed": True,
+                "error": "final_response_validator failed",
+                "failure": {
+                    "kind": "host-validation-error",
+                    "operation": "final-response-validation",
+                    "retryable": False,
+                    "message": "final_response_validator failed",
+                },
+            }
+            agent._persist_session(messages, conversation_history)
+            return _verdict("return", result)
+
+        if not validation_control["accepted"]:
+            validation_feedback = None
+            if validation_control.get("feedback") is not None:
+                try:
+                    validation_feedback = _detach_validation_feedback(validation_control["feedback"])
+                except (TypeError, ValueError, RecursionError):
+                    result = {
+                        "final_response": None,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "final_response_validation_failed": True,
+                        "error": "final_response_validator returned invalid validationFeedback",
+                        "failure": {
+                            "kind": "host-validation-error",
+                            "operation": "final-response-validation",
+                            "retryable": False,
+                            "message": "final_response_validator returned invalid validationFeedback",
+                        },
+                    }
+                    agent._persist_session(messages, conversation_history)
+                    return _verdict("return", result)
+
+            feedback_message = _bounded_failure_text(
+                validation_control["feedback_message"] or _DEFAULT_FINAL_RESPONSE_VALIDATION_FEEDBACK
+            )
+            final_msg["_final_response_validation_rejected"] = True
+            final_msg["_final_response_validation_feedback"] = feedback_message
+            append_message(messages, final_msg)
+            can_retry = (
+                validation_control["retryable"]
+                and final_response_validation_retries < max_final_response_validation_retries
+            )
+            if not can_retry:
+                terminal_failure = {
+                    "kind": "output-validation-error" if validation_feedback is not None else "host-validation-error",
+                    "operation": "final-response-validation",
+                    "retryable": bool(validation_control["retryable"]) if validation_feedback is not None else False,
+                    "message": feedback_message,
+                }
+                if validation_feedback is not None:
+                    terminal_failure["validationFeedback"] = validation_feedback
+                result = {
+                    "final_response": None,
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": True,
+                    "final_response_validation_failed": True,
+                    "error": (
+                        "Final response validator rejected the candidate "
+                        f"after {final_response_validation_retries + 1} attempt(s)"
+                    ),
+                    "failure": terminal_failure,
+                }
+                agent._session_messages = messages
+                agent._persist_session(messages, conversation_history)
+                return _verdict("return", result)
+
+            final_response_validation_retries += 1
+            append_message(messages, {
+                "role": "user",
+                "content": feedback_message,
+                "_final_response_validation_feedback": True,
+            })
+            agent._persist_session(messages, conversation_history)
+            final_response = None
+            return _verdict("continue")
+
+        final_response_validation_retries = 0
 
     append_message(messages, final_msg)
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
