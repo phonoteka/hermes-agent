@@ -95,38 +95,30 @@ class SelfHostedBackend(Mem0Backend):
             self._client.close()
 
 
-_DIRECT_OPENAI_PROVIDER = "hermes_openai"
-_DIRECT_OPENAI_CLASS_PATH = "plugins.memory.mem0._openai_llm.DirectOpenAILLM"
-
-
-def _register_direct_openai_provider() -> None:
-    """Register Hermes' OpenAI-only Mem0 LLM provider once per factory."""
-    from mem0.configs.llms.openai import OpenAIConfig
-    from mem0.utils.factory import LlmFactory
-    provider_map = getattr(LlmFactory, "provider_to_class", None)
-    register_provider = getattr(LlmFactory, "register_provider", None)
-    if not isinstance(provider_map, dict) or not callable(register_provider):
-        raise RuntimeError("mem0 LlmFactory does not support the provider registration required for the Hermes OpenAI OSS backend")
-    if provider_map.get(_DIRECT_OPENAI_PROVIDER) != (_DIRECT_OPENAI_CLASS_PATH, OpenAIConfig):
-        register_provider(_DIRECT_OPENAI_PROVIDER, _DIRECT_OPENAI_CLASS_PATH, OpenAIConfig)
-
-
 class OSSBackend(Mem0Backend):
-    """Wraps mem0.Memory for self-hosted (OSS) mode."""
+    """Wraps native mem0.Memory with the injected Hermes LLM adapter."""
 
-    def __init__(self, oss_config: dict):
+    def __init__(self, oss_config: dict, llm=None):
         import os
         from mem0 import Memory
-        from ._oss_providers import EMBEDDER_PROVIDERS, KNOWN_DIMS, LLM_PROVIDERS
+        from .config_schema import build_native_memory_config, register_native_llm
+        from ._oss_providers import KNOWN_DIMS
 
-        def _provider_block(name: str, registry: dict) -> dict:
-            """Copy of oss_config[name] with the legacy ``api_base`` key mapped to the provider's canonical base-URL key."""
-            block = dict(oss_config[name])
+        # Mem0 owns extraction/history/deduplication/embedding/persistence. The
+        # only replaced seam is its LLM object, which delegates to host ctx.llm.
+        register_native_llm()
+
+        def _embedder_block() -> dict:
+            block = dict(oss_config["embedder"])
+            provider = str(block.get("provider") or "").strip().lower()
             provider_config = dict(block.get("config", {}))
             legacy_base = provider_config.pop("api_base", None)
-            canonical_key = registry.get(str(block.get("provider") or "").strip().lower(), {}).get("base_url_key")
-            if legacy_base and canonical_key:
-                provider_config.setdefault(canonical_key, legacy_base)
+            if legacy_base:
+                from ._oss_providers import EMBEDDER_PROVIDERS
+                provider_def = EMBEDDER_PROVIDERS.get(provider, {})
+                canonical_key = provider_def.get("base_url_key")
+                if canonical_key:
+                    provider_config.setdefault(canonical_key, legacy_base)
             block["config"] = provider_config
             return block
 
@@ -140,19 +132,13 @@ class OSSBackend(Mem0Backend):
             vs_config["embedding_model_dims"] = dims
             self._recreate_collection_if_dims_changed(vector_store.get("provider", "qdrant"), vs_config, dims)
         vector_store["config"] = vs_config
-        config = {"vector_store": vector_store, "llm": _provider_block("llm", LLM_PROVIDERS), "embedder": _provider_block("embedder", EMBEDDER_PROVIDERS), "version": "v1.1"}
-        if str(config["llm"].get("provider") or "").strip().lower() == "openai":
-            # mem0 validates LlmConfig.provider before its factory lookup: build the supported OpenAI config, then swap the provider.
-            _register_direct_openai_provider()
-            from mem0.configs.base import MemoryConfig
-            memory_config = MemoryConfig(**config)
-            try:
-                memory_config.llm.provider = _DIRECT_OPENAI_PROVIDER
-            except (AttributeError, TypeError) as exc:
-                raise RuntimeError("mem0 MemoryConfig does not expose a mutable llm.provider for the Hermes OpenAI OSS backend") from exc
-            self._memory = Memory(memory_config)
-        else:
-            self._memory = Memory.from_config(config)
+        config = {
+            "vector_store": vector_store,
+            "embedder": _embedder_block(),
+            "version": "v1.1",
+        }
+        config = build_native_memory_config(config, llm)
+        self._memory = Memory(config)
 
     @staticmethod
     def _recreate_collection_if_dims_changed(provider: str, vs_config: dict, expected_dims: int) -> None:

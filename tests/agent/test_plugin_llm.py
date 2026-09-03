@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -427,9 +428,151 @@ class TestAsyncSurface:
         assert result.content_type == "json"
 
 
-# ---------------------------------------------------------------------------
-# Config-driven trust gate (round-trip via plugins.entries.<id>.llm)
-# ---------------------------------------------------------------------------
+class TestStrictStructuredSurface:
+    _SCHEMA = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "kind": {"type": "string", "enum": ["note"]},
+            "value": {"type": "string"},
+        },
+        "required": ["kind", "value"],
+    }
+
+    @staticmethod
+    def _llm(response_text: str, calls: list, *, async_mode: bool = False):
+        def caller(**kwargs):
+            calls.append(kwargs)
+            return "openai", "gpt-4o", _fake_response(response_text)
+
+        async def async_caller(**kwargs):
+            calls.append(kwargs)
+            return "openai", "gpt-4o", _fake_response(response_text)
+
+        return make_plugin_llm_for_test(
+            plugin_id="strict-plugin",
+            policy=_TrustPolicy(plugin_id="strict-plugin"),
+            sync_caller=None if async_mode else caller,
+            async_caller=async_caller if async_mode else None,
+        )
+
+    def test_strict_valid_json_uses_named_strict_schema_and_one_call(self):
+        calls = []
+        llm = self._llm('{"kind":"note","value":"ok"}', calls)
+
+        result = llm.complete_structured(
+            instructions="Extract a note",
+            input=[PluginLlmTextInput(text="source")],
+            json_schema=self._SCHEMA,
+            schema_name="memory.enriched",
+            strict=True,
+        )
+
+        assert result.parsed == {"kind": "note", "value": "ok"}
+        assert result.content_type == "json"
+        assert len(calls) == 1
+        assert calls[0]["extra_body"] == {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "memory.enriched",
+                    "schema": self._SCHEMA,
+                    "strict": True,
+                },
+            }
+        }
+
+    @pytest.mark.parametrize(
+        "response_text",
+        [
+            "",
+            "not json",
+            '```json\n{"kind":"note","value":"ok"}\n```',
+            'Here is the JSON: {"kind":"note","value":"ok"}',
+            '{"kind":"note","value":"ok","extra":true}',
+            '{"kind":"wrong","value":"ok"}',
+        ],
+        ids=["empty", "malformed", "fenced", "prose", "extra-field", "wrong-enum"],
+    )
+    def test_strict_rejects_invalid_output_after_one_call(self, response_text):
+        calls = []
+        llm = self._llm(response_text, calls)
+
+        with pytest.raises(ValueError, match="strict"):
+            llm.complete_structured(
+                instructions="Extract a note",
+                input=[PluginLlmTextInput(text="source")],
+                json_schema=self._SCHEMA,
+                strict=True,
+            )
+
+        assert len(calls) == 1
+
+    def test_strict_requires_schema_before_call(self):
+        calls = []
+        llm = self._llm('{"kind":"note","value":"ok"}', calls)
+
+        with pytest.raises(ValueError, match="requires json_schema"):
+            llm.complete_structured(
+                instructions="Extract a note",
+                input=[PluginLlmTextInput(text="source")],
+                strict=True,
+            )
+        assert calls == []
+
+    def test_strict_fails_without_jsonschema(self, monkeypatch):
+        calls = []
+        llm = self._llm('{"kind":"note","value":"ok"}', calls)
+        monkeypatch.setitem(sys.modules, "jsonschema", None)
+
+        with pytest.raises(ValueError, match="jsonschema"):
+            llm.complete_structured(
+                instructions="Extract a note",
+                input=[PluginLlmTextInput(text="source")],
+                json_schema=self._SCHEMA,
+                strict=True,
+            )
+        assert len(calls) == 1
+
+    def test_async_strict_matches_sync_contract(self):
+        calls = []
+        llm = self._llm('{"kind":"note","value":"ok"}', calls, async_mode=True)
+
+        async def run():
+            return await llm.acomplete_structured(
+                instructions="Extract a note",
+                input=[PluginLlmTextInput(text="source")],
+                json_schema=self._SCHEMA,
+                schema_name="memory.enriched",
+                strict=True,
+            )
+
+        result = asyncio.run(run())
+        assert result.parsed == {"kind": "note", "value": "ok"}
+        assert len(calls) == 1
+        assert calls[0]["extra_body"]["response_format"]["json_schema"]["strict"] is True
+
+    def test_non_strict_fenced_json_keeps_legacy_behavior(self):
+        calls = []
+        llm = self._llm('```json\n{"kind":"note","value":"ok"}\n```', calls)
+
+        result = llm.complete_structured(
+            instructions="Extract a note",
+            input=[PluginLlmTextInput(text="source")],
+            json_schema=self._SCHEMA,
+        )
+
+        assert result.parsed == {"kind": "note", "value": "ok"}
+        assert len(calls) == 1
+        assert (
+            calls[0]["extra_body"]["response_format"]["json_schema"]["strict"]
+            is False
+        )
+        assert (
+            calls[0]["extra_body"]["response_format"]["json_schema"]["name"]
+            == "plugin_structured_output"
+        )
 
 
 class TestConfigDrivenPolicy:

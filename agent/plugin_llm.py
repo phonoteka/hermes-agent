@@ -313,24 +313,69 @@ def _strip_code_fences(text: str) -> str:
     return match.group(1).strip() if match else text.strip()
 
 
-def _parse_structured_text(*, text: str, json_mode: bool, json_schema: Optional[Any]) -> tuple[Optional[Any], str]:
-    """``(parsed, content_type)``: ``"json"`` when parsing (and schema validation, if
-    given) succeeded, ``"text"`` otherwise. Schema violations raise ``ValueError``;
-    a missing ``jsonschema`` package skips validation with a debug log."""
-    if not (json_mode or json_schema is not None) or not text:
+def _parse_structured_text(
+    *,
+    text: str,
+    json_mode: bool,
+    json_schema: Optional[Any],
+    strict: bool = False,
+) -> tuple[Optional[Any], str]:
+    """Return parsed structured output, with strict mode failing closed.
+
+    The legacy lane remains tolerant of fenced JSON and an absent validator.
+    Strict mode requires a schema, raw JSON (no fences/prose), and Draft
+    2020-12 validation with format checking.
+    """
+    if not (json_mode or json_schema is not None):
         return None, "text"
+    if strict and json_schema is None:
+        raise ValueError("strict complete_structured requires json_schema")
+    if not text or not text.strip():
+        if strict:
+            raise ValueError("strict structured output was empty")
+        return None, "text"
+
     try:
-        parsed = json.loads(_strip_code_fences(text))
+        parsed = json.loads(text if strict else _strip_code_fences(text))
     except (json.JSONDecodeError, ValueError):
+        if strict:
+            raise ValueError("strict structured output was not valid JSON") from None
         return None, "text"
+
     if json_schema is not None:
         try:
             import jsonschema  # type: ignore[import-untyped]
-            jsonschema.validate(parsed, json_schema)
         except ImportError:
+            if strict:
+                raise ValueError(
+                    "strict structured output requires the jsonschema package"
+                ) from None
             logger.debug("jsonschema unavailable; skipping schema validation")
-        except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
-            raise ValueError(f"Plugin LLM structured output did not match schema: {exc.message}") from exc
+        else:
+            try:
+                if strict:
+                    validator = jsonschema.Draft202012Validator(
+                        json_schema,
+                        format_checker=jsonschema.FormatChecker(),
+                    )
+                    validator.validate(parsed)
+                else:
+                    jsonschema.validate(parsed, json_schema)
+            except jsonschema.ValidationError as exc:  # type: ignore[attr-defined]
+                if strict:
+                    raise ValueError(
+                        "strict structured output did not match json_schema"
+                    ) from None
+                raise ValueError(
+                    f"Plugin LLM structured output did not match schema: {exc.message}"
+                ) from exc
+            except jsonschema.SchemaError:  # type: ignore[attr-defined]
+                if strict:
+                    raise ValueError(
+                        "strict structured output received an invalid schema"
+                    ) from None
+                raise
+
     return parsed, "json"
 
 
@@ -400,11 +445,18 @@ def _resolve_attribution(*, provider_override: Optional[str], model_override: Op
     return provider, route_info.get("model") or model_override or _main_config_value("_read_main_model", "default")
 
 
-def _json_response_format(*, json_mode: bool, json_schema: Optional[Any]) -> Optional[Dict[str, Any]]:
+def _json_response_format(
+    *, json_mode: bool, json_schema: Optional[Any], schema_name: Optional[str] = None,
+    strict: bool = False,
+) -> Optional[Dict[str, Any]]:
     """``extra_body.response_format``; falls back to ``json_object`` without a
     schema so schema-blind providers still get a hint."""
     if json_schema is not None:
-        schema = {"name": "plugin_structured_output", "schema": json_schema, "strict": False}
+        schema = {
+            "name": (schema_name if strict else None) or "plugin_structured_output",
+            "schema": json_schema,
+            "strict": strict,
+        }
         return {"response_format": {"type": "json_schema", "json_schema": schema}}
     if json_mode:
         return {"response_format": {"type": "json_object"}}
@@ -413,15 +465,18 @@ def _json_response_format(*, json_mode: bool, json_schema: Optional[Any]) -> Opt
 
 def _structured_spec(
     name: str, instructions: str, input: Sequence[PluginLlmInput], system_prompt: Optional[str],
-    json_mode: bool, json_schema: Optional[Any], schema_name: Optional[str],
+    json_mode: bool, json_schema: Optional[Any], schema_name: Optional[str], strict: bool = False,
 ) -> Dict[str, Any]:
     """Argument check for the structured methods (runs before the trust gate)."""
     if not instructions or not instructions.strip():
         raise ValueError(f"{name} requires non-empty instructions")
     if not input:
         raise ValueError(f"{name} requires at least one input block")
+    if strict and json_schema is None:
+        raise ValueError(f"strict {name} requires json_schema")
     return dict(instructions=instructions, inputs=list(input), system_prompt=system_prompt,
-                json_mode=json_mode, json_schema=json_schema, schema_name=schema_name)
+                json_mode=json_mode, json_schema=json_schema, schema_name=schema_name,
+                strict=strict)
 
 
 class PluginLlm:
@@ -459,7 +514,7 @@ class PluginLlm:
 
     def complete_structured(
         self, *, instructions: str, input: Sequence[PluginLlmInput], json_schema: Optional[Any] = None,
-        json_mode: bool = False, schema_name: Optional[str] = None, system_prompt: Optional[str] = None,
+        json_mode: bool = False, strict: bool = False, schema_name: Optional[str] = None, system_prompt: Optional[str] = None,
         provider: Optional[str] = None, model: Optional[str] = None, temperature: Optional[float] = None,
         max_tokens: Optional[int] = None, timeout: Optional[float] = None, agent_id: Optional[str] = None,
         profile: Optional[str] = None, purpose: Optional[str] = None, task: Optional[str] = None,
@@ -469,7 +524,7 @@ class PluginLlm:
         ``input`` accepts text and image blocks. With ``json_mode=True`` or a
         ``json_schema`` the response is parsed (and validated when the optional
         ``jsonschema`` package is installed) into ``result.parsed``."""
-        spec = _structured_spec("complete_structured", instructions, input, system_prompt, json_mode, json_schema, schema_name)
+        spec = _structured_spec("complete_structured", instructions, input, system_prompt, json_mode, json_schema, schema_name, strict)
         agent, kw = self._gate(provider, model, agent_id, profile, task, None, temperature, max_tokens, timeout, spec)
         return self._finish("complete_structured", agent, kw, self._invoke_sync(kw), purpose, spec)
 
@@ -485,13 +540,13 @@ class PluginLlm:
 
     async def acomplete_structured(
         self, *, instructions: str, input: Sequence[PluginLlmInput], json_schema: Optional[Any] = None,
-        json_mode: bool = False, schema_name: Optional[str] = None, system_prompt: Optional[str] = None,
+        json_mode: bool = False, strict: bool = False, schema_name: Optional[str] = None, system_prompt: Optional[str] = None,
         provider: Optional[str] = None, model: Optional[str] = None, temperature: Optional[float] = None,
         max_tokens: Optional[int] = None, timeout: Optional[float] = None, agent_id: Optional[str] = None,
         profile: Optional[str] = None, purpose: Optional[str] = None, task: Optional[str] = None,
     ) -> PluginLlmStructuredResult:
         """Async sibling of :meth:`complete_structured`."""
-        spec = _structured_spec("acomplete_structured", instructions, input, system_prompt, json_mode, json_schema, schema_name)
+        spec = _structured_spec("acomplete_structured", instructions, input, system_prompt, json_mode, json_schema, schema_name, strict)
         agent, kw = self._gate(provider, model, agent_id, profile, task, None, temperature, max_tokens, timeout, spec)
         return self._finish("acomplete_structured", agent, kw, await self._invoke_async(kw), purpose, spec)
 
@@ -512,8 +567,15 @@ class PluginLlm:
             requested_profile=profile)
         extra_body = None
         if spec is not None:
-            messages = _build_structured_messages(**spec)
-            extra_body = _json_response_format(json_mode=spec["json_mode"], json_schema=spec["json_schema"])
+            messages = _build_structured_messages(
+                instructions=spec["instructions"], inputs=spec["inputs"],
+                system_prompt=spec["system_prompt"], json_mode=spec["json_mode"],
+                json_schema=spec["json_schema"], schema_name=spec["schema_name"],
+            )
+            extra_body = _json_response_format(
+                json_mode=spec["json_mode"], json_schema=spec["json_schema"],
+                schema_name=spec["schema_name"], strict=spec["strict"],
+            )
         return eff_agent, dict(messages=messages, provider_override=eff_provider, model_override=eff_model,
                                profile_override=eff_profile, temperature=temperature, max_tokens=max_tokens,
                                timeout=timeout, extra_body=extra_body, task=eff_task)
@@ -533,7 +595,10 @@ class PluginLlm:
         log_args = [self._plugin_id, real_provider, real_model, eff_task, purpose or ""]
         cls: Any = PluginLlmCompleteResult
         if spec is not None:
-            parsed, content_type = _parse_structured_text(text=text, json_mode=spec["json_mode"], json_schema=spec["json_schema"])
+            parsed, content_type = _parse_structured_text(
+                text=text, json_mode=spec["json_mode"], json_schema=spec["json_schema"],
+                strict=spec["strict"],
+            )
             audit["schema_name"] = spec["schema_name"] or ""
             fields.update(parsed=parsed, content_type=content_type)
             fmt += "content_type=%s "

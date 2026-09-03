@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import plugins.memory as memory_plugins
+from plugins.memory import _ProviderCollector
 
 PROVIDER_SOURCE = """\
 from agent.memory_provider import MemoryProvider
@@ -180,6 +181,20 @@ def test_bare_module_entry_point_has_no_directory(entry_points, tmp_path, monkey
 # ---------------------------------------------------------------------------
 # Registration surface
 # ---------------------------------------------------------------------------
+
+
+def test_provider_collector_exposes_lazy_read_only_llm():
+    collector = _ProviderCollector("lazy-llm")
+
+    assert collector._context is None
+    first = collector.llm
+    assert collector._context is not None
+    assert first is collector.llm
+
+    with pytest.raises(AttributeError):
+        setattr(collector, "llm", object())
+    with pytest.raises(AttributeError):
+        _ = collector.undeclared_attribute
 
 
 def test_a_secondary_registration_cannot_cost_the_provider(tmp_path, monkeypatch):

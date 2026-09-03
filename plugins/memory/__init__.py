@@ -345,6 +345,11 @@ class _ProviderCollector:
     def register_cli_command(self, *args, **kwargs):
         pass  # CLI registration happens via discover_plugin_cli_commands()
 
+    @property
+    def llm(self):
+        """Expose the host-owned LLM facade without widening forwarding."""
+        return self._plugin_context().llm
+
     def __getattr__(self, attr: str):
         """Delegate any other ``register_*`` call to a real ``PluginContext`` (a
         hand-maintained stub drifted: unknown calls raised and cost the provider).

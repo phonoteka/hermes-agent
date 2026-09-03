@@ -21,6 +21,8 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider, spawn_context_thread
 from agent.secret_scope import get_secret
 from tools.registry import tool_error
+
+from ._enriched_memory import decode_enriched_memory, render_memory
 from utils import atomic_json_write, read_json_or_empty
 
 logger = logging.getLogger(__name__)
@@ -126,7 +128,8 @@ _PROMPT_BODY = (
 class Mem0MemoryProvider(MemoryProvider):
     """Mem0 memory with server-side extraction and semantic search (platform, self-hosted or OSS)."""
 
-    def __init__(self):
+    def __init__(self, llm=None):
+        self._llm = llm
         self._config = self._backend = self._sync_thread = self._prefetch_thread = None
         self._mode, self._api_key, self._host, self._user_id, self._agent_id = "platform", "", "", _DEFAULT_USER_ID, "hermes"
         self._rerank_default, self._channel = False, "cli"  # channel = gateway name (cli/telegram/discord/...)
@@ -178,7 +181,7 @@ class Mem0MemoryProvider(MemoryProvider):
         try:
             from . import _backend
             if self._mode == "oss":
-                return _backend.OSSBackend(self._config.get("oss", {}))
+                return _backend.OSSBackend(self._config.get("oss", {}), llm=self._llm)
             return _backend.SelfHostedBackend(self._api_key, self._host) if self._host else _backend.PlatformBackend(self._api_key)
         except Exception as e:
             logger.error("Mem0 backend failed to initialize (%s mode): %s", self._mode, e)
@@ -274,7 +277,11 @@ class Mem0MemoryProvider(MemoryProvider):
 
         def _run():
             results = self._try(lambda: self._search(query, backend=backend), logger.debug, "Mem0 prefetch failed: %s")
-            lines = [r.get("memory", "") for r in (results or []) if r.get("memory")]
+            lines = [
+                render_memory(r.get("memory", ""))
+                for r in (results or [])
+                if r.get("memory")
+            ]
             body = "## Mem0 Memory\n" + "\n".join(f"- {l}" for l in lines) if lines else ""
             with self._prefetch_lock:
                 if self._prefetch_query == query:
@@ -335,8 +342,16 @@ class Mem0MemoryProvider(MemoryProvider):
         results = self._search(args["query"], top_k, rerank)
         if not results:
             return json.dumps({"result": "No relevant memories found."})
-        items = [{"id": r.get("id"), "memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results]
-        return json.dumps({"results": items, "count": len(items)})
+        items = []
+        for row in results:
+            raw_memory = row.get("memory", "")
+            structured = decode_enriched_memory(raw_memory)
+            items.append({
+                "id": row.get("id"),
+                "memory": structured if structured is not None else raw_memory,
+                "score": row.get("score", 0),
+            })
+        return json.dumps({"results": items, "count": len(items)}, ensure_ascii=False)
 
     def _tool_add(self, args: dict) -> str:
         result = self._add([{"role": "user", "content": args["content"]}], infer=False)
@@ -390,7 +405,7 @@ class Mem0MemoryProvider(MemoryProvider):
 
 def register(ctx) -> None:
     """Register Mem0 as a memory provider plugin."""
-    ctx.register_memory_provider(Mem0MemoryProvider())
+    ctx.register_memory_provider(Mem0MemoryProvider(llm=ctx.llm))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

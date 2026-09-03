@@ -529,7 +529,7 @@ class TestCreateBackendRouting:
 
     def test_oss_mode_takes_precedence_over_host(self, monkeypatch):
         class OB(_SentinelBackend):
-            def __init__(self, cfg):
+            def __init__(self, cfg, llm=None):
                 pass
 
         monkeypatch.setattr("plugins.memory.mem0._backend.OSSBackend", OB)
