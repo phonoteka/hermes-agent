@@ -215,7 +215,7 @@ def test_malformed_memory_config_still_builds_default_store():
 
 def _make_output_validation_agent(monkeypatch, normalized_messages, request_messages):
     """Build a deterministic agent double for the generic final-output seam."""
-    with patch("agent.process_bootstrap.OpenAI") as mock_openai, patch("run_agent.ContextCompressor") as mock_comp:
+    with patch("agent.process_bootstrap.OpenAI") as mock_openai, patch("agent.context_compressor.ContextCompressor") as mock_comp:
         mock_openai.return_value = MagicMock()
         compressor = MagicMock()
         compressor.context_length = 100000
