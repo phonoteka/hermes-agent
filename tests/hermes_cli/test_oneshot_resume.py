@@ -188,8 +188,16 @@ class TestRunAgentResumeRuntime:
                 captured.update(kwargs)
             def __setattr__(self, name, _value):
                 pass
-            def run_conversation(self, _prompt, conversation_history=None):
+            def run_conversation(
+                self,
+                _prompt,
+                conversation_history=None,
+                final_response_validator=None,
+                max_final_response_validation_retries=2,
+            ):
                 captured["history"] = conversation_history
+                captured["final_response_validator"] = final_response_validator
+                captured["max_final_response_validation_retries"] = max_final_response_validation_retries
                 return {"final_response": "ok", "session_id": "s1"}
             def close(self):
                 pass
@@ -211,6 +219,8 @@ class TestRunAgentResumeRuntime:
             assert captured["provider"] == "custom:stored"
             assert captured["session_id"] == "s1"
             assert captured["history"][0]["role"] == "user"
+            assert captured["final_response_validator"] is None
+            assert captured["max_final_response_validation_retries"] == 2
             row = db.get_session("s1")
             assert row["ended_at"] is None and row["end_reason"] is None
         finally:
@@ -230,7 +240,15 @@ class TestRunAgentResumeRuntime:
                 captured.update(kwargs)
             def __setattr__(self, name, _value):
                 pass
-            def run_conversation(self, _prompt, conversation_history=None):
+            def run_conversation(
+                self,
+                _prompt,
+                conversation_history=None,
+                final_response_validator=None,
+                max_final_response_validation_retries=2,
+            ):
+                captured["final_response_validator"] = final_response_validator
+                captured["max_final_response_validation_retries"] = max_final_response_validation_retries
                 return {"final_response": "ok"}
             def close(self):
                 pass
@@ -249,6 +267,8 @@ class TestRunAgentResumeRuntime:
             oneshot_mod._run_agent("hello", model="explicit-model", provider="openrouter", resume="s1")
             assert captured["model"] == "explicit-model"
             assert captured["provider"] == "openrouter"
+            assert captured["final_response_validator"] is None
+            assert captured["max_final_response_validation_retries"] == 2
         finally:
             db.close()
 
