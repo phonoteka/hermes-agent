@@ -21,6 +21,8 @@ import sys
 import time
 from collections import deque
 from contextlib import nullcontext, suppress
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 try:
@@ -167,6 +169,10 @@ class WebhookAdapter(BasePlatformAdapter):
         self._host: Optional[str] = extra.get("host", DEFAULT_HOST) or None
         self._port: int = int(extra.get("port", DEFAULT_PORT))
         self._global_secret: str = extra.get("secret", "")
+        raw_bitrix24_config = extra.get("bitrix24", {})
+        self._bitrix24_config: Dict[str, Any] = (
+            raw_bitrix24_config if isinstance(raw_bitrix24_config, dict) else {}
+        )
         self._static_routes: Dict[str, dict] = extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
         self._dynamic_routes_mtime: float = 0.0
@@ -225,6 +231,10 @@ class WebhookAdapter(BasePlatformAdapter):
         # Without an api_server listener this port is the shared listener: forward a secondary's
         # inbound-port platforms (Twilio, LINE, Teams, ...) registered in shared-listener mode.
         app.router.add_route("*", "/p/{profile}/{tail:.*}", self._handle_profile_ingress)
+        if self._bitrix24_config.get("enabled") is True:
+            app.router.add_post(
+                self._bitrix24_route_path(), self._handle_bitrix24_webhook
+            )
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         # SO_REUSEADDR: on macOS (BSD) two wildcard/specific sockets can silently split traffic while
@@ -673,6 +683,319 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.debug("[webhook] Closed session %s for delivery %s", session_id, session_chat_id)
         except Exception as e:
             logger.debug("[webhook] Failed to close session for %s: %s", session_chat_id, e)
+
+    def _bitrix24_route_path(self) -> str:
+        route_path = self._bitrix24_config.get("route_path", "/bitrix24/webhook")
+        if not isinstance(route_path, str):
+            return "/bitrix24/webhook"
+        normalized = route_path.strip()
+        if not normalized:
+            return "/bitrix24/webhook"
+        if not normalized.startswith("/"):
+            normalized = f"/{normalized}"
+        return normalized
+
+    def _sanitize_bitrix24_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        allowed_keys = {
+            "accepted",
+            "reason",
+            "targeted",
+            "deduped",
+            "event",
+            "event_id",
+            "source_domain",
+            "ingress",
+            "payload",
+            "targeting",
+            "normalized_turn",
+            "turns",
+            "task_id",
+            "message",
+            "file_ids",
+            "attachments",
+            "agent_request",
+            "deferred_actions",
+        }
+        return {key: value for key, value in result.items() if key in allowed_keys}
+
+    def _render_bitrix24_prompt(self, result: dict[str, Any]) -> str:
+        prompt_payload: dict[str, Any] = {
+            "source": "bitrix24_webhook",
+            "event": result.get("event", ""),
+            "event_id": result.get("event_id", ""),
+            "reason": result.get("reason", ""),
+            "source_domain": result.get("source_domain", ""),
+            "task_id": result.get("task_id", ""),
+            "message": result.get("message", ""),
+            "targeting": result.get("targeting", {}),
+            "payload": result.get("payload", {}),
+            "attachments": result.get("attachments", []),
+            "agent_request": result.get("agent_request", {}),
+            "deferred_actions": result.get("deferred_actions", []),
+        }
+        compact_payload = {
+            key: value
+            for key, value in prompt_payload.items()
+            if value not in (None, "", [], {})
+        }
+        return (
+            "Bitrix24 webhook accepted. Use the sanitized event payload below.\n\n"
+            f"```json\n{json.dumps(compact_payload, ensure_ascii=False, indent=2)[:4000]}\n```"
+        )
+
+    def _log_bitrix24_auth_rejection(
+        self,
+        payload: Dict[str, Any],
+        request: Any,
+    ) -> None:
+        auth = payload.get("auth")
+        auth_dict = auth if isinstance(auth, dict) else {}
+        received_token = auth_dict.get("application_token")
+        received_token_text = received_token if isinstance(received_token, str) else ""
+        expected_token = os.getenv("BITRIX24_APPLICATION_TOKEN", "")
+
+        def _digest(value: str) -> str:
+            if not value:
+                return ""
+            return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+        logger.warning(
+            "[webhook] Bitrix24 auth rejected: event=%s event_id=%s event_handler_id=%s "
+            "domain=%s auth_keys=%s token_present=%s token_len=%d token_sha12=%s "
+            "expected_present=%s expected_len=%d expected_sha12=%s content_type=%s user_agent=%s",
+            payload.get("event"),
+            payload.get("event_id"),
+            payload.get("event_handler_id"),
+            auth_dict.get("domain"),
+            sorted(str(key) for key in auth_dict.keys()),
+            bool(received_token_text),
+            len(received_token_text),
+            _digest(received_token_text),
+            bool(expected_token),
+            len(expected_token),
+            _digest(expected_token),
+            request.headers.get("Content-Type", ""),
+            request.headers.get("User-Agent", ""),
+        )
+
+    def _maybe_sync_bitrix24_application_token(
+        self,
+        payload: Dict[str, Any],
+    ) -> bool:
+        if os.getenv("BITRIX24_CAPTURE_APPLICATION_TOKEN_ON_AUTH_REJECT", "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return False
+
+        auth = payload.get("auth")
+        auth_dict = auth if isinstance(auth, dict) else {}
+        received_token = auth_dict.get("application_token")
+        if not isinstance(received_token, str) or not received_token:
+            return False
+
+        expected_handler_id = os.getenv("BITRIX24_CAPTURE_EVENT_HANDLER_ID", "").strip()
+        if expected_handler_id and str(payload.get("event_handler_id", "")) != expected_handler_id:
+            return False
+
+        expected_domain = os.getenv("BITRIX24_CAPTURE_DOMAIN", "").strip()
+        if expected_domain and str(auth_dict.get("domain", "")) != expected_domain:
+            return False
+
+        received_digest = hashlib.sha256(received_token.encode("utf-8")).hexdigest()[:12]
+        expected_digest = os.getenv("BITRIX24_CAPTURE_TOKEN_SHA12", "").strip()
+        if expected_digest and received_digest != expected_digest:
+            return False
+
+        configured_files = os.getenv(
+            "BITRIX24_TOKEN_SYNC_ENV_FILES",
+            "/home/hermes/.hermes/.env",
+        )
+        env_files = [Path(item) for item in configured_files.split(os.pathsep) if item.strip()]
+        if not env_files:
+            return False
+
+        for env_file in env_files:
+            self._write_env_value(env_file, "BITRIX24_APPLICATION_TOKEN", received_token)
+            self._write_env_value(env_file, "BITRIX24_CAPTURE_APPLICATION_TOKEN_ON_AUTH_REJECT", "0")
+
+        os.environ["BITRIX24_APPLICATION_TOKEN"] = received_token
+        os.environ["BITRIX24_CAPTURE_APPLICATION_TOKEN_ON_AUTH_REJECT"] = "0"
+        logger.warning(
+            "[webhook] Bitrix24 application token synchronized from rejected payload: "
+            "event=%s event_handler_id=%s domain=%s token_len=%d token_sha12=%s env_files=%s",
+            payload.get("event"),
+            payload.get("event_handler_id"),
+            auth_dict.get("domain"),
+            len(received_token),
+            received_digest,
+            [str(path) for path in env_files],
+        )
+        return True
+
+    @staticmethod
+    def _write_env_value(env_file: Path, key: str, value: str) -> None:
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        existing_text = env_file.read_text() if env_file.exists() else ""
+        lines = existing_text.splitlines()
+        if env_file.exists():
+            backup = env_file.with_name(
+                f"{env_file.name}.bak-bitrix24-token-sync-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+            )
+            backup.write_text(existing_text)
+
+        replacement = f"{key}={value}"
+        replaced = False
+        updated_lines: list[str] = []
+        for line in lines:
+            if line.strip().startswith("#") or "=" not in line:
+                updated_lines.append(line)
+                continue
+            current_key = line.split("=", 1)[0].strip()
+            if current_key == key:
+                updated_lines.append(replacement)
+                replaced = True
+            else:
+                updated_lines.append(line)
+        if not replaced:
+            updated_lines.append(replacement)
+        env_file.write_text("\n".join(updated_lines) + "\n")
+
+    async def _handle_bitrix24_webhook(self, request: "web.Request") -> "web.Response":
+        content_length = request.content_length or 0
+        if content_length > self._max_body_bytes:
+            return web.json_response({"error": "Payload too large"}, status=413)
+
+        try:
+            raw_body = await request.read()
+        except Exception as e:
+            logger.error("[webhook] Failed to read Bitrix24 body: %s", e)
+            return web.json_response({"error": "Bad request"}, status=400)
+
+        try:
+            from plugins.bitrix24.attachments import _materialize_attachments
+            from plugins.bitrix24.handoff import _agent_request_from_result
+            from plugins.bitrix24.http import parse_bitrix24_webhook_payload
+            from plugins.bitrix24.ingress import _make_webhook_ingress_handler
+
+            payload = parse_bitrix24_webhook_payload(
+                raw_body, request.headers.get("Content-Type", "")
+            )
+        except ValueError:
+            return web.json_response({"error": "Cannot parse body"}, status=400)
+        except Exception:
+            logger.exception("[webhook] Bitrix24 payload parsing failed")
+            return web.json_response({"error": "Cannot parse body"}, status=400)
+
+        ingress_handler = _make_webhook_ingress_handler(
+            materialize_attachments=_materialize_attachments,
+            agent_request_from_result=_agent_request_from_result,
+        )
+        try:
+            result = json.loads(ingress_handler(payload))
+        except Exception:
+            logger.exception("[webhook] Bitrix24 ingress handler failed")
+            return web.json_response({"error": "Bad request"}, status=400)
+
+        if not isinstance(result, dict):
+            return web.json_response({"error": "Bad request"}, status=400)
+
+        reason = str(result.get("reason", "") or "")
+        if result.get("accepted") is not True:
+            if reason == "unauthorized_application_token":
+                self._log_bitrix24_auth_rejection(payload, request)
+                if self._maybe_sync_bitrix24_application_token(payload):
+                    try:
+                        result = json.loads(ingress_handler(payload))
+                    except Exception:
+                        logger.exception("[webhook] Bitrix24 ingress retry after token sync failed")
+                        return web.json_response({"error": "Bad request"}, status=400)
+                    if not isinstance(result, dict):
+                        return web.json_response({"error": "Bad request"}, status=400)
+                    reason = str(result.get("reason", "") or "")
+                    if result.get("accepted") is True:
+                        logger.info(
+                            "[webhook] Bitrix24 webhook accepted after application token sync: event=%s event_handler_id=%s event_id=%s",
+                            result.get("event"),
+                            payload.get("event_handler_id"),
+                            result.get("event_id"),
+                        )
+            if result.get("accepted") is not True:
+                status_by_reason = {
+                    "invalid_payload": 400,
+                    "unknown_payload_shape": 400,
+                    "invalid_webhook_url": 503,
+                    "webhook_auth_not_configured": 503,
+                    "unauthorized_application_token": 401,
+                    "unauthorized_source": 403,
+                    "unsupported_event": 200,
+                    "not_targeted": 200,
+                    "project_not_allowed": 200,
+                    "duplicate_event": 200,
+                }
+                status = status_by_reason.get(reason, 400)
+                body = {"status": "ignored", "reason": reason or "invalid_payload"}
+                if status in {401, 403, 503}:
+                    body = {"error": reason or "invalid_payload"}
+                return web.json_response(body, status=status)
+
+        now = time.time()
+        if not self._record_rate_limit_hit("bitrix24", now):
+            return web.json_response({"error": "Rate limit exceeded"}, status=429)
+
+        sanitized_result = self._sanitize_bitrix24_result(result)
+        prompt = self._render_bitrix24_prompt(sanitized_result)
+        delivery_id = str(
+            sanitized_result.get("event_id")
+            or request.headers.get("X-Request-ID", str(int(time.time() * 1000)))
+        )
+        session_chat_id = f"bitrix24:{delivery_id}"
+
+        deliver_config = {
+            "deliver": self._bitrix24_config.get("deliver", "log"),
+            "deliver_extra": self._render_delivery_extra(
+                self._bitrix24_config.get("deliver_extra", {}), sanitized_result
+            ),
+            "payload": sanitized_result,
+        }
+        self._delivery_info[session_chat_id] = deliver_config
+        self._delivery_info_created[session_chat_id] = now
+        self._delivery_info_order.append((now, session_chat_id))
+        self._prune_delivery_info(now)
+
+        source = self.build_source(
+            chat_id=session_chat_id,
+            chat_name="bitrix24/webhook",
+            chat_type="webhook",
+            user_id="bitrix24",
+            user_name="bitrix24",
+        )
+        event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=sanitized_result,
+            message_id=delivery_id,
+        )
+
+        logger.info(
+            "[webhook] %s event=%s route=bitrix24 prompt_len=%d delivery=%s",
+            request.method,
+            sanitized_result.get("event", "unknown"),
+            len(prompt),
+            delivery_id,
+        )
+
+        task = asyncio.create_task(self.handle_message(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        return web.json_response(
+            {
+                "status": "accepted",
+                "route": "bitrix24",
+                "event": sanitized_result.get("event", "unknown"),
+                "delivery_id": delivery_id,
+            },
+            status=202,
+        )
 
     # --- Signature validation ---
 

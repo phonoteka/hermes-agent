@@ -1,0 +1,22 @@
+name: bitrix24
+version: 0.1.0
+description: "Bundled Bitrix24 scaffold plugin. Outbound Hermes -> Bitrix24 uses BITRIX24_WEBHOOK_URL old REST base `https://{portal}/rest/{user}/{secret}` only; REST v3 `/rest/api/{user}/{token}` stays unsupported/fail-closed. Inbound Bitrix24 -> Hermes uses dedicated `POST /bitrix24/webhook` when `platforms.webhook.extra.bitrix24.enabled=true`, authenticates with payload `auth.application_token` + `auth.domain` instead of generic HMAC headers, and keeps webhook URLs/application tokens/download links redacted from public payloads."
+author: NousResearch
+kind: standalone
+requires_env:
+  - BITRIX24_WEBHOOK_URL
+provides_tools:
+  - bitrix24_status
+  - bitrix24_webhook_ingress
+  - bitrix24_task_create
+  - bitrix24_task_get
+  - bitrix24_task_list
+  - bitrix24_task_update
+  - bitrix24_task_complete
+  - bitrix24_task_comments
+  - bitrix24_task_comment_add
+  - bitrix24_task_comment_update
+  - bitrix24_chat_get
+  - bitrix24_chat_send
+  - bitrix24_my_plan_stages_get
+  - bitrix24_my_plan_task_move
