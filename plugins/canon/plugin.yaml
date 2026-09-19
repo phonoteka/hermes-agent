@@ -1,0 +1,9 @@
+name: canon
+version: "1.0.0"
+description: Ordinary Hermes transport for launching Canon workflows
+kind: standalone
+provides_tools:
+  - canon_gateway_launch
+  - canon_gateway_checkpoint
+  - canon_workflow_observe
+  - canon_workflow_control
