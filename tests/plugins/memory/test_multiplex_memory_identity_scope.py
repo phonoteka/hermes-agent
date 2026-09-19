@@ -8,6 +8,7 @@ OPENVIKING_* / HINDSIGHT_BANK_ID / HERMES_HONCHO_HOST, the provider must fall ba
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from agent import secret_scope
 
@@ -81,22 +82,35 @@ def test_secondary_profile_memory_identity_never_inherits_default_environ(second
     assert honcho_client._env_base_url() is None
 
 
-def test_mem0_oss_llm_never_borrows_default_profile_openai_key(secondary_profile):
-    pytest.importorskip("mem0")
-    from mem0.configs.llms.openai import OpenAIConfig
+def test_mem0_oss_llm_uses_injected_host_not_default_profile_openai(secondary_profile):
+    from plugins.memory.mem0._enriched_memory import Mem0HermesLlm
 
-    from plugins.memory.mem0._openai_llm import DirectOpenAILLM
+    class FakeHostLlm:
+        def __init__(self):
+            self.requests = []
 
-    with pytest.raises(ValueError, match="OpenAI API key is required"):
-        DirectOpenAILLM(OpenAIConfig(model="gpt-5-mini"))
-    # The secondary's own scoped key + base URL are used when present.
-    token = secret_scope.set_secret_scope({"OPENAI_API_KEY": "sk-b", "OPENAI_BASE_URL": "https://openai.b/v1"})
+        def complete_structured(self, **request):
+            self.requests.append(request)
+            return SimpleNamespace(parsed={"memory": []})
+
+    host_llm = FakeHostLlm()
+    token = secret_scope.set_secret_scope({
+        "OPENAI_API_KEY": "sk-secondary",
+        "OPENAI_BASE_URL": "https://openai.secondary/v1",
+    })
     try:
-        llm = DirectOpenAILLM(OpenAIConfig(model="gpt-5-mini"))
+        adapter = Mem0HermesLlm({"host_llm": host_llm})
+        result = adapter.generate_response(
+            [{"role": "user", "content": "remember tea"}],
+            response_format={"type": "json_object"},
+        )
     finally:
         secret_scope.reset_secret_scope(token)
-    assert llm.client.api_key == "sk-b"
-    assert str(llm.client.base_url).startswith("https://openai.b/v1")
+
+    assert result == '{"memory":[]}'
+    assert len(host_llm.requests) == 1
+    assert host_llm.requests[0]["strict"] is True
+    assert host_llm.requests[0]["purpose"] == "mem0_enriched_memory"
 
 
 def test_hindsight_retain_shaping_is_not_re_read_from_the_default_profile_environ(secondary_profile):

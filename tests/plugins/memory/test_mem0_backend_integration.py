@@ -10,7 +10,7 @@ import pytest
 pytest.importorskip("mem0", reason="requires the existing mem0 extra")
 
 
-def test_openai_backend_uses_real_mem0_config_and_factory(monkeypatch, tmp_path):
+def test_oss_backend_uses_injected_host_llm_without_openai(monkeypatch, tmp_path):
     mem0_dir = tmp_path / "mem0"
     monkeypatch.setenv("MEM0_DIR", str(mem0_dir))
     monkeypatch.setenv("OPENAI_API_KEY", "environment-openai-sentinel")
@@ -21,33 +21,19 @@ def test_openai_backend_uses_real_mem0_config_and_factory(monkeypatch, tmp_path)
     from mem0.utils.factory import LlmFactory
 
     from plugins.memory.mem0._backend import OSSBackend
-    from plugins.memory.mem0._openai_llm import DirectOpenAILLM
+    from plugins.memory.mem0._enriched_memory import Mem0HermesLlm
 
-    clients = []
-    requests = []
+    class RaisingOpenAI:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("the Mem0 host-LLM path must not construct OpenAI")
 
-    class FakeOpenAI:
-        def __init__(self, *, api_key, base_url):
-            self.api_key = api_key
-            self.base_url = base_url
-            self.chat = SimpleNamespace(
-                completions=SimpleNamespace(create=self._create)
-            )
-            clients.append(self)
+    class FakeHostLlm:
+        def __init__(self):
+            self.requests = []
 
-        @staticmethod
-        def _create(**params):
-            requests.append(params)
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        message=SimpleNamespace(
-                            content="direct answer",
-                            tool_calls=None,
-                        )
-                    )
-                ]
-            )
+        def complete_structured(self, **request):
+            self.requests.append(request)
+            return SimpleNamespace(parsed={"memory": []})
 
     class DummyVectorStore:
         pass
@@ -61,7 +47,7 @@ def test_openai_backend_uses_real_mem0_config_and_factory(monkeypatch, tmp_path)
         "provider_to_class",
         dict(LlmFactory.provider_to_class),
     )
-    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(openai, "OpenAI", RaisingOpenAI)
     monkeypatch.setattr(
         memory_main.EmbedderFactory,
         "create",
@@ -110,22 +96,26 @@ def test_openai_backend_uses_real_mem0_config_and_factory(monkeypatch, tmp_path)
     }
     original_config = copy.deepcopy(config)
     environment = dict(os.environ)
+    host_llm = FakeHostLlm()
+    messages = [{"role": "user", "content": "remember tea"}]
 
-    backend = OSSBackend(config)
+    backend = OSSBackend(config, llm=host_llm)
     result = backend._memory.llm.generate_response(
-        [{"role": "user", "content": "remember tea"}]
+        messages,
+        response_format={"type": "json_object"},
     )
 
-    assert isinstance(backend._memory.llm, DirectOpenAILLM)
-    assert len(clients) == 1
-    assert clients[0].api_key == "configured-openai-sentinel"
-    assert clients[0].base_url == "https://openai.example/v1"
-    assert requests == [
-        {
-            "model": "gpt-5-mini",
-            "messages": [{"role": "user", "content": "remember tea"}],
-        }
-    ]
-    assert result == "direct answer"
+    assert isinstance(backend._memory.llm, Mem0HermesLlm)
+    assert len(host_llm.requests) == 1
+    request = host_llm.requests[0]
+    assert request["strict"] is True
+    assert request["schema_name"] == "hermes_memory_enriched_v1"
+    assert request["purpose"] == "mem0_enriched_memory"
+    assert request["json_schema"]["$schema"] == "https://json-schema.org/draft/2020-12/schema"
+    assert request["input"] == [{
+        "type": "text",
+        "text": '[{"content":"remember tea","role":"user"}]',
+    }]
+    assert result == '{"memory":[]}'
     assert config == original_config
     assert dict(os.environ) == environment

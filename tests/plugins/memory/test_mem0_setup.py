@@ -261,6 +261,13 @@ def test_discovery_loaded_setup_module_exposes_post_setup(monkeypatch):
     module the loader actually cached, not on a normal top-level import."""
     from plugins.memory import load_memory_provider
 
+    parent_package = sys.modules.get("plugins.memory")
+    parent_attr_sentinel = object()
+    saved_parent_attr = (
+        getattr(parent_package, "mem0", parent_attr_sentinel)
+        if parent_package is not None
+        else parent_attr_sentinel
+    )
     saved = {k: sys.modules.pop(k) for k in list(sys.modules) if k.startswith("plugins.memory.mem0")}
     try:
         provider = load_memory_provider("mem0", register_skills=False)
@@ -271,3 +278,8 @@ def test_discovery_loaded_setup_module_exposes_post_setup(monkeypatch):
             if k.startswith("plugins.memory.mem0"):
                 del sys.modules[k]
         sys.modules.update(saved)
+        if parent_package is not None:
+            if saved_parent_attr is parent_attr_sentinel:
+                parent_package.__dict__.pop("mem0", None)
+            else:
+                setattr(parent_package, "mem0", saved_parent_attr)
