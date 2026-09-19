@@ -321,7 +321,7 @@ def _native_session(result: dict[str, Any]) -> str | None:
 
 def _kill_native(ctx: Any, native_id: str) -> bool:
     try:
-        raw = ctx.dispatch_tool("process", {"action": "kill", "session_id": native_id})
+        raw = ctx.dispatch_tool("process_manage", {"action": "kill", "session_id": native_id})
         result = _parse_object(raw, "native process cleanup")
     except Exception:
         return False
@@ -355,12 +355,12 @@ def _dispatch_terminal(
 
 def _dispatch_wait(ctx: Any, native_id: str, timeout: int) -> dict[str, Any]:
     try:
-        raw = ctx.dispatch_tool("process", {"action": "wait", "session_id": native_id, "timeout": timeout})
+        raw = ctx.dispatch_tool("process_manage", {"action": "wait", "session_id": native_id, "timeout": timeout})
         result = _parse_object(raw, "native process wait")
         if result.get("status") != "exited":
             return result
         raw_log = ctx.dispatch_tool(
-            "process",
+            "process_manage",
             {"action": "log", "session_id": native_id, "offset": 0, "limit": 2},
         )
         log = _parse_object(raw_log, "native process log")
@@ -697,13 +697,13 @@ def _run_cli(ctx: Any, argv: list[str], *, root: Path, timeout: int, task_id: st
         native_id = _native_session(started)
         if native_id is None or started.get("exit_code") != 0:
             raise CanonTransportError("Canon CLI process was not accepted by native transport")
-        waited = _parse_process(ctx.dispatch_tool("process", {
+        waited = _parse_process(ctx.dispatch_tool("process_manage", {
             "action": "wait", "session_id": native_id, "timeout": timeout,
         }), "Canon CLI process wait")
         if waited.get("status") != "exited":
             _kill_native(ctx, native_id)
             raise CanonTransportError("Canon CLI process did not complete")
-        logged = _parse_process(ctx.dispatch_tool("process", {
+        logged = _parse_process(ctx.dispatch_tool("process_manage", {
             "action": "log", "session_id": native_id, "offset": 0, "limit": 4096,
         }), "Canon CLI process log")
         if logged.get("status") != "exited" or (

@@ -21,7 +21,10 @@ import pytest
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 
+# Register the real terminal/process built-ins for PluginContext dispatch.
+import model_tools
 from hermes_cli.plugins import PluginManager, PluginContext, PluginManifest
+from hermes_cli.plugins_manifest import parse_manifest_file
 from plugins.canon import background_runner
 from plugins.canon import register
 from plugins.canon import transport
@@ -716,7 +719,7 @@ def test_checkpoint_schema_and_transport_reject_delivery_targeting_and_observe_c
             })
     manager = PluginManager(scope_key=str(tmp_path))
     plugin_dir = Path(__file__).resolve().parents[2] / "plugins" / "canon"
-    manifest = manager._parse_manifest(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
+    manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
     assert manifest is not None
     try:
         manager._load_plugin(manifest)
@@ -780,7 +783,7 @@ def test_carriers_are_private_outside_execution_root_and_cleanup_on_failure(tmp_
         "execution_root": str(execution), "wait_mode": "async-no-wait",
     }, ctx=Context())))
     assert "error" in result
-    assert [item[0] for item in calls] == ["terminal", "process"]
+    assert [item[0] for item in calls] == ["terminal", "process_manage"]
     private = profile / "runtime" / "canon"
     assert private.is_dir()
     assert not any(private.glob("hermes-canon-*/manifest.json"))
@@ -1077,7 +1080,7 @@ def test_sync_launch_uses_terminal_then_process_wait_and_returns_framed_result(t
                 assert kwargs == {"task_id": None}
                 return json.dumps({"session_id": "native-1", "exit_code": 0, "notify_on_complete": True})
             assert kwargs == {}
-            assert name == "process"
+            assert name == "process_manage"
             if args["action"] == "wait":
                 return json.dumps({"status": "exited", "exit_code": 0, "output": 'truncated-tail'})
             assert args == {"action": "log", "session_id": "native-1", "offset": 0, "limit": 2}
@@ -1092,7 +1095,7 @@ def test_sync_launch_uses_terminal_then_process_wait_and_returns_framed_result(t
         "execution_root": str(execution), "wait_mode": "sync-short", "timeout_seconds": 5,
     }, ctx=Context())))
     assert result == json.loads(_run_result(result={"value": 7}))
-    assert [item[0] for item in calls] == ["terminal", "process", "process"]
+    assert [item[0] for item in calls] == ["terminal", "process_manage", "process_manage"]
     assert calls[0][1]["background"] is True
     assert calls[0][1]["notify_on_complete"] is False
     assert calls[1][1]["action"] == "wait"
@@ -1109,7 +1112,7 @@ def test_sync_launch_uses_real_terminal_and_process_registry(tmp_path: Path, mon
     fake = _fake_canon(tmp_path / "fake", output=_run_result(result={"proof": "real-path"}))
     manager = PluginManager(scope_key=str(profile))
     plugin_dir = Path(__file__).resolve().parents[2] / "plugins" / "canon"
-    manifest = manager._parse_manifest(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
+    manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
     assert manifest is not None
     try:
         manager._load_plugin(manifest)
@@ -1187,7 +1190,7 @@ def test_real_async_launch_queues_native_completion_for_origin_task(
     )
     manager = PluginManager(scope_key=str(profile))
     plugin_dir = Path(__file__).resolve().parents[2] / "plugins" / "canon"
-    manifest = manager._parse_manifest(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
+    manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
     assert manifest is not None
     from tools.process_registry import process_registry
     while True:
@@ -1254,7 +1257,7 @@ def test_human_gate_wake_prompt_is_compact_reversible_and_integrity_checked(
     fake = _fake_canon(tmp_path / "paused-fake", output=raw_result, delay=0.1)
     manager = PluginManager(scope_key=str(profile))
     plugin_dir = Path(__file__).resolve().parents[2] / "plugins" / "canon"
-    manifest = manager._parse_manifest(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
+    manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
     assert manifest is not None
     from tools.process_registry import process_registry
     while True:
@@ -1366,7 +1369,7 @@ def test_human_gate_wake_prompt_fails_closed_when_card_cannot_fit_completion_bou
     fake = _fake_canon(tmp_path / "oversized-paused-fake", output=raw_result, delay=0.1)
     manager = PluginManager(scope_key=str(profile))
     plugin_dir = Path(__file__).resolve().parents[2] / "plugins" / "canon"
-    manifest = manager._parse_manifest(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
+    manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
     assert manifest is not None
     from tools.process_registry import process_registry
     while True:
@@ -1446,7 +1449,7 @@ def test_timeout_and_cancellation_cleanup_native_process(tmp_path: Path, monkeyp
         "execution_root": str(execution), "timeout_seconds": 1,
     }, ctx=Context())))
     assert "error" in result
-    assert [name for name, _ in calls] == ["terminal", "process", "process"]
+    assert [name for name, _ in calls] == ["terminal", "process_manage", "process_manage"]
     assert calls[-1][1]["action"] == "kill"
     assert not any((profile / "runtime" / "canon").glob("hermes-canon-*"))
 
@@ -1489,7 +1492,7 @@ def test_run_cli_redacts_nonzero_process_diagnostic_before_error(
         def dispatch_tool(self, name, args, **kwargs):
             if name == "terminal":
                 return json.dumps({"session_id": "native-redaction", "exit_code": 0})
-            assert name == "process"
+            assert name == "process_manage"
             if args["action"] == "wait":
                 return json.dumps({"status": "exited", "exit_code": 7})
             assert args["action"] == "log"
