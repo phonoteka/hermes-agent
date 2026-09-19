@@ -833,13 +833,13 @@ class WebhookAdapter(BasePlatformAdapter):
     @staticmethod
     def _write_env_value(env_file: Path, key: str, value: str) -> None:
         env_file.parent.mkdir(parents=True, exist_ok=True)
-        existing_text = env_file.read_text() if env_file.exists() else ""
+        existing_text = env_file.read_text(encoding="utf-8") if env_file.exists() else ""
         lines = existing_text.splitlines()
         if env_file.exists():
             backup = env_file.with_name(
                 f"{env_file.name}.bak-bitrix24-token-sync-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
             )
-            backup.write_text(existing_text)
+            backup.write_text(existing_text, encoding="utf-8")
 
         replacement = f"{key}={value}"
         replaced = False
@@ -856,7 +856,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 updated_lines.append(line)
         if not replaced:
             updated_lines.append(replacement)
-        env_file.write_text("\n".join(updated_lines) + "\n")
+        env_file.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
 
     async def _handle_bitrix24_webhook(self, request: "web.Request") -> "web.Response":
         content_length = request.content_length or 0
