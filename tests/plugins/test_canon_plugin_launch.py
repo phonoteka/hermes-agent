@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import hashlib
+import importlib.util
 import inspect
 import json
 import os
@@ -28,6 +29,12 @@ from hermes_cli.plugins_manifest import parse_manifest_file
 from plugins.canon import background_runner
 from plugins.canon import register
 from plugins.canon import transport
+
+
+def _installed_canon_root() -> Path:
+    spec = importlib.util.find_spec("canon")
+    assert spec is not None and spec.origin is not None
+    return Path(spec.origin).resolve().parents[2]
 
 
 def _workflow(tmp_path: Path) -> tuple[Path, Path]:
@@ -402,7 +409,7 @@ def test_current_canon_accepted_task_card_prompt_crosses_hermes_boundary_without
     }
     fixture = tmp_path / "accepted-task-card-runtime-result.json"
     fixture.write_text(json.dumps(runtime_result, ensure_ascii=False), encoding="utf-8")
-    canon_root = Path(__file__).resolve().parents[4] / "projects" / "canon"
+    canon_root = _installed_canon_root()
     producer_script = """
 import json
 import sys
@@ -414,7 +421,7 @@ with open(sys.argv[1], encoding="utf-8") as stream:
 print(json.dumps(build_run_result(runtime_result), ensure_ascii=False, separators=(",", ":")))
 """
     producer = subprocess.run(
-        [str(canon_root / ".venv" / "bin" / "python"), "-c", producer_script, str(fixture)],
+        [sys.executable, "-c", producer_script, str(fixture)],
         cwd=canon_root,
         env={**os.environ, "PYTHONPATH": str(canon_root / "src")},
         capture_output=True,
@@ -1733,7 +1740,7 @@ def _probe_canon_checkpoint_request(
     validate_semantics: bool,
 ) -> subprocess.CompletedProcess[str]:
     """Parse one checkpoint carrier in the current Canon source and its own venv."""
-    canon_root = Path(__file__).resolve().parents[4] / "projects" / "canon"
+    canon_root = _installed_canon_root()
     script = """
 import json
 import sys
@@ -1757,7 +1764,7 @@ print(json.dumps(parsed, ensure_ascii=False, sort_keys=True))
     env["PYTHONPATH"] = str(canon_root / "src")
     return subprocess.run(
         [
-            str(canon_root / ".venv" / "bin" / "python"),
+            sys.executable,
             "-c",
             script,
             json.dumps(argv[1:]),

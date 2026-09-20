@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import inspect
+import importlib.util
 import json
 from pathlib import Path
 import queue
@@ -16,29 +17,24 @@ from typing import Any
 
 import pytest
 
-CANON_ROOT = Path("/home/hermes/workspaces/hermes-main/projects/canon")
+
+def _installed_canon_root() -> Path:
+    spec = importlib.util.find_spec("canon")
+    assert spec is not None and spec.origin is not None
+    return Path(spec.origin).resolve().parents[2]
+
+
+CANON_ROOT = _installed_canon_root()
 sys.path.insert(0, str(CANON_ROOT / "src"))
 
-from hermes_cli.plugins import PluginManager
+from hermes_cli.plugins import PluginManager, parse_manifest_file
 from plugins.canon.transport import build_run_request
 from tools.process_registry import process_registry
 from tools.registry import registry
 
 
 HERMES_ROOT = Path(__file__).resolve().parents[2]
-CANON_VENV = CANON_ROOT / ".venv" / "bin" / "python"
-EXPECTED_HERMES_HEAD = "36c7f7680ea893037c49292b2e89bc6c10f63b6e"
-EXPECTED_CANON_HEAD = "5d2552ea7caa96328d6c48752383ef5ab0bf448f"
-
-
-def _git_head(root: Path) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return completed.stdout.strip()
+CANON_VENV = Path(sys.executable)
 
 
 def _canon_durable_probe(action: str, db_path: Path, identity: str) -> Any:
@@ -87,17 +83,11 @@ def _canon_durable_probe(action: str, db_path: Path, identity: str) -> Any:
 
 
 def _assert_preconditions() -> None:
-    """Fail closed when the exact two-worktree fixture contract is unavailable."""
+    """Fail closed when the current checkout and editable Canon are unavailable."""
 
-    assert HERMES_ROOT == Path(
-        "/home/hermes/workspaces/hermes-main/worktrees/hermes-canon-rebuild-restored-20260907"
-    )
     assert HERMES_ROOT.is_dir(), f"Hermes worktree is missing: {HERMES_ROOT}"
     assert CANON_ROOT.is_dir(), f"Canon worktree is missing: {CANON_ROOT}"
-    assert (HERMES_ROOT / ".venv" / "bin" / "python").is_file()
     assert CANON_VENV.is_file() and CANON_VENV.stat().st_mode & 0o111
-    assert _git_head(HERMES_ROOT) == EXPECTED_HERMES_HEAD
-    assert _git_head(CANON_ROOT) == EXPECTED_CANON_HEAD
     for relative in (
         "plugins/canon/transport.py",
         "plugins/canon/background_runner.py",
@@ -359,7 +349,7 @@ def real_canon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     bootstrap = _write_bootstrap(tmp_path)
     manager = PluginManager(scope_key=str(profile_root))
     plugin_dir = HERMES_ROOT / "plugins" / "canon"
-    manifest = manager._parse_manifest(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
+    manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
     assert manifest is not None
     while True:
         try:
