@@ -31,26 +31,32 @@ from plugins.canon import transport
 
 
 def _workflow(tmp_path: Path) -> tuple[Path, Path]:
+    schema_path = tmp_path / "task-input.schema.json"
+    schema_path.write_text(json.dumps({"type": "string", "pattern": "\\S"}), encoding="utf-8")
+    routing_path = tmp_path / "model-routing.json"
+    routing_path.write_text(
+        json.dumps({
+            "routingId": "s07-routing",
+            "failClosed": True,
+            "profiles": {"default": {"hermesProfileId": "s07-hermes"}},
+        }),
+        encoding="utf-8",
+    )
     workflow = tmp_path / "workflow.json"
-    workflow.write_text(json.dumps({"workflowId": "s07-workflow"}), encoding="utf-8")
-    request = {
-        "schemaVersion": "run-request.schema.v3",
-        "workflowRef": "workflow:s07-workflow",
-        "runId": "packaged-run",
-        "threadId": "packaged-thread",
-        "workflowInput": {"original": True},
-        "runConfiguration": {
-            "schemaVersion": "run-configuration.schema.v1",
-            "executionRoot": ".",
-            "profileId": "default",
-            "modelRouting": {"registryRef": "routing", "failClosed": True},
-            "limits": {"maxGraphSteps": 10},
-            "durability": {"mode": "durable-production"},
-        },
-    }
-    request_path = workflow.with_name("run-request.json")
-    request_path.write_text(json.dumps(request), encoding="utf-8")
-    return workflow, request_path
+    workflow.write_text(
+        json.dumps({
+            "workflowId": "s07-workflow",
+            "workflowInputPorts": [{
+                "portId": "task",
+                "schemaRef": schema_path.name,
+                "logicalArtifactRef": "artifact:workflow-input/task",
+                "deliveryMode": "inline-candidate",
+            }],
+            "policyRefs": {"modelRoutingRef": routing_path.name},
+        }),
+        encoding="utf-8",
+    )
+    return workflow, schema_path
 
 
 def _run_result(
@@ -80,49 +86,30 @@ def _run_result(
 
 def _full_human_gate() -> dict[str, object]:
     digest = "sha256:" + "a" * 64
-    source_refs = ["α", "β"]
     task_card = {
-        "schemaVersion": "solution-modeling.task-card.v1",
-        "goal": "Смоделировать проверяемое решение без потери точных источников ✅",
+        "schemaVersion": "task-card.schema.v1",
+        "goal": {"text": "Смоделировать проверяемое решение без потери точных источников ✅"},
         "tasks": [
-            {
-                "taskId": "model-1",
-                "title": "Разобрать входные ограничения",
-                "description": "Сохранить структуру, порядок и Unicode без пересказа.",
-                "sourceRefs": source_refs,
-            },
-            {
-                "taskId": "model-2",
-                "title": "Сопоставить критерии приёмки",
-                "description": "Проверить каждое обязательство и каждую границу результата.",
-                "sourceRefs": source_refs,
-            },
-            {
-                "taskId": "model-3",
-                "title": "Подготовить доказуемую выдачу",
-                "description": "Передать точные deliverables с повторяемыми ссылками на источники.",
-                "sourceRefs": source_refs,
-            },
+            {"text": "Разобрать входные ограничения, сохранив структуру, порядок и Unicode без пересказа."},
+            {"text": "Сопоставить критерии приёмки с каждым обязательством и границей результата."},
+            {"text": "Подготовить доказуемую выдачу с повторяемыми ссылками на источники."},
         ],
         "deliverables": [
-            "solution-model.json",
-            "acceptance-matrix.md",
-            "evidence-ledger.json",
-            "точная карточка Human Gate",
+            {"text": "solution-model.json"},
+            {"text": "acceptance-matrix.md"},
+            {"text": "evidence-ledger.json"},
+            {"text": "точная карточка Human Gate"},
         ],
         "constraints": [
-            "Не менять смысл исходных требований.",
-            "Не скрывать Unicode, sourceRefs или порядок задач.",
-            "Не принимать решение за пользователя.",
+            {"text": "Не менять смысл исходных требований."},
+            {"text": "Не скрывать Unicode и порядок задач."},
+            {"text": "Не принимать решение за пользователя."},
         ],
         "acceptanceCriteria": [
-            "Каждая задача имеет проверяемый результат.",
-            "Все sourceRefs сохранены и читаемы.",
-            "Карточка обратимо декодируется с проверкой digest.",
-            "Пользователь видит точное содержимое без пересказа.",
+            {"text": "Каждая задача имеет проверяемый результат."},
+            {"text": "Пользователь видит точное содержимое без пересказа."},
+            {"text": "Карточка обратимо декодируется с проверкой digest."},
         ],
-        "notes": "Е" * 1_800,
-        "sourceRefs": source_refs,
     }
     return {
         "schemaVersion": "human-gate-request.schema.v1",
@@ -160,9 +147,20 @@ def _full_human_gate() -> dict[str, object]:
         },
         "cardBindingRef": "cards/review.json",
         "card": {
-            "cardId": "review-card",
-            "title": "审批 🧑‍⚖️ — review the complete subject",
+            "cardId": "task-card-review",
+            "title": "Проверить карточку задачи",
             "actions": ["approve", "revise", "abort"],
+            "presentation": {
+                "format": "markdown",
+                "title": {"path": "title", "style": "h1"},
+                "sections": [
+                    {"heading": "Цель", "path": "goal", "style": "h2"},
+                    {"heading": "Задачи", "path": "tasks", "style": "h2"},
+                    {"heading": "Результат", "path": "deliverables", "style": "h2"},
+                    {"heading": "Ограничения", "path": "constraints", "style": "h2"},
+                    {"heading": "Критерии приёмки", "path": "acceptanceCriteria", "style": "h2"},
+                ],
+            },
         },
         "actions": ["approve", "revise", "abort"],
         "deliveryPolicyRef": "canon://delivery/operator",
@@ -378,6 +376,102 @@ def test_human_gate_prompt_forwards_ready_card_body_and_rejects_card_payload_onl
     assert not payload_root.exists()
 
 
+def test_current_canon_accepted_task_card_prompt_crosses_hermes_boundary_without_artifact(
+    tmp_path: Path,
+) -> None:
+    pending = _full_human_gate()
+    authority = pending["subjectAuthority"]
+    assert isinstance(authority, dict)
+    digest = authority["subjectDigest"]
+    runtime_result = {
+        "status": "paused",
+        "runId": "run-test",
+        "threadId": "thread-test",
+        "workflowRef": "workflow:s07-workflow",
+        "result": {},
+        "resumeHandle": {
+            "runId": "run-test",
+            "threadId": "thread-test",
+            "checkpointId": "checkpoint-test",
+            "nodeId": "gate-node",
+            "subjectRevision": 1,
+            "subjectDigest": digest,
+            "decisionAttempt": 1,
+        },
+        "pendingHumanGate": pending,
+    }
+    fixture = tmp_path / "accepted-task-card-runtime-result.json"
+    fixture.write_text(json.dumps(runtime_result, ensure_ascii=False), encoding="utf-8")
+    canon_root = Path(__file__).resolve().parents[4] / "projects" / "canon"
+    producer_script = """
+import json
+import sys
+
+from canon.operator_observability import build_run_result
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    runtime_result = json.load(stream)
+print(json.dumps(build_run_result(runtime_result), ensure_ascii=False, separators=(",", ":")))
+"""
+    producer = subprocess.run(
+        [str(canon_root / ".venv" / "bin" / "python"), "-c", producer_script, str(fixture)],
+        cwd=canon_root,
+        env={**os.environ, "PYTHONPATH": str(canon_root / "src")},
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    assert producer.returncode == 0, producer.stderr
+    assert producer.stderr == ""
+    canon_result = json.loads(producer.stdout)
+    assert canon_result["status"] == "paused"
+    assert canon_result["artifactRefs"] == []
+    produced_pending = canon_result["pendingHumanGate"]
+    assert len(produced_pending["subjectTransport"]["inline"]) == 1
+    produced_prompt = canon_result["humanGatePrompt"]
+    expected_body = (
+        "# Проверить карточку задачи\n\n"
+        "## Цель\nСмоделировать проверяемое решение без потери точных источников ✅\n\n"
+        "## Задачи\n"
+        "- Разобрать входные ограничения, сохранив структуру, порядок и Unicode без пересказа.\n"
+        "- Сопоставить критерии приёмки с каждым обязательством и границей результата.\n"
+        "- Подготовить доказуемую выдачу с повторяемыми ссылками на источники.\n\n"
+        "## Результат\n"
+        "- solution-model.json\n"
+        "- acceptance-matrix.md\n"
+        "- evidence-ledger.json\n"
+        "- точная карточка Human Gate\n\n"
+        "## Ограничения\n"
+        "- Не менять смысл исходных требований.\n"
+        "- Не скрывать Unicode и порядок задач.\n"
+        "- Не принимать решение за пользователя.\n\n"
+        "## Критерии приёмки\n"
+        "- Каждая задача имеет проверяемый результат.\n"
+        "- Пользователь видит точное содержимое без пересказа.\n"
+        "- Карточка обратимо декодируется с проверкой digest."
+    )
+    assert produced_prompt["cardBody"] == expected_body
+    serialized_prompt = json.dumps(produced_prompt, ensure_ascii=False, separators=(",", ":"))
+    child = _fake_canon(tmp_path / "current-producer-result", output=producer.stdout)
+    root = tmp_path / "runtime" / "canon" / "hermes-canon-current-producer-result"
+    result = subprocess.run(
+        [sys.executable, str(_runner()), str(_manifest(root, [str(child)], operation="command"))],
+        capture_output=True,
+        shell=False,
+    )
+    assert result.returncode == 0
+    assert result.stderr == b""
+    forwarded = json.loads(result.stdout)
+    assert forwarded == produced_prompt
+    assert result.stdout == serialized_prompt.encode("utf-8") + b"\n"
+    assert forwarded["subjectRevision"] == produced_pending["subjectAuthority"]["subjectRevision"]
+    assert forwarded["subjectDigest"] == produced_pending["subjectAuthority"]["subjectDigest"]
+    assert forwarded["cardBodyDigest"] == "sha256:" + hashlib.sha256(expected_body.encode("utf-8")).hexdigest()
+    assert "cardPayload" not in forwarded
+    assert "artifactRefs" not in forwarded
+    assert not root.exists()
+
+
 def test_runner_rejects_changed_or_missing_card_body_digest_and_cleans_root(tmp_path: Path) -> None:
     body = "# Review\n\n## Items\n- bounded"
     valid_prompt = {
@@ -500,9 +594,9 @@ def _prompt_with_serialized_length(result: dict[str, object], target: int) -> di
 
 @pytest.mark.parametrize(
     ("name", "serialized_length", "expected_code"),
-    [("exact", 1_999, 0), ("over", 2_000, 125)],
+    [("below", 1_999, 0), ("exact", 2_000, 0), ("over", 2_001, 125)],
 )
-def test_completion_line_boundary_is_full_serialized_json_plus_newline(
+def test_completion_line_boundary_is_exact_serialized_prompt_length(
     name: str,
     serialized_length: int,
     expected_code: int,
@@ -512,6 +606,7 @@ def test_completion_line_boundary_is_full_serialized_json_plus_newline(
     canon_result = json.loads(_run_result(status="paused", pending_human_gate=pending))
     prompt = _prompt_with_serialized_length(canon_result, serialized_length)
     serialized_prompt = json.dumps(prompt, ensure_ascii=False, separators=(",", ":"))
+    assert len(serialized_prompt) == serialized_length
     raw_result = _run_result(
         status="paused",
         pending_human_gate=pending,
@@ -656,10 +751,10 @@ def test_handle_observe_dispatches_every_declared_surface(
     root.mkdir()
     monkeypatch.setattr(transport, "_profile_durable_root", lambda: root)
     monkeypatch.setattr(transport, "_canon_command_prefix", lambda: ["canon"])
-    captured: list[list[str]] = []
+    captured: list[tuple[list[str], str]] = []
 
-    def run_cli(_ctx, argv, *, root, timeout, task_id=None):
-        captured.append(argv)
+    def run_cli(_ctx, argv, *, root, timeout, task_id=None, operation="command"):
+        captured.append((argv, operation))
         return {"result": []}
 
     monkeypatch.setattr(transport, "_run_cli", run_cli)
@@ -669,7 +764,8 @@ def test_handle_observe_dispatches_every_declared_surface(
     result = json.loads(asyncio.run(transport.handle_observe(args, ctx=object())))
     assert result == {"result": []}
     assert len(captured) == 1
-    assert captured[0][1] == ("index" if surface in {"latest", "list"} else "inspect")
+    assert captured[0][0][1] == ("index" if surface in {"latest", "list"} else "inspect")
+    assert captured[0][1] == "observe"
 
 
 def test_checkpoint_schema_and_transport_reject_delivery_targeting_and_observe_combinations(tmp_path: Path) -> None:
@@ -857,6 +953,32 @@ def test_command_manifest_executes_exact_argv_and_preserves_generic_json(
     )
     assert result.stderr == b""
     assert not marker.exists()
+    assert not root.exists()
+
+
+def test_observe_manifest_preserves_pending_human_gate_report(
+    tmp_path: Path,
+) -> None:
+    pending = _full_human_gate()
+    raw_result = _run_result(status="paused", pending_human_gate=pending)
+    expected_report = json.loads(raw_result)
+    assert "pendingHumanGate" in expected_report
+    assert "humanGatePrompt" not in expected_report
+
+    child = _fake_canon(tmp_path / "observe-report", output=raw_result)
+    root = tmp_path / "runtime" / "canon" / "hermes-canon-observe-report"
+    result = subprocess.run(
+        [sys.executable, str(_runner()), str(_manifest(root, [str(child)], operation="observe"))],
+        capture_output=True,
+        shell=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == json.dumps(
+        expected_report, ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    assert json.loads(result.stdout) == expected_report
+    assert result.stderr == b""
     assert not root.exists()
 
 
@@ -1582,12 +1704,12 @@ def test_plugin_has_no_core_registration_or_alternate_runner() -> None:
 
 
 def _checkpoint_continue_request(workflow: Path, *, run_id: str = "run-checkpoint", thread_id: str = "thread-checkpoint") -> dict[str, object]:
-    packaged_request = json.loads(workflow.with_name("run-request.json").read_text(encoding="utf-8"))
+    workflow_declaration = json.loads(workflow.read_text(encoding="utf-8"))
     return {
         "schemaVersion": "checkpoint-control-request.schema.v1",
         "action": "checkpointControl",
         "mode": "continue_paused",
-        "workflowRef": packaged_request["workflowRef"],
+        "workflowRef": f"workflow:{workflow_declaration['workflowId']}",
         "runId": run_id,
         "threadId": thread_id,
         "checkpointId": "checkpoint-1",
@@ -1602,6 +1724,52 @@ def _checkpoint_continue_request(workflow: Path, *, run_id: str = "run-checkpoin
         "runConfiguration": {"durability": {"mode": "durable-production"}},
         "requestId": "request-1",
     }
+
+
+def _probe_canon_checkpoint_request(
+    argv: list[str],
+    workflow: Path,
+    *,
+    validate_semantics: bool,
+) -> subprocess.CompletedProcess[str]:
+    """Parse one checkpoint carrier in the current Canon source and its own venv."""
+    canon_root = Path(__file__).resolve().parents[4] / "projects" / "canon"
+    script = """
+import json
+import sys
+from pathlib import Path
+
+from canon.cli import _checkpoint_request_from_args, build_parser
+
+argv = json.loads(sys.argv[1])
+workflow = Path(sys.argv[2])
+parsed = _checkpoint_request_from_args(
+    build_parser().parse_args(argv),
+    workflow_path=workflow,
+    mode="continue_paused",
+)
+if sys.argv[3] == "validate":
+    from canon.checkpoint_control import CheckpointControlRequest
+    CheckpointControlRequest.from_mapping(parsed)
+print(json.dumps(parsed, ensure_ascii=False, sort_keys=True))
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(canon_root / "src")
+    return subprocess.run(
+        [
+            str(canon_root / ".venv" / "bin" / "python"),
+            "-c",
+            script,
+            json.dumps(argv[1:]),
+            str(workflow),
+            "validate" if validate_semantics else "parse",
+        ],
+        cwd=canon_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
 
 
 def test_checkpoint_continue_builds_complete_private_request_and_cli_valid_argv(
@@ -1638,17 +1806,9 @@ def test_checkpoint_continue_builds_complete_private_request_and_cli_valid_argv(
     assert config["artifact"]["root"] == str(durable / "artifacts")
     assert config["journal"]["db"] == str(durable / "journal.sqlite")
 
-    import sys
-    canon_root = Path("/home/hermes/workspaces/hermes-main/worktrees/canon-rebuild-20260906")
-    sys.path.insert(0, str(canon_root))
-    sys.path.insert(0, str(canon_root / "src"))
-    from canon.cli import _checkpoint_request_from_args, build_parser
-
-    parsed_args = build_parser().parse_args(argv[1:])
-    parsed = _checkpoint_request_from_args(
-        parsed_args, workflow_path=workflow, mode="continue_paused",
-    )
-    assert parsed == request
+    probe = _probe_canon_checkpoint_request(argv, workflow, validate_semantics=False)
+    assert probe.returncode == 0, probe.stderr
+    assert json.loads(probe.stdout) == request
 
 
 def test_checkpoint_continue_leaves_gate_semantics_to_canon(
@@ -1667,19 +1827,11 @@ def test_checkpoint_continue_leaves_gate_semantics_to_canon(
         "run_id": request["runId"], "thread_id": request["threadId"], "payload": request,
     }, root, durable_root=tmp_path / "durable")
 
-    import sys
-    canon_root = Path("/home/hermes/workspaces/hermes-main/worktrees/canon-rebuild-20260906")
-    sys.path.insert(0, str(canon_root))
-    sys.path.insert(0, str(canon_root / "src"))
-    from canon.checkpoint_control import CheckpointControlRequest
-    from canon.cli import _checkpoint_request_from_args, build_parser
-    from canon.errors import ValidationError
-
-    parsed_args = build_parser().parse_args(argv[1:])
-    parsed = _checkpoint_request_from_args(parsed_args, workflow_path=workflow, mode="continue_paused")
-    assert parsed == request
-    with pytest.raises(ValidationError):
-        CheckpointControlRequest.from_mapping(parsed)
+    parsed = _probe_canon_checkpoint_request(argv, workflow, validate_semantics=False)
+    assert parsed.returncode == 0, parsed.stderr
+    assert json.loads(parsed.stdout) == request
+    rejected = _probe_canon_checkpoint_request(argv, workflow, validate_semantics=True)
+    assert rejected.returncode != 0
 
 
 def test_checkpoint_replay_preserves_selector_lineage_and_safe_mode_in_private_carrier(

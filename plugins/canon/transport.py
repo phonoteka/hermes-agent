@@ -142,32 +142,122 @@ def _require_execution_root(value: str) -> Path:
     return path.resolve(strict=True)
 
 
-def _load_packaged_request(workflow_path: Path) -> dict[str, Any]:
-    request_path = workflow_path.with_name("run-request.json")
-    if not request_path.is_file():
-        raise CanonTransportError("selected workflow has no adjacent run-request.json authority")
+def _safe_local_json_path(pack_root: Path, raw: Any, label: str) -> Path:
+    """Resolve one declaration-owned JSON file without permitting pack escape."""
+    if not isinstance(raw, str) or not raw or Path(raw).is_absolute() or ".." in Path(raw).parts:
+        raise CanonTransportError(f"{label} must be a safe pack-relative JSON path")
+    root = pack_root.resolve(strict=True)
+    candidate = (root / raw).resolve(strict=False)
+    if not candidate.is_relative_to(root) or not candidate.is_file() or candidate.suffix != ".json":
+        raise CanonTransportError(f"{label} must name an existing JSON file inside the workflow pack")
+    return candidate
+
+
+def _read_json_object(path: Path, label: str) -> dict[str, Any]:
+    """Read one finite JSON object from a declaration-owned local file."""
     try:
-        payload = json.loads(request_path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-        raise CanonTransportError("adjacent run-request authority is not valid JSON framing") from exc
-    if not isinstance(payload, dict) or not isinstance(payload.get("runConfiguration"), dict):
-        raise CanonTransportError("adjacent run-request authority must contain an object runConfiguration")
-    _ensure_finite_json(payload)
-    return payload
+        value = _decode_json(path.read_bytes())
+    except OSError as exc:
+        raise CanonTransportError(f"{label} could not be read") from exc
+    if not isinstance(value, dict):
+        raise CanonTransportError(f"{label} must be a JSON object")
+    return value
+
+
+def _load_workflow_framing(workflow_path: Path, workflow_input: dict[str, Any], execution_root: Path) -> dict[str, Any]:
+    """Build complete durable-production framing from workflow declarations."""
+    workflow = _read_json_object(workflow_path, "workflow declaration")
+    workflow_id = workflow.get("workflowId")
+    if not isinstance(workflow_id, str) or not workflow_id:
+        raise CanonTransportError("workflow declaration requires a non-empty workflowId")
+    ports = workflow.get("workflowInputPorts")
+    if not isinstance(ports, list) or not ports or any(not isinstance(port, dict) for port in ports):
+        raise CanonTransportError("workflow declaration must declare workflow input ports")
+    port_by_id: dict[str, dict[str, Any]] = {}
+    for port in ports:
+        port_id = port.get("portId")
+        if not isinstance(port_id, str) or not port_id or port_id in port_by_id:
+            raise CanonTransportError("workflow declaration has invalid or duplicate input port")
+        for field in ("schemaRef", "logicalArtifactRef", "deliveryMode"):
+            if not isinstance(port.get(field), str) or not port[field]:
+                raise CanonTransportError(f"declared input port {port_id} requires non-empty {field}")
+        port_by_id[port_id] = port
+    if set(workflow_input) != set(port_by_id):
+        raise CanonTransportError("workflow_input must match the declared workflow input ports")
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import SchemaError as JsonSchemaError
+    from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
+
+    pack_root = workflow_path.parent
+    for port_id, port in port_by_id.items():
+        value = workflow_input[port_id]
+        if port_id == "taskInput" and (not isinstance(value, str) or not value.strip()):
+            raise CanonTransportError("taskInput must be a non-empty string")
+        schema_path = _safe_local_json_path(pack_root, port["schemaRef"], f"input schema for {port_id}")
+        schema = _read_json_object(schema_path, f"input schema for {port_id}")
+        try:
+            Draft202012Validator.check_schema(schema)
+        except JsonSchemaError as exc:
+            raise CanonTransportError(f"declared input schema for {port_id} is not a valid JSON Schema") from exc
+        try:
+            Draft202012Validator(schema).validate(value)
+        except JsonSchemaValidationError as exc:
+            if port_id == "taskInput":
+                raise CanonTransportError("taskInput must be a non-empty string") from exc
+            raise CanonTransportError(f"{port_id} does not match its declared input schema") from exc
+
+    policy_refs = workflow.get("policyRefs")
+    routing_ref = policy_refs.get("modelRoutingRef") if isinstance(policy_refs, dict) else None
+    routing_path = _safe_local_json_path(pack_root, routing_ref, "policyRefs.modelRoutingRef")
+    routing = _read_json_object(routing_path, "model routing policy")
+    routing_id = routing.get("routingId")
+    profiles = routing.get("profiles")
+    if not isinstance(routing_id, str) or not routing_id:
+        raise CanonTransportError("model routing policy requires a non-empty routingId")
+    if routing.get("failClosed") is not True:
+        raise CanonTransportError("model routing policy must declare failClosed=true")
+    if not isinstance(profiles, dict) or not isinstance(profiles.get("default"), dict):
+        raise CanonTransportError("model routing policy requires a default profile")
+
+    input_publications = [
+        {
+            "portId": port["portId"],
+            "logicalArtifactRef": port["logicalArtifactRef"],
+            "version": 1,
+            "deliveryMode": port["deliveryMode"],
+        }
+        for port in ports
+    ]
+    return {
+        "schemaVersion": "run-request.schema.v3",
+        "workflowRef": f"workflow:{workflow_id}",
+        "workflowInput": deepcopy(workflow_input),
+        "inputPublications": input_publications,
+        "runConfiguration": {
+            "schemaVersion": "run-configuration.schema.v1",
+            "executionRoot": str(execution_root),
+            "profileId": "default",
+            "modelRouting": {"registryRef": routing_id, "failClosed": True},
+            "limits": {"maxGraphSteps": 64},
+            "durability": {"mode": "durable-production"},
+        },
+    }
 
 
 def build_run_request(*, workflow_path: Path, workflow_input: dict[str, Any], execution_root: Path) -> dict[str, Any]:
-    """Project transport inputs without minting Canon run identity."""
+    """Project exact declared workflow input into Canon-owned production framing.
+
+    Hermes owns only semantic input and host execution-root transport. Canon declarations own
+    workflow identity, input publications, routing, limits, and durability; Hermes does not mint
+    or forward runId/threadId.
+    """
     if not isinstance(workflow_input, dict) or not workflow_input:
         raise CanonTransportError("workflow_input must be a non-empty object")
     _ensure_finite_json(workflow_input)
-    request = deepcopy(_load_packaged_request(workflow_path))
-    request["workflowInput"] = deepcopy(workflow_input)
-    config = deepcopy(request["runConfiguration"])
-    config["executionRoot"] = str(execution_root)
-    request["runConfiguration"] = config
-    request.pop("runId", None)
-    request.pop("threadId", None)
+    if not execution_root.is_absolute() or not execution_root.is_dir():
+        raise CanonTransportError("execution_root must be an absolute existing directory")
+    request = _load_workflow_framing(workflow_path, workflow_input, execution_root)
+    _ensure_finite_json(request)
     return request
 
 
@@ -537,10 +627,11 @@ def _validate_continue_request(
     """Bind the opaque Canon request to public transport identity without rewriting it."""
     if not isinstance(request, dict):
         raise CanonTransportError("continue_paused payload must be a JSON object")
-    packaged_request = _load_packaged_request(Path(workflow_name))
-    expected_workflow_ref = packaged_request.get("workflowRef")
-    if not isinstance(expected_workflow_ref, str) or not expected_workflow_ref.strip():
-        raise CanonTransportError("adjacent run-request authority must contain a non-empty workflowRef")
+    workflow = _read_json_object(Path(workflow_name), "workflow declaration")
+    workflow_id = workflow.get("workflowId")
+    if not isinstance(workflow_id, str) or not workflow_id.strip():
+        raise CanonTransportError("workflow declaration requires a non-empty workflowId")
+    expected_workflow_ref = f"workflow:{workflow_id}"
     identity = {
         "schemaVersion": "checkpoint-control-request.schema.v1",
         "action": "checkpointControl",
@@ -679,13 +770,21 @@ def _parse_process(raw: Any, label: str) -> dict[str, Any]:
     return result
 
 
-def _run_cli(ctx: Any, argv: list[str], *, root: Path, timeout: int, task_id: str | None = None) -> dict[str, Any]:
+def _run_cli(
+    ctx: Any,
+    argv: list[str],
+    *,
+    root: Path,
+    timeout: int,
+    task_id: str | None = None,
+    operation: str = "command",
+) -> dict[str, Any]:
     if ctx is None or not callable(getattr(ctx, "dispatch_tool", None)):
         raise CanonTransportError("Canon CLI transport requires plugin context")
     runner_root: Path | None = None
     try:
         runner_root = _create_private_root(root)
-        manifest_path = _write_manifest(runner_root, argv, timeout, operation="command")
+        manifest_path = _write_manifest(runner_root, argv, timeout, operation=operation)
         command = shlex.join([sys.executable, "-I", str(_runner_path()), str(manifest_path)])
         started = _parse_process(ctx.dispatch_tool("terminal", {
             "command": command,
@@ -991,7 +1090,14 @@ async def handle_observe(args: dict[str, Any], *, ctx: Any = None, task_id: str 
             value = args.get(name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
                 raise CanonTransportError(f"{name} must be a non-negative integer")
-        result = _run_cli(ctx, _observe_argv(args, root), root=root, timeout=90, task_id=task_id)
+        result = _run_cli(
+            ctx,
+            _observe_argv(args, root),
+            root=root,
+            timeout=90,
+            task_id=task_id,
+            operation="observe",
+        )
         return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     except Exception as exc:
         return json.dumps({"success": False, "error": _diagnostic(exc)}, ensure_ascii=False, separators=(",", ":"))

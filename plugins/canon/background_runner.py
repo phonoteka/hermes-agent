@@ -115,7 +115,7 @@ def _read_manifest(path: Path) -> tuple[dict[str, Any], Path] | None:
         return None
     if manifest.get("schemaVersion") != _MANIFEST_SCHEMA:
         return None
-    if manifest.get("operation") not in {"launch", "restart", "command"}:
+    if manifest.get("operation") not in {"launch", "restart", "command", "observe"}:
         return None
     argv = manifest.get("argv")
     if not isinstance(argv, list) or not argv or any(not isinstance(item, str) or not item for item in argv):
@@ -395,7 +395,7 @@ def _run(manifest: dict[str, Any]) -> int:
             _bounded_error("Canon process timed out")
             return 124
         if _child.returncode != 0:
-            if operation != "command":
+            if operation not in {"command", "observe"}:
                 result = _valid_failed_result(stdout)
                 if result is not None:
                     sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -403,7 +403,7 @@ def _run(manifest: dict[str, Any]) -> int:
                     return int(_child.returncode)
             _bounded_error("Canon process failed")
             return int(_child.returncode)
-        if operation == "command":
+        if operation in {"command", "observe"}:
             output = _valid_command_result(stdout)
             if output is None:
                 _bounded_error("Canon stdout framing is invalid")
@@ -414,13 +414,13 @@ def _run(manifest: dict[str, Any]) -> int:
                 _bounded_error("Canon stdout framing is invalid")
                 return 125
             output = result
-        if isinstance(output, dict) and "pendingHumanGate" in output:
+        if operation != "observe" and isinstance(output, dict) and "pendingHumanGate" in output:
             prompt = output.get("humanGatePrompt")
             if not _valid_human_gate_prompt(prompt, output):
                 _bounded_error("Canon Human Gate prompt is invalid")
                 return 125
             serialized_prompt = json.dumps(prompt, ensure_ascii=False, separators=(",", ":"))
-            if len(serialized_prompt) + 1 > _MAX_COMPLETION_CHARS:
+            if len(serialized_prompt) > _MAX_COMPLETION_CHARS:
                 _bounded_error("Canon Human Gate prompt exceeds completion boundary")
                 return 125
             output = prompt
