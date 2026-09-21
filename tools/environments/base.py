@@ -167,6 +167,11 @@ class BaseEnvironment(ABC):
         LocalEnvironment overrides for Termux where only ``TMPDIR`` is writable)."""
         return "/tmp"
 
+    def describe_actual_state(self) -> dict:
+        """Return detached, sanitized backend facts without environment data."""
+        backend = type(self).__name__.removesuffix("Environment").lower() or "unknown"
+        return {"backend": backend}
+
     def __init__(self, cwd: str, timeout: int, env: dict = None):
         self.cwd = cwd
         self.timeout = timeout

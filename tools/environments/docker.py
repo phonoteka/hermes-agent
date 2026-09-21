@@ -956,6 +956,92 @@ class DockerEnvironment(BaseEnvironment):
         logger.debug("Docker --storage-opt support: %s", _storage_opt_ok)
         return _storage_opt_ok
 
+    def describe_actual_state(self) -> dict:
+        """Inspect the active container and return only sanitized attestation facts."""
+        container_id = self._container_id
+        if not isinstance(container_id, str) or not container_id:
+            raise RuntimeError("Docker actual state requires an active container")
+        try:
+            result = subprocess.run(
+                [self._docker_exe, "inspect", container_id], capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30, check=False, stdin=subprocess.DEVNULL,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise RuntimeError("Docker actual-state inspect failed") from exc
+        if result.returncode != 0:
+            raise RuntimeError("Docker actual-state inspect failed")
+        try:
+            parsed = json.loads(result.stdout)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Docker actual-state inspect returned malformed JSON") from exc
+        if isinstance(parsed, list):
+            if len(parsed) != 1 or not isinstance(parsed[0], dict):
+                raise RuntimeError("Docker actual-state inspect returned malformed JSON")
+            inspect_obj = parsed[0]
+        elif isinstance(parsed, dict):
+            inspect_obj = parsed
+        else:
+            raise RuntimeError("Docker actual-state inspect returned malformed JSON")
+        actual_id = inspect_obj.get("Id")
+        if not isinstance(actual_id, str) or not actual_id or (actual_id != container_id and not actual_id.startswith(container_id)):
+            raise RuntimeError("Docker actual-state inspect identity mismatch")
+        image_id = inspect_obj.get("Image")
+        host_config, mounts = inspect_obj.get("HostConfig"), inspect_obj.get("Mounts")
+        if not isinstance(image_id, str) or not image_id or not isinstance(host_config, dict) or not isinstance(mounts, list):
+            raise RuntimeError("Docker actual-state inspect omitted required fields")
+        if host_config.get("NetworkMode") != "none":
+            raise RuntimeError("Docker actual-state container is not network-isolated")
+        workspace = next(
+            (mount for mount in mounts if isinstance(mount, dict) and mount.get("Destination", mount.get("Target")) == "/workspace"),
+            None,
+        )
+        if workspace is None:
+            tmpfs = host_config.get("Tmpfs")
+            options = tmpfs.get("/workspace") if isinstance(tmpfs, dict) else None
+            if isinstance(options, str) and "rw" in {item.strip().lower() for item in options.split(",")}:
+                workspace = {"Type": "tmpfs", "Mode": "rw", "RW": True}
+        if workspace is None or (workspace.get("RW") is not True and str(workspace.get("Mode") or "").lower() != "rw"):
+            raise RuntimeError("Docker actual-state /workspace mount is not rw")
+        mount_type = workspace.get("Type")
+        if mount_type == "bind":
+            source = workspace.get("Source")
+            if not isinstance(source, str) or not source:
+                raise RuntimeError("Docker actual-state bind source is missing")
+            source_digest = "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
+        elif mount_type == "tmpfs":
+            source_digest = "sha256:" + hashlib.sha256(b"tmpfs:/workspace").hexdigest()
+        else:
+            raise RuntimeError("Docker actual-state /workspace mount type is unsupported")
+
+        def string_list(value):
+            if value is None:
+                return []
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise RuntimeError("Docker actual-state controls are malformed")
+            return list(value)
+
+        controls = {
+            "capDrop": string_list(host_config.get("CapDrop")),
+            "securityOpt": string_list(host_config.get("SecurityOpt")),
+            "privileged": host_config.get("Privileged") is True,
+            "readonlyRootfs": host_config.get("ReadonlyRootfs") is True,
+            "pidsLimit": host_config.get("PidsLimit", 0),
+            "nanoCpus": host_config.get("NanoCpus", 0),
+            "memory": host_config.get("Memory", 0),
+        }
+        for key in ("pidsLimit", "nanoCpus", "memory"):
+            if isinstance(controls[key], bool) or not isinstance(controls[key], int):
+                raise RuntimeError("Docker actual-state controls are malformed")
+        inspect_digest = "sha256:" + hashlib.sha256(
+            json.dumps(inspect_obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
+        ).hexdigest()
+        return {
+            "backend": "docker", "containerId": actual_id, "imageId": image_id,
+            "inspectDigest": inspect_digest,
+            "workspaceMount": {"sourceDigest": source_digest, "target": "/workspace", "mode": "rw"},
+            "networkMode": "none", "controls": controls,
+        }
+
     def _container_network_mode(self, container_id: str) -> Optional[str]:
         """``HostConfig.NetworkMode`` of a container, or ``None`` when inspection fails (callers
         treat ``None`` as a mismatch under lockdown, so a failed inspect fails closed)."""

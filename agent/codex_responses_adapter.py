@@ -778,6 +778,7 @@ _PREFLIGHT_OPTIONAL_FIELDS: tuple[tuple[str, Callable[[Any], bool], Optional[Cal
 
 _PREFLIGHT_ALLOWED_KEYS = {
     "model", "instructions", "input", "tools", "store", "extra_headers", "extra_body",
+    "text",
     *(key for key, _, _ in _PREFLIGHT_OPTIONAL_FIELDS),
 }
 
@@ -787,6 +788,42 @@ def _optional_dict(api_kwargs: Dict[str, Any], key: str) -> Optional[Dict[str, A
     if value is not None and not isinstance(value, dict):
         raise ValueError(f"Codex Responses request '{key}' must be an object.")
     return value
+
+
+def _validate_codex_json_object(value: Any, path: str = "text.format.schema") -> None:
+    """Reject non-JSON values without coercing schema semantics."""
+    if not isinstance(value, dict):
+        raise ValueError(f"Codex Responses {path} must be a JSON object.")
+
+    def validate(item: Any, item_path: str, active: Optional[set] = None) -> None:
+        if active is None:
+            active = set()
+        if item is None or isinstance(item, (str, bool, int)):
+            return
+        if isinstance(item, float):
+            if item != item or item in (float("inf"), float("-inf")):
+                raise ValueError(f"Codex Responses {item_path} contains a non-JSON number.")
+            return
+        if isinstance(item, (list, dict)):
+            marker = id(item)
+            if marker in active:
+                raise ValueError(f"Codex Responses {item_path} contains a cyclic value.")
+            active.add(marker)
+            try:
+                if isinstance(item, list):
+                    for index, child in enumerate(item):
+                        validate(child, f"{item_path}[{index}]", active)
+                else:
+                    for key, child in item.items():
+                        if not isinstance(key, str):
+                            raise ValueError(f"Codex Responses {item_path} object keys must be strings.")
+                        validate(child, f"{item_path}.{key}", active)
+            finally:
+                active.remove(marker)
+            return
+        raise ValueError(f"Codex Responses {item_path} contains a non-JSON value.")
+
+    validate(value, path)
 
 
 def _preflight_codex_api_kwargs(
@@ -815,6 +852,39 @@ def _preflight_codex_api_kwargs(
             raise ValueError("Codex Responses request 'tools' must be a list when provided.")
         normalized_tools = [_preflight_tool(tool, idx) for idx, tool in enumerate(tools)]
         normalized["tools"] = _neutralize_harmony_structure(normalized_tools) if sanitize_harmony_tokens else normalized_tools
+    text_projection = None
+    if "text" in api_kwargs:
+        text = api_kwargs["text"]
+        if not isinstance(text, dict) or set(text) != {"format"}:
+            raise ValueError(
+                "Codex Responses request 'text' must contain exactly the 'format' field."
+            )
+        text_format = text["format"]
+        expected_format_fields = {"type", "name", "strict", "schema"}
+        if not isinstance(text_format, dict) or set(text_format) != expected_format_fields:
+            raise ValueError(
+                "Codex Responses request 'text.format' must contain exactly "
+                "type, name, strict and schema."
+            )
+        if text_format.get("type") != "json_schema":
+            raise ValueError("Codex Responses request 'text.format.type' must be 'json_schema'.")
+        if text_format.get("name") != "canon_phase_output":
+            raise ValueError(
+                "Codex Responses request 'text.format.name' must be 'canon_phase_output'."
+            )
+        if text_format.get("strict") is not True:
+            raise ValueError("Codex Responses request 'text.format.strict' must be true.")
+        schema = text_format["schema"]
+        _validate_codex_json_object(schema)
+        text_projection = {
+            "format": {
+                "type": text_format["type"],
+                "name": text_format["name"],
+                "strict": text_format["strict"],
+                "schema": schema,
+            }
+        }
+        normalized["text"] = text_projection
     if api_kwargs.get("store", False) is not False:
         raise ValueError("Codex Responses contract requires 'store' to be false.")
     for key, accept, coerce in _PREFLIGHT_OPTIONAL_FIELDS:

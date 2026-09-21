@@ -181,7 +181,7 @@ def get_active_env(task_id: str):
         return _active_environments.get(lookup) or _active_environments.get(task_id)
 
 
-def ensure_task_env(task_id: Optional[str] = None):
+def ensure_task_env(task_id: Optional[str] = None, required_backend: Optional[str] = None):
     """Lazily create and cache the sandbox env for *task_id* if none is active.
 
     Lets non-terminal callers (``tools.image_source`` reading container-only
@@ -197,11 +197,18 @@ def ensure_task_env(task_id: Optional[str] = None):
     """
     from tools.terminal_tool import (
         _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
-        _get_env_config, _last_activity, _resolve_container_task_id,
+        _last_activity, _resolve_container_task_id, get_task_environment_config,
+        resolve_task_environment_config,
         _resolve_task_host_cwd, _select_image, _start_cleanup_thread, resolve_task_overrides,
     )
-    config = _get_env_config()
+    config = resolve_task_environment_config(task_id)
     env_type = config["env_type"]
+    if required_backend and env_type != required_backend:
+        from tools.terminal_tool import TaskEnvironmentFailure
+        return TaskEnvironmentFailure(
+            "required_backend_mismatch", env_type,
+            f"task environment backend is {env_type!r}, required {required_backend!r}",
+        )
     if env_type == "local":
         return None
 
@@ -235,6 +242,12 @@ def ensure_task_env(task_id: Optional[str] = None):
                 "Lazy %s environment init failed for task %s: %s",
                 env_type, effective_task_id[:8], exc,
             )
+            if required_backend or get_task_environment_config(task_id) is not None:
+                from tools.terminal_tool import TaskEnvironmentFailure
+                return TaskEnvironmentFailure(
+                    "environment_creation_failed", env_type,
+                    f"failed to create the {env_type} task environment",
+                )
             return None
 
         with _env_lock:
@@ -305,6 +318,52 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
         env, task_id, force_remove=force_remove,
         done_msg="Manually cleaned up environment for task: %s",
     )
+
+
+def cleanup_task_environment(task_id: str) -> dict[str, Any]:
+    """Force-remove exactly one task environment and verify owned registry state."""
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("task_id is required")
+    from tools.terminal_tool import (
+        _container_aliases, _container_alias_lock, _creation_locks, _creation_locks_lock,
+        _session_cwd, _session_cwd_lock, get_task_environment_config,
+    )
+    snapshot = get_task_environment_config(task_id)
+    environment = get_active_env(task_id)
+    task_digest = snapshot.digest if snapshot is not None else None
+    backend = snapshot.to_dict().get("env_type") if snapshot is not None else None
+    cleanup_vm(task_id, force_remove=True)
+    wait_for_cleanup = getattr(environment, "wait_for_cleanup", None) if environment is not None else None
+    if callable(wait_for_cleanup) and wait_for_cleanup(timeout=30) is False:
+        raise RuntimeError("task environment cleanup did not finish within 30 seconds")
+    from tools.terminal_tool import clear_task_env_overrides
+    clear_task_env_overrides(task_id)
+    active_absent = get_active_env(task_id) is None
+    snapshot_absent = get_task_environment_config(task_id) is None
+    with _creation_locks_lock:
+        creation_lock_absent = task_id not in _creation_locks
+    with _session_cwd_lock:
+        session_cwd_absent = task_id not in _session_cwd
+    with _container_alias_lock:
+        container_alias_absent = task_id not in _container_aliases
+    registry_clean = all((active_absent, snapshot_absent, creation_lock_absent, session_cwd_absent, container_alias_absent))
+    if not registry_clean:
+        raise RuntimeError("task environment cleanup left task registry state")
+    if isinstance(task_digest, str) and not task_digest.startswith("sha256:"):
+        task_digest = "sha256:" + task_digest
+    return {
+        "taskId": task_id,
+        "status": "cleaned" if environment is not None else "already-clean",
+        "backend": backend,
+        "taskEnvironmentDigest": task_digest,
+        "registryClean": {
+            "activeEnvironment": active_absent,
+            "taskSnapshot": snapshot_absent,
+            "creationLock": creation_lock_absent,
+            "sessionCwd": session_cwd_absent,
+            "containerAlias": container_alias_absent,
+        },
+    }
 
 
 def _evict_environment_for_task(task_id: Optional[str]) -> None:

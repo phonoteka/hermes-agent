@@ -36,6 +36,7 @@ from tools.file_tools_read_tracking import (
     _mark_verification_stale, _patch_failure_lock, _patch_failure_tracker, _read_tracker,
     _read_tracker_lock, _record_not_found, _record_patch_failure, _reset_patch_failures,
     _task_data, _update_read_timestamp)
+from tools.tool_execution_scope import get_tool_execution_scope
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,18 @@ def _rewrite_v4a_patch_paths_for_host(patch: str, path_to_resolved: dict, file_o
 
     patch = _V4A_SINGLE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(3))}", patch)
     return _V4A_MOVE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_res(m.group(2))} -> {_res(m.group(3))}", patch)
+
+
+def _rewrite_scoped_v4a_patch_paths(patch: str, path_to_resolved: dict) -> str:
+    """Rewrite every authorized V4A endpoint to its scope-resolved target."""
+    def _resolved(raw: str) -> str:
+        raw = raw.strip()
+        return path_to_resolved.get(raw) or raw
+
+    patch = _V4A_SINGLE_HEADER_RE.sub(lambda m: f"{m.group(1)}{_resolved(m.group(3))}", patch)
+    return _V4A_MOVE_HEADER_RE.sub(
+        lambda m: f"{m.group(1)}{_resolved(m.group(2))} -> {_resolved(m.group(3))}", patch
+    )
 
 
 def _is_blocked_device_path(path: str) -> bool:
@@ -549,7 +562,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
                 f"Cannot read '{path}': this is a device file that would "
                 "block or produce infinite output.")
 
-        _resolved = _resolve_path_for_task(path, task_id)
+        _resolved = _resolve_scope_checked_path(path, task_id, write=False)
 
         # A read on a FIFO/socket blocks until the exec timeout: a self-shipped DoS.
         if _file_ops_uses_host_paths(_get_file_ops(task_id)):
@@ -602,7 +615,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
             except OSError:
                 pass  # stat failed — fall through to full read
 
-        result = _get_file_ops(task_id).read_file(path, offset, limit)
+        read_target = str(_resolved) if get_tool_execution_scope() is not None else path
+        result = _get_file_ops(task_id).read_file(read_target, offset, limit)
         result_dict = result.to_dict()
 
         # Cache a not-found result for retries. Deliberately NO early return:
@@ -654,10 +668,37 @@ def read_file_tool(path: str, offset: int = 1, limit: int = DEFAULT_READ_LIMIT, 
 
 def _resolve_or_none(filepath: str, task_id: str) -> str | None:
     """Task-resolved path string, or None when resolution fails for any reason."""
+    scope = get_tool_execution_scope()
     try:
-        return str(_resolve_path_for_task(filepath, task_id))
+        resolved = (
+            _resolve_scope_checked_path(filepath, task_id, write=True)
+            if scope is not None else _resolve_path_for_task(filepath, task_id)
+        )
+        return str(resolved)
     except Exception:
+        if scope is not None:
+            raise
         return None
+
+
+def _resolve_scope_checked_path(filepath: str, task_id: str, *, write: bool):
+    """Resolve a path and enforce active tool authority before backend I/O."""
+    scope = get_tool_execution_scope()
+    resolved = scope.resolve_path(filepath) if scope is not None else _resolve_path_for_task(filepath, task_id)
+    if scope is None:
+        return resolved
+    resolved_text = str(resolved)
+    allowed = scope.allows_write(resolved_text) if write else scope.allows_read(resolved_text)
+    if allowed:
+        return resolved
+    action = "write" if write else "read"
+    if scope.contains(resolved_text):
+        raise PermissionError(f"Path '{resolved}' is outside active effect {action} allowlist")
+    roots = scope.write_roots if write else scope.read_roots
+    raise PermissionError(
+        f"Path '{resolved}' is outside the active tool execution {action} roots: "
+        + (", ".join(roots) or "<none>")
+    )
 
 
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
@@ -880,7 +921,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(_rewrite_v4a_patch_paths_for_host(patch, _path_to_resolved, file_ops))
+                forwarded_patch = (
+                    _rewrite_scoped_v4a_patch_paths(patch, _path_to_resolved)
+                    if get_tool_execution_scope() is not None
+                    else _rewrite_v4a_patch_paths_for_host(patch, _path_to_resolved, file_ops)
+                )
+                result = file_ops.patch_v4a(forwarded_patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
@@ -947,8 +993,14 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 pattern=pattern,
                 already_searched=count)
 
+        scope = get_tool_execution_scope()
         try:
-            resolved_search_path = str(_resolve_path_for_task(path, task_id))
+            resolved_search = _resolve_scope_checked_path(path, task_id, write=False)
+            resolved_search_path = str(resolved_search)
+            if scope is not None and not scope.allows_read_tree(resolved_search):
+                raise PermissionError(f"Path '{resolved_search}' is outside active effect read allowlist")
+        except PermissionError:
+            raise
         except (OSError, ValueError, RuntimeError) as exc:
             resolved_search_path = path
             # A RuntimeError still surfaces as the tool error unless the raw
@@ -966,7 +1018,7 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             return cached_search_nf
 
         result = _get_file_ops(task_id).search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern, path=resolved_search_path if scope is not None else path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context, order=order)
         omitted = _filter_read_blocked_search_results(result, task_id)
         for m in getattr(result, "matches", None) or ():

@@ -635,3 +635,144 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
+
+
+# ---------------------------------------------------------------------------
+# Canon strict structured-output projection — current Codex owner RED.
+# Keep builder imports inside builder-dependent tests so absence of the target
+# API is reported as a causal test failure rather than a collection failure.
+# ---------------------------------------------------------------------------
+
+
+def _canon_text_preflight_kwargs(text):
+    return {
+        "model": "gpt-5.5",
+        "instructions": "You are Hermes.",
+        "input": [{"role": "user", "content": "hi"}],
+        "store": False,
+        "text": text,
+    }
+
+
+def test_canon_text_projection_builder_emits_exact_positive_projection():
+    from agent.transports.codex import build_canon_responses_text_format
+
+    schema = {
+        "type": "object",
+        "properties": {"result": {"type": "string"}},
+        "required": ["result"],
+        "additionalProperties": False,
+    }
+
+    assert build_canon_responses_text_format(schema) == {
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "canon_phase_output",
+                "strict": True,
+                "schema": schema,
+            },
+        },
+    }
+
+
+def test_canon_text_projection_builder_detaches_schema_mapping():
+    from agent.transports.codex import build_canon_responses_text_format
+
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
+    projection = build_canon_responses_text_format(schema)
+    projected_schema = projection["text"]["format"]["schema"]
+
+    assert projected_schema == schema
+    assert projected_schema is not schema
+    assert projected_schema["properties"] is not schema["properties"]
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        None,
+        [],
+        "not an object",
+        {"type": ("object",)},
+        {1: "non-string key"},
+    ],
+)
+def test_canon_text_projection_builder_rejects_non_json_schema_values(schema):
+    from agent.transports.codex import build_canon_responses_text_format
+
+    with pytest.raises(ValueError):
+        build_canon_responses_text_format(schema)
+
+
+def test_canon_text_projection_builder_rejects_cyclic_schema():
+    from agent.transports.codex import build_canon_responses_text_format
+
+    schema = {"type": "object"}
+    schema["self"] = schema
+
+    with pytest.raises(ValueError):
+        build_canon_responses_text_format(schema)
+
+
+def test_canon_text_projection_builder_rejects_non_finite_schema_numbers():
+    import math
+
+    from agent.transports.codex import build_canon_responses_text_format
+
+    for value in (math.nan, math.inf, -math.inf):
+        with pytest.raises(ValueError):
+            build_canon_responses_text_format({"minimum": value})
+
+
+def test_canon_text_projection_preflight_accepts_exact_shape_and_preserves_schema_identity():
+    schema = {
+        "type": "object",
+        "properties": {"result": {"type": "string"}},
+        "required": ["result"],
+        "additionalProperties": False,
+    }
+    text = {
+        "format": {
+            "type": "json_schema",
+            "name": "canon_phase_output",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+    normalized = _preflight_codex_api_kwargs(_canon_text_preflight_kwargs(text))
+
+    assert normalized["text"] == text
+    assert normalized["text"]["format"]["schema"] is schema
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        {},
+        {"format": {"type": "json_schema", "name": "canon_phase_output", "strict": True}},
+        {"format": {"type": "wrong", "name": "canon_phase_output", "strict": True, "schema": {}}},
+        {"format": {"type": "json_schema", "name": "other", "strict": True, "schema": {}}},
+        {"format": {"type": "json_schema", "name": "canon_phase_output", "strict": False, "schema": {}}},
+        {"format": {"type": "json_schema", "name": "canon_phase_output", "strict": True, "schema": []}},
+        {"format": {"type": "json_schema", "name": "canon_phase_output", "strict": True, "schema": {}, "extra": 1}},
+        "arbitrary text",
+    ],
+)
+def test_canon_text_projection_preflight_rejects_malformed_exact_shapes(text):
+    with pytest.raises(ValueError):
+        _preflight_codex_api_kwargs(_canon_text_preflight_kwargs(text))
+
+
+def test_canon_text_projection_preflight_rejects_response_format_fallback():
+    kwargs = {
+        "model": "gpt-5.5",
+        "instructions": "You are Hermes.",
+        "input": [{"role": "user", "content": "hi"}],
+        "store": False,
+        "response_format": {"type": "json_schema", "json_schema": {"name": "x"}},
+    }
+
+    with pytest.raises(ValueError, match=r"unsupported field.*response_format"):
+        _preflight_codex_api_kwargs(kwargs)

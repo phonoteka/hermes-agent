@@ -3007,3 +3007,144 @@ def test_model_not_found_notice_absent_when_fallback_chain_configured(monkeypatc
     text = _format_async(evt)
     assert text.count("SUBAGENT MODEL REJECTED") == 1
     assert "No fallback chain is configured" not in text
+
+
+class _ShellNoiseChunkBuffer:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def read1(self, _size):
+        return self._chunks.pop(0) if self._chunks else b""
+
+
+class _ShellNoiseStdout:
+    def __init__(self, chunks):
+        self.buffer = _ShellNoiseChunkBuffer(chunks)
+
+    def close(self):
+        pass
+
+
+class _ShellNoiseProcess:
+    def __init__(self, chunks):
+        self.stdout = _ShellNoiseStdout(chunks)
+        self.stderr = None
+        self.stdin = None
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def _read_shell_noise_log(registry, monkeypatch, chunks, sid):
+    import tools.process_registry as process_registry_module
+
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(process_registry_module, "save_completed_result", lambda _session: None)
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda _session, _chunk: None)
+    session = _make_session(sid=sid)
+    session.notify_on_complete = False
+    session.process = _ShellNoiseProcess(chunks)
+    registry._running[session.id] = session
+    registry._reader_loop(session)
+    return registry.read_log(session.id, offset=0, limit=4096)
+
+
+_KNOWN_SHELL_WARNING = b"bash: no job control in this shell\n"
+_CANON_JSON_LINE = b'{"result":"ok"}\n'
+
+
+@pytest.mark.parametrize("split", range(1, len(_KNOWN_SHELL_WARNING) + 1))
+def test_reader_log_strips_known_shell_warning_across_every_chunk_boundary(registry, monkeypatch, split):
+    log = _read_shell_noise_log(
+        registry,
+        monkeypatch,
+        [_KNOWN_SHELL_WARNING[:split], _KNOWN_SHELL_WARNING[split:] + _CANON_JSON_LINE],
+        sid=f"proc_shell_noise_split_{split}",
+    )
+
+    assert log["output"] == _CANON_JSON_LINE.decode().rstrip("\n")
+    assert log["total_lines"] == 1
+
+
+@pytest.mark.parametrize(
+    ("chunks", "expected"),
+    [
+        (
+            [
+                b"bash: no job control in this shell\n",
+                b"bash: cannot set terminal process group (-1): Inappropriate ioctl for device\n",
+                _CANON_JSON_LINE,
+            ],
+            _CANON_JSON_LINE.decode().rstrip("\n"),
+        ),
+        ([b"bash: no job control in this shell"], ""),
+        ([b"bash: no job control in this shell\n", _CANON_JSON_LINE], _CANON_JSON_LINE.decode().rstrip("\n")),
+    ],
+)
+def test_reader_log_handles_multiple_warnings_eof_warning_and_trailing_newline(
+    registry, monkeypatch, chunks, expected
+):
+    log = _read_shell_noise_log(registry, monkeypatch, chunks, sid="proc_shell_noise_variants")
+
+    assert log["output"] == expected
+    assert log["total_lines"] == (1 if expected else 0)
+
+
+def test_reader_log_shell_noise_preserves_oversized_leading_prefix(registry, monkeypatch):
+    prefix = b"bash: " + b"x" * 8192 + b"\n"
+    log = _read_shell_noise_log(
+        registry,
+        monkeypatch,
+        [prefix[:5], prefix[5:4096], prefix[4096:] + _CANON_JSON_LINE],
+        sid="proc_shell_noise_oversized",
+    )
+
+    assert len(prefix) == 8199
+    assert log["output"] == (prefix + _CANON_JSON_LINE).decode().rstrip("\n")
+    assert log["total_lines"] == 2
+    assert prefix.decode().rstrip("\n") in log["output"]
+    assert _CANON_JSON_LINE.decode().rstrip("\n") in log["output"]
+
+
+def test_reader_log_shell_noise_preserves_warning_phrase_inside_valid_json(registry, monkeypatch):
+    payload = b'{"message":"no job control in this shell"}\n'
+    log = _read_shell_noise_log(registry, monkeypatch, [payload], sid="proc_shell_noise_payload")
+
+    assert log["output"] == payload.decode().rstrip("\n")
+    assert log["total_lines"] == 1
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"bash: prefix no job control in this shell suffix\n",
+        b"bash: cannot set terminal process group (-1): Inappropriate ioctl for device suffix\n",
+        b"bash: tcsetattr: Inappropriate ioctl for device suffix\n",
+    ],
+)
+def test_reader_log_shell_noise_preserves_non_allowlisted_warning_like_lines(
+    registry, monkeypatch, line
+):
+    log = _read_shell_noise_log(
+        registry,
+        monkeypatch,
+        [line, _CANON_JSON_LINE],
+        sid="proc_shell_noise_warning_like",
+    )
+
+    assert log["output"] == (line + _CANON_JSON_LINE).decode().rstrip("\n")
+    assert log["total_lines"] == 2
+
+
+def test_reader_log_shell_noise_preserves_unknown_diagnostic_and_malformed_payload(registry, monkeypatch):
+    log = _read_shell_noise_log(
+        registry,
+        monkeypatch,
+        [b"diagnostic: unexpected stderr\n{not-json}\n"],
+        sid="proc_shell_noise_negative",
+    )
+
+    assert "diagnostic: unexpected stderr" in log["output"]
+    assert "{not-json}" in log["output"]
+    assert log["total_lines"] == 2

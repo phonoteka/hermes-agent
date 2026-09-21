@@ -22,6 +22,64 @@ from agent.transports.types import NormalizedResponse, ToolCall
 
 logger = logging.getLogger(__name__)
 
+
+def build_canon_responses_text_format(output_schema: Any) -> dict[str, Any]:
+    """Build the provider-owned strict JSON-schema Responses projection.
+
+    The schema must be a JSON object. Validation before serialization rejects
+    Python values that JSON would coerce (for example tuple values or
+    non-string object keys), while the JSON round-trip returns a detached
+    mapping for the per-invocation request carrier.
+    """
+    def validate_json_value(value: Any, path: str, active: Optional[set] = None) -> None:
+        if active is None:
+            active = set()
+        if value is None or isinstance(value, (str, bool, int)):
+            return
+        if isinstance(value, float):
+            if value != value or value in (float("inf"), float("-inf")):
+                raise ValueError(f"output_schema contains a non-JSON number at {path}.")
+            return
+        if isinstance(value, (list, dict)):
+            marker = id(value)
+            if marker in active:
+                raise ValueError(f"output_schema contains a cyclic value at {path}.")
+            active.add(marker)
+            try:
+                if isinstance(value, list):
+                    for index, item in enumerate(value):
+                        validate_json_value(item, f"{path}[{index}]", active)
+                else:
+                    for key, item in value.items():
+                        if not isinstance(key, str):
+                            raise ValueError(f"output_schema object keys must be strings at {path}.")
+                        validate_json_value(item, f"{path}.{key}", active)
+            finally:
+                active.remove(marker)
+            return
+        raise ValueError(f"output_schema contains a non-JSON value at {path}.")
+
+    if not isinstance(output_schema, dict):
+        raise ValueError("output_schema must be a JSON object.")
+    validate_json_value(output_schema, "$")
+    try:
+        detached_schema = json.loads(
+            json.dumps(output_schema, ensure_ascii=False, allow_nan=False)
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("output_schema must be JSON-serializable.") from exc
+    return {
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "canon_phase_output",
+                "strict": True,
+                "schema": detached_schema,
+            }
+        }
+    }
+
+
 # Cron fires use ``cron_<job_id>_<YYYYMMDD_HHMMSS>``; the per-fire timestamp is
 # stripped so repeat fires of one job share a cache scope.
 # See #51395, #52295.

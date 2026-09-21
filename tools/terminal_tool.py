@@ -18,14 +18,21 @@ import/patch target): ``terminal_tool_config`` (TERMINAL_* reads, ``_quiet``),
 ``terminal_tool_result`` (foreground result post-processing).
 """
 
+import hashlib
 import json
 import logging
 import os
+import re
+import shlex
 import sys
 import time
 import threading
 import atexit
+from copy import deepcopy
+from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
+from types import MappingProxyType
 from typing import Optional, Dict, Any, List
 
 logger = logging.getLogger(__name__)
@@ -41,7 +48,8 @@ def _redact_terminal_error_text(value: Any) -> str:
 from tools.registry import tool_error
 from tools.terminal_tool_lifecycle import (
     _check_disk_usage_warning, _cleanup_inactive_envs, _create_configured_env,
-    _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
+    _evict_environment_for_task, cleanup_all_environments, cleanup_task_environment,
+    ensure_task_env, get_active_env,
 )
 from tools.terminal_tool_config import (
     _is_container_backend, _is_host_cwd, _is_unusable_container_cwd, _parse_env_var,
@@ -52,6 +60,8 @@ from tools.terminal_tool_backends import (
 )
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled
+from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
+from tools.tool_execution_scope import get_tool_execution_scope
 
 
 def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
@@ -230,6 +240,204 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 # loop; sandbox creation consults this first, then the TERMINAL_* env vars.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
 
+
+def _freeze_task_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({key: _freeze_task_value(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze_task_value(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze_task_value(item) for item in value)
+    return value
+
+
+def _thaw_task_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_task_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_thaw_task_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return {_thaw_task_value(item) for item in value}
+    return value
+
+
+@dataclass(frozen=True)
+class TaskEnvironmentConfig:
+    """Immutable normalized environment authority for one task."""
+
+    values: Mapping[str, Any]
+    digest: str
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self.values[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _thaw_task_value(self.values)
+
+    as_dict = to_dict
+
+
+@dataclass(frozen=True)
+class TaskEnvironmentFailure:
+    code: str
+    backend: str
+    message: str
+
+
+class TaskEnvironmentBindingError(ValueError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+_task_environment_configs: Dict[str, TaskEnvironmentConfig] = {}
+_task_environment_lock = threading.RLock()
+
+
+def _profile_terminal_environment(profile_config: Mapping[str, Any]) -> Dict[str, str]:
+    """Project one profile's terminal values into an explicit terminal scope."""
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP, _terminal_env_value
+
+    terminal = profile_config.get("terminal", {}) if isinstance(profile_config, Mapping) else {}
+    if not isinstance(terminal, Mapping):
+        terminal = {}
+    projected: Dict[str, str] = {}
+    for key, env_name in TERMINAL_CONFIG_ENV_MAP.items():
+        if key not in terminal or terminal[key] is None:
+            continue
+        projected[env_name] = _terminal_env_value(terminal[key])
+    projected.setdefault("TERMINAL_ENV", "local")
+    projected.setdefault("TERMINAL_CWD", ".")
+    return projected
+
+
+def normalize_task_environment_config(profile_config: Mapping[str, Any]) -> TaskEnvironmentConfig:
+    """Normalize a selected profile through terminal-scope reads, never ambient env."""
+    token = set_terminal_scope(_profile_terminal_environment(profile_config))
+    try:
+        config = _get_env_config()
+    finally:
+        reset_terminal_scope(token)
+    frozen = _freeze_task_value(config)
+    canonical = json.dumps(
+        _thaw_task_value(frozen), sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+    return TaskEnvironmentConfig(MappingProxyType(frozen), hashlib.sha256(canonical.encode()).hexdigest())
+
+
+def register_task_environment_config(task_id: str, profile_config: Mapping[str, Any]) -> TaskEnvironmentConfig:
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise TaskEnvironmentBindingError("task_id_required", "task environment registration requires a non-empty task ID")
+    snapshot = normalize_task_environment_config(profile_config)
+    with _task_environment_lock:
+        previous = _task_environment_configs.get(task_id)
+        if previous is not None:
+            if previous.digest == snapshot.digest:
+                return previous
+            raise TaskEnvironmentBindingError(
+                "task_environment_digest_mismatch",
+                "task environment binding cannot be replaced after registration",
+            )
+        _task_environment_configs[task_id] = snapshot
+    return snapshot
+
+
+def get_task_environment_config(task_id: Optional[str]) -> Optional[TaskEnvironmentConfig]:
+    if not task_id:
+        return None
+    with _task_environment_lock:
+        return _task_environment_configs.get(task_id)
+
+
+def _validate_actual_task_facts(facts: Any) -> dict[str, Any]:
+    """Validate the exact secret-free backend fact projection."""
+    if not isinstance(facts, dict):
+        raise RuntimeError("task environment actual state must be an object")
+    required = {"backend", "containerId", "imageId", "inspectDigest", "workspaceMount", "networkMode", "controls"}
+    if set(facts) != required:
+        raise RuntimeError("task environment actual state has an unsupported shape")
+    if facts.get("backend") != "docker" or facts.get("networkMode") != "none":
+        raise RuntimeError("task environment actual state contradicts Docker authority")
+    digest_re = re.compile(r"^sha256:[0-9a-f]{64}$")
+    for key in ("containerId", "imageId"):
+        if not isinstance(facts.get(key), str) or not facts[key]:
+            raise RuntimeError("task environment actual state identity is malformed")
+    if not isinstance(facts.get("inspectDigest"), str) or not digest_re.fullmatch(facts["inspectDigest"]):
+        raise RuntimeError("task environment actual state inspect digest is malformed")
+    workspace = facts.get("workspaceMount")
+    if not isinstance(workspace, dict) or set(workspace) != {"sourceDigest", "target", "mode"}:
+        raise RuntimeError("task environment actual state workspace mount is malformed")
+    if (
+        not isinstance(workspace.get("sourceDigest"), str)
+        or not digest_re.fullmatch(workspace["sourceDigest"])
+        or workspace.get("target") != "/workspace"
+        or workspace.get("mode") != "rw"
+    ):
+        raise RuntimeError("task environment actual state workspace mount is malformed")
+    controls = facts.get("controls")
+    control_keys = {"capDrop", "securityOpt", "privileged", "readonlyRootfs", "pidsLimit", "nanoCpus", "memory"}
+    if not isinstance(controls, dict) or set(controls) != control_keys:
+        raise RuntimeError("task environment actual state controls are malformed")
+    for key in ("capDrop", "securityOpt"):
+        if not isinstance(controls[key], list) or not all(isinstance(item, str) for item in controls[key]):
+            raise RuntimeError("task environment actual state controls are malformed")
+    for key in ("privileged", "readonlyRootfs"):
+        if not isinstance(controls[key], bool):
+            raise RuntimeError("task environment actual state controls are malformed")
+    for key in ("pidsLimit", "nanoCpus", "memory"):
+        if isinstance(controls[key], bool) or not isinstance(controls[key], int):
+            raise RuntimeError("task environment actual state controls are malformed")
+    forbidden = {"env", "config", "labels", "name", "command", "source"}
+    if any(str(key).lower() in forbidden for key in facts):
+        raise RuntimeError("task environment actual state contains forbidden data")
+    return deepcopy(facts)
+
+
+def describe_task_environment_actual_state(task_id: str, required_backend: str = "docker") -> dict[str, Any]:
+    """Describe one registered active task environment with an exact redacted projection."""
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("task_id is required")
+    snapshot = get_task_environment_config(task_id)
+    if snapshot is None:
+        raise RuntimeError("task environment snapshot is not registered")
+    backend = snapshot.to_dict().get("env_type")
+    if not isinstance(required_backend, str) or backend != required_backend:
+        raise RuntimeError("task environment backend does not match required backend")
+    environment = get_active_env(task_id)
+    if environment is None:
+        raise RuntimeError("task environment is not active")
+    describe = getattr(environment, "describe_actual_state", None)
+    if not callable(describe):
+        raise RuntimeError("task environment does not support actual-state description")
+    facts = _validate_actual_task_facts(describe())
+    task_digest = snapshot.digest
+    if not isinstance(task_digest, str) or not re.fullmatch(r"(?:sha256:)?[0-9a-f]{64}", task_digest):
+        raise RuntimeError("task environment snapshot digest is malformed")
+    facts["taskEnvironmentDigest"] = task_digest if task_digest.startswith("sha256:") else "sha256:" + task_digest
+    return deepcopy(facts)
+
+
+def resolve_task_environment_config(task_id: Optional[str]) -> Dict[str, Any]:
+    snapshot = get_task_environment_config(task_id)
+    return snapshot.to_dict() if snapshot is not None else _get_env_config()
+
+
+def _validate_registered_overrides(task_id: str, overrides: Mapping[str, Any]) -> None:
+    snapshot = get_task_environment_config(task_id)
+    if snapshot is None or not overrides:
+        return
+    values = snapshot.to_dict()
+    for key, value in overrides.items():
+        if key not in values or values[key] != value:
+            raise TaskEnvironmentBindingError(
+                "task_environment_widening_rejected",
+                "registered task environment overrides must be empty or exact snapshot no-ops",
+            )
+
 # Per-session cwd records: the durable source of truth for "which directory
 # is THIS session in". Keyed by the raw session/task key, NOT the collapsed
 # container id — the env is shared across sessions, so cwd state stored on
@@ -282,7 +490,10 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
     too, so env-side seeding stays consistent (ACP switching project root
     mid-session via ``session/load``).
     """
-    _task_env_overrides[task_id] = overrides
+    _validate_registered_overrides(task_id, overrides)
+    if get_task_environment_config(task_id) is not None:
+        return
+    _task_env_overrides[task_id] = dict(overrides)
 
     new_cwd = overrides.get("cwd")
     if isinstance(new_cwd, str) and new_cwd.strip():
@@ -300,6 +511,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
 def clear_task_env_overrides(task_id: str):
     """Drop a task's overrides, cwd record and container alias (rollout cleanup)."""
     _task_env_overrides.pop(task_id, None)
+    with _task_environment_lock:
+        _task_environment_configs.pop(task_id, None)
     clear_session_cwd(task_id)
     with _container_alias_lock:
         _container_aliases.pop(task_id, None)
@@ -415,6 +628,8 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
        keyed profile would split from its gateway sessions), else ``"default"``,
        which subagent ids collapse onto to share the parent's container.
     """
+    if task_id and get_task_environment_config(task_id) is not None:
+        return task_id
     if task_id and _has_isolation_overrides(task_id):
         return task_id
     scope = _session_scope()
@@ -766,6 +981,54 @@ def _resolve_notification_flag_conflict(*, notify_on_complete: bool, watch_patte
     return watch_patterns, ""
 
 
+_SCOPED_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_@%+=:,.-])/(?:[A-Za-z0-9._~+@%:=,/-]+)")
+_SCOPED_RUNTIME_ROOTS = tuple(Path(path).resolve(strict=False) for path in ("/usr", "/bin", "/lib", "/lib64"))
+
+
+def _scoped_command_path_error(command: str) -> str | None:
+    """Reject explicit absolute command paths outside the active scope."""
+    scope = get_tool_execution_scope()
+    if scope is None:
+        return None
+    for match in _SCOPED_ABSOLUTE_PATH_RE.finditer(command):
+        raw = match.group(0).rstrip(".,;:)]}")
+        if not raw or raw == "/":
+            continue
+        try:
+            candidate = Path(raw).expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            return f"Terminal command path literal '{raw}' is invalid under the active tool execution scope"
+        if not scope.contains(candidate) and not any(
+            runtime_root == candidate or runtime_root in candidate.parents
+            for runtime_root in _SCOPED_RUNTIME_ROOTS
+        ):
+            return (
+                f"Terminal command path literal '{candidate}' is outside the active tool execution root "
+                f"'{scope.root_directory}'"
+            )
+    return None
+
+
+def _landlock_scoped_command(command: str) -> str:
+    """Wrap an opaque scoped command in the current-checkout Landlock launcher."""
+    scope = get_tool_execution_scope()
+    if scope is None:
+        return command
+    launcher = Path(__file__).with_name("tool_execution_scope.py")
+    return " ".join(
+        shlex.quote(value)
+        for value in (
+            sys.executable, str(launcher), "--landlock-launch",
+            "--root", scope.root_directory,
+            "--read-roots", json.dumps(list(scope.read_roots), separators=(",", ":")),
+            "--write-roots", json.dumps(list(scope.write_roots), separators=(",", ":")),
+            "--read", json.dumps(list(scope.read_allowlist), separators=(",", ":")),
+            "--write", json.dumps(list(scope.write_allowlist), separators=(",", ":")),
+            "--command", command,
+        )
+    )
+
+
 def _resolve_command_cwd(
     *,
     workdir: Optional[str],
@@ -907,7 +1170,7 @@ _PROMOTED_NOTE = (
 
 def _plan_execution(
     command: Any, *, task_id: Optional[str], timeout: Optional[int],
-    background: bool, _host_local: bool,
+    background: bool, _host_local: bool, workdir: Optional[str] = None,
 ) -> _ExecPlan:
     """Resolve backend, env-cache key, image, cwd and timeout for one call.
 
@@ -921,8 +1184,22 @@ def _plan_execution(
             f"Invalid command: expected string, got {type(command).__name__}", status="error",
         ))
 
-    config = _get_env_config()
+    config = resolve_task_environment_config(task_id)
     env_type = "local" if _host_local else config["env_type"]
+    scope = get_tool_execution_scope()
+    if scope is not None:
+        if scope.mode != "read-write":
+            raise _Rejected(_error_json(
+                f"Terminal tool is unavailable for read-only Canon phase {scope.phase_id or 'unknown-phase'} "
+                f"in run {scope.run_id or 'unknown-run'}", status="blocked"
+            ))
+        if env_type != "local":
+            raise _Rejected(_error_json(
+                "Terminal tool is unavailable under an active scope for non-local backends", status="blocked"
+            ))
+        path_error = _scoped_command_path_error(command)
+        if path_error:
+            raise _Rejected(_error_json(path_error, status="blocked"))
 
     # Fail closed under a refusal scope: the routed profile's terminal
     # policy could not be resolved, so running with the launch process's
@@ -946,6 +1223,14 @@ def _plan_execution(
     image = _select_image(env_type, overrides, config)
 
     cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+    if scope is not None:
+        scoped_workdir = scope.resolve_path(workdir) if workdir else Path(scope.working_directory)
+        if not scope.contains(scoped_workdir):
+            raise _Rejected(_error_json(
+                f"Terminal working directory '{scoped_workdir}' is outside the active tool execution root "
+                f"'{scope.root_directory}'", status="blocked"
+            ))
+        cwd = str(scoped_workdir)
     host_cwd = _resolve_task_host_cwd(config, task_id)
     # config["cwd"] was sanitized for container backends in _get_env_config
     # but an override / session record is raw: a host path would reach
@@ -1070,6 +1355,7 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
+    execution_command: Optional[str] = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
     max_retries = 3
@@ -1093,7 +1379,7 @@ def _run_foreground(
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
-                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )
@@ -1209,7 +1495,11 @@ def terminal_tool(
     try:
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
+            workdir=workdir,
         )
+        scope = get_tool_execution_scope()
+        if scope is not None and workdir is not None:
+            workdir = str(scope.resolve_path(workdir))
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
@@ -1230,9 +1520,10 @@ def terminal_tool(
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
+        execution_command = _landlock_scoped_command(command)
         if background:
             result = spawn_background_process(
-                command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
+                command=execution_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
@@ -1245,6 +1536,7 @@ def terminal_tool(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+            execution_command=execution_command,
         )
     except _Rejected as r:
         return r.result_json
@@ -1382,11 +1674,9 @@ registry.register(
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
 # The whole block is removed by reverting the commit that added it.
-from pathlib import Path  # noqa: F401,E402
 import importlib.util  # noqa: F401,E402
 import platform  # noqa: F401,E402
 import re  # noqa: F401,E402
-import shlex  # noqa: F401,E402
 import shutil  # noqa: F401,E402
 import stat  # noqa: F401,E402
 import subprocess  # noqa: F401,E402

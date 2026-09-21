@@ -52,6 +52,7 @@ def _checkpoint_path() -> Path:
 MAX_OUTPUT_CHARS = 200_000      # rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # keep finished processes 30 minutes
 MAX_PROCESSES = 64              # max tracked processes (LRU pruning)
+SHELL_NOISE_PREFIX_LIMIT = 8192
 
 # Watch-pattern rate limiting, PER SESSION: one watch-match notification per
 # WATCH_MIN_INTERVAL_SECONDS; a match inside the cooldown is dropped and counts as one
@@ -75,6 +76,70 @@ WATCH_LIFETIME_MAX_HITS = 8
 WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
+
+
+class _LeadingShellNoiseSanitizer:
+    """Remove only complete allowlisted shell-warning lines at stream start.
+
+    The unresolved prefix is bounded so unknown or malformed process output is
+    preserved for the strict consumer rather than silently discarded.
+    """
+
+    def __init__(self, noise_lines: tuple[str, ...]) -> None:
+        self._noise_lines = noise_lines
+        self._buffer = ""
+        self._passthrough = False
+
+    def feed(self, text: str) -> str:
+        if self._passthrough or not text:
+            return text
+        self._buffer += text
+        return self._drain()
+
+    def finish(self) -> str:
+        if self._passthrough:
+            return ""
+        buffered = self._buffer
+        self._buffer = ""
+        if buffered and self._is_warning(buffered):
+            return ""
+        return buffered
+
+    def _drain(self) -> str:
+        emitted: list[str] = []
+        while not self._passthrough:
+            newline = self._buffer.find("\n")
+            if newline < 0:
+                if len(self._buffer.encode("utf-8")) > SHELL_NOISE_PREFIX_LIMIT:
+                    emitted.append(self._buffer)
+                    self._buffer = ""
+                    self._passthrough = True
+                break
+            line_end = newline + 1
+            line = self._buffer[:line_end]
+            if len(line.encode("utf-8")) > SHELL_NOISE_PREFIX_LIMIT:
+                emitted.append(self._buffer)
+                self._buffer = ""
+                self._passthrough = True
+                break
+            if self._is_warning(line):
+                self._buffer = self._buffer[line_end:]
+                continue
+            emitted.append(self._buffer)
+            self._buffer = ""
+            self._passthrough = True
+        return "".join(emitted)
+
+    def _is_warning(self, line: str) -> bool:
+        line = line.rstrip("\r\n")
+        if line in self._noise_lines:
+            return True
+        prefix = "bash: cannot set terminal process group ("
+        suffix = "): Inappropriate ioctl for device"
+        if not line.startswith(prefix) or not line.endswith(suffix):
+            return False
+        process_group = line[len(prefix):-len(suffix)]
+        return bool(process_group) and process_group.lstrip("-").isdigit()
 
 
 # --- systemd cgroup isolation for gateway-spawned local executors ------------------
@@ -509,9 +574,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
 
-    _SHELL_NOISE_SUBSTRINGS = (
-        "no job control in this shell", "cannot set terminal process group",
-        "tcsetattr: Inappropriate ioctl for device")
+    _SHELL_NOISE_LINES = (
+        "bash: no job control in this shell",
+        "bash: tcsetattr: Inappropriate ioctl for device",
+    )
 
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
@@ -548,14 +614,6 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # a read-only terminal tab without killing the process.
         self.on_output = None
         self.on_close = None
-
-    @staticmethod
-    def _clean_shell_noise(text: str) -> str:
-        """Strip shell startup warnings from the beginning of output."""
-        lines = text.split("\n")
-        while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
-            lines.pop(0)
-        return "\n".join(lines)
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a chunk to the live-output sink; called from reader threads, never raises."""
@@ -1094,7 +1152,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         Windows pipes don't support select(); the blocking path is kept there and the lazy reconcile in
         poll()/wait() remains the safety net. See #68915, #8340.
         """
-        first_chunk = True
+        sanitizer = _LeadingShellNoiseSanitizer(self._SHELL_NOISE_LINES)
         # A split multibyte UTF-8 char would become U+FFFD with stateless decoding; the
         # incremental decoder holds the partial sequence until the rest arrives.
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -1105,11 +1163,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # same treatment the foreground path already has in
         # ``tools/environments/base.py::_wait_for_process``. (Ported from openclaw/openclaw#112325.)
         def _append_chunk(chunk: str):
-            nonlocal first_chunk
-            if first_chunk:
-                chunk = self._clean_shell_noise(chunk)
-                first_chunk = False
-            self._ingest_output(session, chunk)
+            sanitized = sanitizer.feed(chunk)
+            if sanitized:
+                self._ingest_output(session, sanitized)
+
+        def _finish_chunk():
+            sanitized = sanitizer.finish()
+            if sanitized:
+                self._ingest_output(session, sanitized)
         try:
             proc = session.process
             if proc is None or proc.stdout is None:
@@ -1161,15 +1222,19 @@ class ProcessRegistry(ProcessCheckpointMixin):
         finally:
             self._finish_reader(
                 session, decoder, _append_chunk, "Process",
-                lambda: session.process.wait(timeout=5), lambda: session.process.returncode)
+                lambda: session.process.wait(timeout=5), lambda: session.process.returncode,
+                _finish_chunk)
 
-    def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
+    def _finish_reader(self, session, decoder, append, label, wait, exit_code, finalize=None) -> None:
         """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
         one U+FFFD instead of vanishing), reap the child (no zombies), record the exit."""
         with suppress(Exception):
             tail = decoder.decode(b"", final=True)
             if tail:
                 append(tail)
+        if finalize is not None:
+            with suppress(Exception):
+                finalize()
         try:
             wait()
         except Exception as e:
@@ -1268,6 +1333,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
         pty = session._pty
+        sanitizer = _LeadingShellNoiseSanitizer(self._SHELL_NOISE_LINES)
         # Same split-multibyte handling as _reader_loop.
         # PTY reads can split a multibyte UTF-8 character across chunks just like pipe reads — hold partial
         # sequences until the rest arrives. (Ported from openclaw/openclaw#112325.)
@@ -1280,6 +1346,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
         if not _IS_WINDOWS:
             from tools.pty_query_responder import PtyQueryResponder
             responder = PtyQueryResponder(rows=30, cols=120)
+
+        def _append_chunk(chunk: str):
+            sanitized = sanitizer.feed(chunk)
+            if sanitized:
+                self._ingest_output(session, sanitized)
+
+        def _finish_chunk():
+            sanitized = sanitizer.finish()
+            if sanitized:
+                self._ingest_output(session, sanitized)
+
         try:
             while pty.isalive():
                 try:
@@ -1298,7 +1375,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                                     )
                         text = chunk if isinstance(chunk, str) else decoder.decode(chunk)
                         if text:
-                            self._ingest_output(session, text)
+                            _append_chunk(text)
                 except Exception:  # EOFError included
                     break
         except Exception as e:
@@ -1307,10 +1384,11 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # A query prefix split across the final reads is plain output after all.
             tail = decoder.decode(responder.flush())
             if tail:
-                self._ingest_output(session, tail)
+                _append_chunk(tail)
         self._finish_reader(
-            session, decoder, lambda t: self._ingest_output(session, t), "PTY",
-            pty.wait, lambda: pty.exitstatus if hasattr(pty, 'exitstatus') else -1)
+            session, decoder, _append_chunk, "PTY",
+            pty.wait, lambda: pty.exitstatus if hasattr(pty, 'exitstatus') else -1,
+            _finish_chunk)
 
     def _ingest_output(self, session: ProcessSession, text: str) -> None:
         """Buffer a freshly-read chunk, then scan watch patterns and stream it live."""

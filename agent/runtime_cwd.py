@@ -9,9 +9,10 @@ logical cwd via `_SESSION_CWD`.
 
 import logging
 import os
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +36,43 @@ def _is_install_tree(p: Path) -> bool:
     return p == _PACKAGE_ROOT or _PACKAGE_ROOT in p.parents
 
 
-def set_session_cwd(cwd: str | None) -> Token:
+def set_session_cwd(cwd: str | os.PathLike[str] | None) -> Token:
     """Pin the logical cwd for the current context."""
-    return _SESSION_CWD.set((cwd or "").strip())
+    return _SESSION_CWD.set((os.fspath(cwd) if cwd is not None else "").strip())
+
+
+def reset_session_cwd(token: Token) -> None:
+    """Reset the logical cwd with the exact token returned by ``set_session_cwd``."""
+    _SESSION_CWD.reset(token)
+
+
+def _validate_session_cwd(cwd: str | Path) -> Path:
+    if not isinstance(cwd, (str, Path)):
+        raise ValueError("session cwd must be a path")
+    raw = os.fspath(cwd)
+    if not raw or not raw.strip() or raw != raw.strip():
+        raise ValueError("session cwd must be nonblank")
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("session cwd must be absolute")
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise ValueError("session cwd could not be resolved") from exc
+    if not resolved.is_dir():
+        raise ValueError("session cwd must be an existing directory")
+    return resolved
+
+
+@contextmanager
+def session_cwd_scope(cwd: str | Path) -> Iterator[Path]:
+    """Bind one validated session cwd and restore its exact context token."""
+    resolved = _validate_session_cwd(cwd)
+    token = set_session_cwd(str(resolved))
+    try:
+        yield resolved
+    finally:
+        reset_session_cwd(token)
 
 
 def clear_session_cwd() -> None:

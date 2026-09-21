@@ -79,3 +79,52 @@ class TestSessionCwdOverride:
         finally:
             rt._SESSION_CWD.reset(token)
 
+
+class TestSessionCwdLifecycle:
+    def test_session_cwd_lifecycle_nested_scope_restores_exact_token(self, tmp_path):
+        from agent.runtime_cwd import reset_session_cwd, session_cwd_scope
+
+        outer = tmp_path / "outer"
+        inner = tmp_path / "inner"
+        outer.mkdir()
+        inner.mkdir()
+        outer_token = set_session_cwd(outer)
+        try:
+            assert resolve_context_cwd() == outer.resolve()
+            with session_cwd_scope(inner) as resolved_inner:
+                assert resolved_inner == inner.resolve()
+                assert resolve_context_cwd() == inner.resolve()
+            assert resolve_context_cwd() == outer.resolve()
+            reset_session_cwd(outer_token)
+            assert resolve_context_cwd() is None
+        finally:
+            if rt._SESSION_CWD.get() is not rt._UNSET:
+                rt._SESSION_CWD.set(rt._UNSET)
+
+    @pytest.mark.parametrize(
+        "invalid_cwd",
+        ["", "   ", " /tmp ", "relative/path", "/definitely/missing/session-cwd", 42],
+        ids=["blank", "whitespace", "whitespace-padded", "relative", "missing-absolute", "non-path"],
+    )
+    def test_session_cwd_lifecycle_invalid_input_preserves_outer(self, tmp_path, invalid_cwd):
+        from agent.runtime_cwd import session_cwd_scope
+
+        outer = tmp_path / "outer"
+        outer.mkdir()
+        outer_token = set_session_cwd(outer)
+        try:
+            with pytest.raises(ValueError):
+                with session_cwd_scope(invalid_cwd):
+                    pass
+            assert resolve_context_cwd() == outer.resolve()
+        finally:
+            rt._SESSION_CWD.reset(outer_token)
+
+    def test_session_cwd_lifecycle_reset_exact_token(self, tmp_path):
+        from agent.runtime_cwd import reset_session_cwd
+
+        token = set_session_cwd(tmp_path)
+        assert resolve_context_cwd() == tmp_path.resolve()
+        reset_session_cwd(token)
+        assert resolve_context_cwd() is None
+
