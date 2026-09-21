@@ -110,8 +110,24 @@ def _diagnostic(exc: BaseException) -> str:
 
 
 def _canon_command_prefix() -> list[str]:
-    """Use the current Hermes interpreter in isolated Canon module mode."""
-    return [sys.executable, "-I", "-m", "canon.cli"]
+    """Run Canon isolated while pinning Hermes imports to this plugin checkout."""
+    source_root = Path(__file__).resolve().parents[2]
+    profile_runtime = source_root / "profile_runtime.py"
+    if not profile_runtime.is_file():
+        raise CanonTransportError("canonical Hermes profile runtime is unavailable")
+    bootstrap = (
+        "import pathlib,runpy,sys;"
+        f"_root=pathlib.Path({str(source_root)!r}).resolve(strict=True);"
+        "sys.path.insert(0,str(_root));"
+        "import profile_runtime as _profile_runtime;"
+        "_loaded=pathlib.Path(_profile_runtime.__file__).resolve(strict=True);"
+        "_expected=(_root/'profile_runtime.py').resolve(strict=True);"
+        "(_loaded==_expected) or (_ for _ in ()).throw("
+        "RuntimeError('profile_runtime source mismatch'));"
+        "sys.argv[0]='canon.cli';"
+        "runpy.run_module('canon.cli',run_name='__main__')"
+    )
+    return [sys.executable, "-I", "-c", bootstrap]
 
 
 def _validate_args(raw: Any) -> LaunchArguments:

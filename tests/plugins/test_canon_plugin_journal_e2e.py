@@ -224,21 +224,6 @@ SOLUTION_MODELING_REVISED_TASK_CARD: dict[str, Any] = {
         {"text": "Карточка соответствует схеме task-card.schema.v1."},
     ],
 }
-SOLUTION_MODELING_FIRST_CONTINUATION: dict[str, Any] = {
-    "continuationRootRef": "continuation://s7/solution-modeling",
-    "agentSessionRef": "session://s7/solution-modeling",
-    "agentCheckpointRef": "checkpoint://s7/solution-modeling/first",
-    "eventCursorRefs": ["cursor://s7/solution-modeling/first"],
-}
-SOLUTION_MODELING_SECOND_CONTINUATION: dict[str, Any] = {
-    "continuationRootRef": "continuation://s7/solution-modeling",
-    "agentSessionRef": "session://s7/solution-modeling",
-    "agentCheckpointRef": "checkpoint://s7/solution-modeling/second",
-    "eventCursorRefs": ["cursor://s7/solution-modeling/second"],
-}
-SOLUTION_MODELING_SESSION_REF = "session://fake/s7-solution-modeling"
-
-
 def _write_bootstrap(tmp_path: Path) -> Path:
     """Create the only child-process adapter: the external phase-host boundary."""
 
@@ -247,83 +232,136 @@ def _write_bootstrap(tmp_path: Path) -> Path:
         textwrap.dedent(
             f"""
             import json
+            from copy import deepcopy
+            from pathlib import Path
             import sys
             import types
+            from types import SimpleNamespace
+            from unittest.mock import MagicMock, patch
+            sys.path.insert(0, {str(HERMES_ROOT)!r})
             sys.path.insert(0, {str(CANON_ROOT / "src")!r})
             sys.path.insert(0, {str(CANON_ROOT)!r})
             tests_package = types.ModuleType("tests")
             tests_package.__path__ = [{str(CANON_ROOT / 'tests')!r}]
             sys.modules["tests"] = tests_package
             from tests.helpers.fake_host import FakeHostAdapter
-            from canon.host import PhaseHostCandidate, PhaseHostFacts
             from canon.host_provider_registry import HostAdapterProviderRegistry
+            from integrations.hermes.canon_hermes.profile_host_adapter import CanonProfileHostAdapter
+            from run_agent import AIAgent
+            import hermes_cli.runtime_provider as runtime_provider_module
 
             TASK_INPUT = {SOLUTION_MODELING_TASK_INPUT!r}
             REVISION_INSTRUCTIONS = {SOLUTION_MODELING_REVISION_INSTRUCTIONS!r}
             INITIAL_TASK_CARD = {SOLUTION_MODELING_INITIAL_TASK_CARD!r}
             REVISED_TASK_CARD = {SOLUTION_MODELING_REVISED_TASK_CARD!r}
-            FIRST_CONTINUATION = {SOLUTION_MODELING_FIRST_CONTINUATION!r}
-            SECOND_CONTINUATION = {SOLUTION_MODELING_SECOND_CONTINUATION!r}
-            MODEL_SESSION_REF = {SOLUTION_MODELING_SESSION_REF!r}
+            PROFILES_ROOT = Path({str(tmp_path / 'hermes-home')!r})
+            TRACE_PATH = Path({str(tmp_path / 'solution-modeling-agent-trace.jsonl')!r})
 
-            class _SolutionModelingHost(FakeHostAdapter):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self._phase_calls = 0
+            runtime_provider_module.resolve_runtime_provider = lambda **kwargs: {{
+                "provider": kwargs.get("requested") or "openai-codex",
+                "api_mode": "responses",
+                "base_url": "https://example.invalid/v1",
+                "api_key": "test-only",
+            }}
 
-                def _run_phase_host(self, context, request, final_response_validator):
-                    _ = (context, final_response_validator)
-                    self._phase_calls += 1
-                    if self._phase_calls != 1:
-                        raise RuntimeError("solution-modeling host received an unexpected invocation count")
-                    if TASK_INPUT not in request.prompt:
-                        raise RuntimeError("solution-modeling host did not receive the exact task input")
-                    if request.continuation is None:
-                        output = INITIAL_TASK_CARD
-                        continuation = FIRST_CONTINUATION
-                    elif request.continuation == FIRST_CONTINUATION:
-                        if REVISION_INSTRUCTIONS not in request.prompt:
-                            raise RuntimeError("solution-modeling host did not receive exact revision instructions")
-                        output = REVISED_TASK_CARD
-                        continuation = SECOND_CONTINUATION
-                    else:
-                        raise RuntimeError("solution-modeling host received an unexpected continuation")
-                    raw_output = json.dumps(output, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-                    return PhaseHostCandidate.succeeded(
-                        raw_output,
-                        continuation=continuation,
-                        invocation_id=request.invocation_id,
+            def _append_trace(row):
+                TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with TRACE_PATH.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\\n")
+
+            def _agent_factory(**kwargs):
+                with patch("agent.process_bootstrap.OpenAI") as mock_openai, patch(
+                    "agent.context_compressor.ContextCompressor"
+                ) as mock_compressor:
+                    mock_openai.return_value = MagicMock()
+                    compressor = MagicMock()
+                    compressor.context_length = 100000
+                    compressor.threshold_tokens = 50000
+                    compressor.protect_first_n = 2
+                    compressor.protect_last_n = 2
+                    compressor.should_compress.return_value = False
+                    compressor.last_prompt_tokens = 0
+                    mock_compressor.return_value = compressor
+                    agent = AIAgent(**kwargs)
+
+                class _Transport:
+                    def build_kwargs(self, *, model, messages, tools=None, max_tokens=None, **_kwargs):
+                        return {{"model": model, "messages": messages, "tools": tools}}
+
+                    def preflight_kwargs(self, api_kwargs, **_kwargs):
+                        return api_kwargs
+
+                    def validate_response(self, _response):
+                        return True
+
+                    def normalize_response(self, response, **_kwargs):
+                        return response.normalized_message
+
+                original_run = agent.run_conversation
+
+                def _recording_run(prompt, **run_kwargs):
+                    history = deepcopy(run_kwargs.get("conversation_history") or [])
+                    history_text = json.dumps(history, sort_keys=True, ensure_ascii=False)
+                    is_revision = REVISION_INSTRUCTIONS in prompt
+                    agent._solution_modeling_response = REVISED_TASK_CARD if is_revision else INITIAL_TASK_CARD
+                    _append_trace({{
+                        "sessionId": agent.session_id,
+                        "promptContainsTaskInput": TASK_INPUT in prompt,
+                        "promptContainsRevisionInstructions": is_revision,
+                        "historyCount": len(history),
+                        "historyContainsTaskInput": TASK_INPUT in history_text,
+                    }})
+                    return original_run(prompt, **run_kwargs)
+
+                def _response_call(*_args, **_kwargs):
+                    content = json.dumps(
+                        agent._solution_modeling_response,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        ensure_ascii=False,
+                    )
+                    return SimpleNamespace(
+                        choices=[object()],
+                        usage=None,
+                        model=agent.model,
+                        normalized_message=SimpleNamespace(
+                            content=content,
+                            tool_calls=None,
+                            finish_reason="stop",
+                        ),
                     )
 
-                def _describe_phase_host(self, context):
-                    facts = super()._describe_phase_host(context)
-                    backend_session = dict(facts.backend_session)
-                    backend_session["sessionRef"] = MODEL_SESSION_REF
-                    return PhaseHostFacts(
-                        facts.invocation_id,
-                        facts.policy_digest,
-                        facts.profile_digest,
-                        facts.settings_digest,
-                        backend_session,
-                        facts.structured_output_transport,
-                        facts.structured_output_schema_digest,
-                        facts.final_validator_schema_digest,
-                        facts.attestation,
-                    )
+                agent.run_conversation = _recording_run
+                agent._get_transport = lambda: _Transport()
+                agent._interruptible_api_call = _response_call
+                agent._cleanup_dead_connections = lambda: False
+                agent._emit_status = lambda *_args, **_kwargs: None
+                agent._touch_activity = lambda *_args, **_kwargs: None
+                agent._sync_external_memory_for_turn = lambda **_kwargs: None
+                agent._safe_print = lambda *_args, **_kwargs: None
+                agent._vprint = lambda *_args, **_kwargs: None
+                agent._buffer_status = lambda *_args, **_kwargs: None
+                agent._clear_status_buffer = lambda *_args, **_kwargs: None
+                agent._try_activate_fallback = lambda *_args, **_kwargs: False
+                return agent
 
             def _resolve(self, selector, request):
                 if selector != "canon-hermes-profile":
                     raise RuntimeError("J05 bootstrap received an unexpected host provider")
-                host_type = (
-                    _SolutionModelingHost
-                    if request.workflow.get("workflowId") == "solution-modeling-workflow"
-                    else FakeHostAdapter
-                )
-                host = host_type(
-                    capabilities=set(request.capabilities),
-                    checkpoint_backend=request.store.checkpoint_backend,
-                    artifact_backend=request.store.artifact_backend,
-                )
+                if request.workflow.get("workflowId") == "solution-modeling-workflow":
+                    host = CanonProfileHostAdapter(
+                        profiles_root=PROFILES_ROOT,
+                        capabilities=set(request.capabilities),
+                        checkpoint_backend=request.store.checkpoint_backend,
+                        artifact_backend=request.store.artifact_backend,
+                        agent_factory=_agent_factory,
+                    )
+                else:
+                    host = FakeHostAdapter(
+                        capabilities=set(request.capabilities),
+                        checkpoint_backend=request.store.checkpoint_backend,
+                        artifact_backend=request.store.artifact_backend,
+                    )
                 host.journal = request.store.journal
                 return host
 
@@ -344,6 +382,19 @@ def real_canon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     _assert_preconditions()
     profile_root = tmp_path / "hermes-home"
+    for profile_dir in (
+        profile_root,
+        profile_root / "profiles" / "j05-test-profile",
+    ):
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text(
+            "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\nagent:\n  max_turns: 3\n",
+            encoding="utf-8",
+        )
+        (profile_dir / "SOUL.md").write_text(
+            "isolated solution-modeling test profile\n",
+            encoding="utf-8",
+        )
     execution_root = tmp_path / "execution"
     execution_root.mkdir()
     bootstrap = _write_bootstrap(tmp_path)
@@ -377,6 +428,7 @@ def real_canon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "scope": manager.scope_key,
             "profile": profile_root,
             "execution": execution_root,
+            "agent_trace": tmp_path / "solution-modeling-agent-trace.jsonl",
         }
     finally:
         manager.unload()
@@ -711,6 +763,21 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     initial_checkpoint_ref = initial_alias["agentCheckpointRef"]
     assert initial_session_ref
     assert initial_checkpoint_ref
+    trace_path = real_canon["agent_trace"]
+    initial_trace = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert len(initial_trace) == 1
+    initial_private_session_id = initial_trace[0]["sessionId"]
+    assert isinstance(initial_private_session_id, str)
+    assert initial_private_session_id.startswith("canon-")
+    assert initial_trace == [
+        {
+            "historyContainsTaskInput": False,
+            "historyCount": 0,
+            "promptContainsRevisionInstructions": False,
+            "promptContainsTaskInput": True,
+            "sessionId": initial_private_session_id,
+        }
+    ]
 
     observed = _dispatch(
         real_canon["scope"],
@@ -729,6 +796,13 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     assert all((artifact_root / ref / "content.json").is_file() for ref in initial_artifact_refs)
     assert json.loads((artifact_root / initial_artifact_refs[0] / "content.json").read_text(encoding="utf-8")) == SOLUTION_MODELING_TASK_INPUT
     assert initial_report["pendingHumanGate"]["gateId"] == "approve-task-card"
+    for _ in range(2):
+        inspected = _dispatch(
+            real_canon["scope"],
+            "canon_workflow_observe",
+            {"surface": "inspect", "run_id": run_id},
+        )
+        assert "result" in inspected and inspected["result"]["runId"] == run_id, inspected
 
     revise_payload = _solution_modeling_checkpoint_payload(
         workflow_path,
@@ -773,6 +847,13 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     assert revised_alias["agentSessionRef"] == initial_session_ref
     assert revised_alias["agentCheckpointRef"]
     assert revised_alias["agentCheckpointRef"] != initial_checkpoint_ref
+    trace_rows = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert len(trace_rows) == 2
+    assert trace_rows[1]["sessionId"] == initial_private_session_id
+    assert trace_rows[1]["promptContainsTaskInput"] is False
+    assert trace_rows[1]["promptContainsRevisionInstructions"] is True
+    assert trace_rows[1]["historyCount"] > 0
+    assert trace_rows[1]["historyContainsTaskInput"] is True
 
     observed = _dispatch(
         real_canon["scope"],
@@ -790,6 +871,12 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     assert revised_report["pendingHumanGate"]["gateId"] == "approve-task-card"
     assert len(revised_report["gateDecisions"]) == 1
     assert revised_report["gateDecisions"][0]["decision"] == "revise"
+    inspected = _dispatch(
+        real_canon["scope"],
+        "canon_workflow_observe",
+        {"surface": "inspect", "run_id": run_id},
+    )
+    assert "result" in inspected and inspected["result"]["runId"] == run_id, inspected
 
     approve_payload = _solution_modeling_checkpoint_payload(
         workflow_path,
@@ -861,7 +948,14 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     assert len(phase_completions) == 2
     assert all(row["nodeId"] == "disambiguate-task" for row in phase_completions)
     backend_rows = [row for row in rows if row["eventKind"] == "backend.session.linked"]
-    assert {row["payload"]["sessionRef"] for row in backend_rows} == {SOLUTION_MODELING_SESSION_REF}
+    backend_session_refs = {row["payload"]["sessionRef"] for row in backend_rows}
+    assert len(backend_session_refs) == 1
+    backend_session_ref = next(iter(backend_session_refs))
+    assert isinstance(backend_session_ref, str) and backend_session_ref
+    assert backend_session_ref != initial_session_ref
+    assert [row["payload"]["continuationMode"] for row in backend_rows] == ["fresh", "replayed"]
+    assert backend_rows[0]["payload"]["historyCount"] == 0
+    assert backend_rows[1]["payload"]["historyCount"] > 0
     accept_rows = [
         row for row in rows
         if row["eventKind"] == "gate.decision" and row.get("payload", {}).get("decision") == "accept"

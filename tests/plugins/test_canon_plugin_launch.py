@@ -16,7 +16,7 @@ import stat
 import subprocess
 import sys
 import textwrap
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -1664,6 +1664,116 @@ def test_run_cli_rejects_unexited_or_multiline_log_framing(tmp_path: Path) -> No
             )
 
 
+def test_run_cli_accepts_cleaned_single_json_record_framing_and_preserves_phrase(tmp_path: Path) -> None:
+    root = tmp_path / "workdir"
+    root.mkdir()
+    payload = '{"message":"no job control in this shell"}'
+
+    class Context:
+        def dispatch_tool(self, name, args, **kwargs):
+            if name == "terminal":
+                return json.dumps({"session_id": "native-shell-noise", "exit_code": 0})
+            if args["action"] == "wait":
+                return json.dumps({"status": "exited", "exit_code": 0})
+            return json.dumps({"status": "exited", "total_lines": 1, "output": payload})
+
+    assert transport._run_cli(Context(), ["canon", "inspect"], root=root, timeout=5) == {
+        "result": {"message": "no job control in this shell"}
+    }
+
+
+def test_run_cli_real_process_registry_shell_noise_ingestion_cleans_split_warning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(process_registry_module, "save_completed_result", lambda _session: None)
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda _session, _chunk: None)
+
+    warning = b"bash: no job control in this shell\n"
+    payload = b'{"message":"no job control in this shell"}\n'
+
+    class ChunkBuffer:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self._chunks = list(chunks)
+
+        def read1(self, _size: int) -> bytes:
+            return self._chunks.pop(0) if self._chunks else b""
+
+    class Stdout:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.buffer = ChunkBuffer(chunks)
+
+        def close(self) -> None:
+            return None
+
+    class Process:
+        def __init__(self, chunks: list[bytes]) -> None:
+            self.stdout = Stdout(chunks)
+            self.stderr = None
+            self.stdin = None
+            self.returncode = 0
+
+        def wait(self, timeout: int | None = None) -> int:
+            return 0
+
+    session = ProcessSession(id="proc_real_shell_noise", command="fake canon cli")
+    session.process = cast(Any, Process([warning[:5], warning[5:] + payload]))
+    registry._running[session.id] = session
+
+    class Context:
+        def dispatch_tool(self, name: str, args: dict[str, Any], **kwargs: Any) -> str:
+            if name == "terminal":
+                registry._reader_loop(session)
+                return json.dumps({"session_id": session.id, "exit_code": 0})
+            assert name == "process_manage"
+            if args["action"] == "wait":
+                return json.dumps(registry.wait(session.id, timeout=args["timeout"]))
+            assert args["action"] == "log"
+            return json.dumps(registry.read_log(
+                session.id,
+                offset=args["offset"],
+                limit=args["limit"],
+            ))
+
+    root = tmp_path / "workdir"
+    root.mkdir()
+    result = transport._run_cli(Context(), ["canon", "inspect"], root=root, timeout=5)
+
+    assert result == {"result": {"message": "no job control in this shell"}}
+
+
+@pytest.mark.parametrize(
+    ("output", "match"),
+    [
+        ("diagnostic: unexpected stderr\n{not-json}", "log framing"),
+        ("{not-json}", "malformed, oversized, or non-finite JSON"),
+    ],
+)
+def test_run_cli_rejects_unknown_diagnostic_and_malformed_payload_framing(
+    tmp_path: Path, output: str, match: str
+) -> None:
+    root = tmp_path / "workdir"
+    root.mkdir()
+
+    class Context:
+        def dispatch_tool(self, name, args, **kwargs):
+            if name == "terminal":
+                return json.dumps({"session_id": "native-shell-noise-negative", "exit_code": 0})
+            if args["action"] == "wait":
+                return json.dumps({"status": "exited", "exit_code": 0})
+            logged = {"status": "exited", "total_lines": output.count("\n") + 1, "output": output}
+            assert "diagnostic: unexpected stderr" in logged["output"] or "{not-json}" in logged["output"]
+            return json.dumps(logged)
+
+    with pytest.raises(transport.CanonTransportError, match=match):
+        transport._run_cli(Context(), ["canon", "inspect"], root=root, timeout=5)
+
+
 def test_run_cli_redacts_json_secret_values_before_bounded_error() -> None:
     diagnostic = transport._redact_cli_text(
         '{"token":"JSON-TOKEN-MARKER","api_key":"JSON-API-MARKER"}'
@@ -1686,7 +1796,10 @@ def _typed_failed_result() -> dict[str, object]:
     }
 
 
-def test_command_prefix_isolated_and_not_ambient(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_command_prefix_isolated_and_bound_to_gateway_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     marker = tmp_path / "marker-canon"
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin")
@@ -1697,10 +1810,13 @@ def test_command_prefix_isolated_and_not_ambient(monkeypatch: pytest.MonkeyPatch
         Path("/config.json"),
     )
 
-    assert argv[:4] == [sys.executable, "-I", "-m", "canon.cli"]
+    source_root = Path(transport.__file__).resolve().parents[2]
+    assert argv[:3] == [sys.executable, "-I", "-c"]
+    assert str(source_root) in argv[3]
+    assert "profile_runtime source mismatch" in argv[3]
+    assert "runpy.run_module('canon.cli'" in argv[3]
     assert str(marker) not in argv
-    assert "canon" not in argv[:3]
-
+    assert "PYTHONPATH" not in argv[3]
 
 def test_plugin_has_no_core_registration_or_alternate_runner() -> None:
     assert not Path("tools/canon_gateway_launch.py").exists()
