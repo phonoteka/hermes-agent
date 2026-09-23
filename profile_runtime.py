@@ -413,6 +413,20 @@ def _continuation_identity(
     """Return the private agent identity and its opaque stable session reference."""
     root = request.continuation_root_ref or f"implicit-root:{snapshot.profile_digest}:{request.session_id}"
     owner = request.continuation_owner_ref or f"implicit-owner:{request.platform}:{request.task_id}"
+    identity_request_settings = _safe_snapshot(snapshot.request_settings)
+    if isinstance(identity_request_settings, dict):
+        text_settings = identity_request_settings.get("text")
+        if isinstance(text_settings, dict):
+            format_settings = text_settings.get("format")
+            if (
+                isinstance(format_settings, dict)
+                and format_settings.keys() == {"type", "name", "strict", "schema"}
+                and format_settings.get("type") == "json_schema"
+                and format_settings.get("name") == "canon_phase_output"
+                and format_settings.get("strict") is True
+                and isinstance(format_settings.get("schema"), dict)
+            ):
+                del format_settings["schema"]
     identity_input = {
         "root_ref": root,
         "owner_ref": owner,
@@ -430,7 +444,7 @@ def _continuation_identity(
         "loaded_skill_names": snapshot.loaded_skill_names,
         "skill_prompt_digest": snapshot.skill_prompt_digest,
         "mcp_server_refs": snapshot.mcp_server_refs,
-        "request_settings": _safe_snapshot(snapshot.request_settings),
+        "request_settings": identity_request_settings,
     }
     digest = hashlib.sha256(_canonical(identity_input)).hexdigest()
     private_identity = "canon-" + digest

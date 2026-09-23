@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -553,4 +554,164 @@ def test_checkpoint_is_revalidated_after_prepare_before_provider(tmp_path, monke
         ) == (True, True)
     finally:
         runtime.close_profile_agent_session(second)
+        fallback_db.close()
+
+
+def test_output_schema_is_turn_local(tmp_path, monkeypatch):
+    from agent.transports.codex import build_canon_responses_text_format
+
+    _assert_continuation_request_contract()
+    fallback_db, provider_requests, factory = _continuation_factory(
+        tmp_path, monkeypatch, ["first answer", "corrected answer", "must not be called"]
+    )
+    schema_a = {"type": "object", "properties": {"phase_a": {"type": "string"}}, "required": ["phase_a"], "additionalProperties": False}
+    schema_b = {"type": "object", "properties": {"phase_b": {"type": "integer"}}, "required": ["phase_b"], "additionalProperties": False}
+    overrides_a = build_canon_responses_text_format(schema_a)
+    overrides_b = build_canon_responses_text_format(schema_b)
+    first = runtime.prepare_profile_agent_session(
+        _request(
+            tmp_path,
+            continuation_root_ref="continuation://root/fixture",
+            continuation_owner_ref="phase://workflow/phase",
+            request_overrides=overrides_a,
+        ),
+        agent_factory=factory,
+    )
+    try:
+        runtime.run_profile_agent_session(first, "first prompt")
+        first_facts = first.continuation_state
+        private_session_id = first.agent.session_id
+    finally:
+        runtime.close_profile_agent_session(first)
+
+    second = runtime.prepare_profile_agent_session(
+        _request(
+            tmp_path,
+            continuation_root_ref="continuation://root/fixture",
+            continuation_owner_ref="phase://workflow/phase",
+            agent_session_ref=first_facts.agent_session_ref,
+            agent_checkpoint_ref=first_facts.agent_checkpoint_ref,
+            request_overrides=overrides_b,
+        ),
+        agent_factory=factory,
+    )
+    try:
+        runtime.continue_profile_agent_session(second, "correction prompt")
+        second_facts = second.continuation_state
+        replayed = [
+            (item["role"], item["content"])
+            for item in provider_requests[-1]["wire_messages"][-1]
+            if item["role"] in {"user", "assistant"}
+        ]
+        assert replayed[-3:] == [
+            ("user", "first prompt"),
+            ("assistant", "first answer"),
+            ("user", "correction prompt"),
+        ]
+        assert second_facts.agent_session_ref == first_facts.agent_session_ref
+        assert second_facts.agent_checkpoint_ref != first_facts.agent_checkpoint_ref
+        assert provider_requests[-1]["request_overrides"] == overrides_b
+        rows_before_other_root = second.agent._session_db.get_messages(second.agent.session_id)
+        calls_before_other_root = len(provider_requests)
+        with pytest.raises(runtime.ProfileAgentSessionContinuationUnsupported):
+            runtime.prepare_profile_agent_session(
+                _request(
+                    tmp_path,
+                    continuation_root_ref="continuation://root/other",
+                    continuation_owner_ref="phase://workflow/phase",
+                    agent_session_ref=first_facts.agent_session_ref,
+                    agent_checkpoint_ref=first_facts.agent_checkpoint_ref,
+                    request_overrides=overrides_b,
+                ),
+                agent_factory=factory,
+            )
+        assert len(provider_requests) == calls_before_other_root
+        assert second.agent._session_db.get_messages(second.agent.session_id) == rows_before_other_root
+    finally:
+        runtime.close_profile_agent_session(second)
+        fallback_db.close()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["timeout", "non_schema_override", "tools", "skills", "mcp", "provider", "model", "profile", "malformed_output_format", "non_canon_output_format", "extra_format_field"],
+)
+def test_identity_mismatch_and_malformed_output_format_fail_closed(tmp_path, monkeypatch, case):
+    from agent.transports.codex import build_canon_responses_text_format
+    import agent.skill_commands as skill_commands
+    import hermes_cli.runtime_provider as provider_module
+
+    _assert_continuation_request_contract()
+    fallback_db, provider_requests, factory = _continuation_factory(
+        tmp_path, monkeypatch, ["first answer", "must not be called"]
+    )
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"], "additionalProperties": False}
+    canon_format = build_canon_responses_text_format(schema)
+    if case == "extra_format_field":
+        canon_format["text"]["format"]["extension"] = "not-canon"
+    first = runtime.prepare_profile_agent_session(
+        _request(
+            tmp_path,
+            continuation_root_ref="continuation://root/fixture",
+            continuation_owner_ref="phase://workflow/phase",
+            request_overrides=canon_format,
+        ),
+        agent_factory=factory,
+    )
+    try:
+        runtime.run_profile_agent_session(first, "first prompt")
+        facts = first.continuation_state
+        db_path = Path(first.agent._session_db.db_path)
+        private_session_id = first.agent.session_id
+        rows_before = first.agent._session_db.get_messages(private_session_id)
+    finally:
+        runtime.close_profile_agent_session(first)
+
+    values: dict[str, Any] = dict(
+        continuation_root_ref="continuation://root/fixture",
+        continuation_owner_ref="phase://workflow/phase",
+        agent_session_ref=facts.agent_session_ref,
+        agent_checkpoint_ref=facts.agent_checkpoint_ref,
+        request_overrides=canon_format,
+    )
+    changes = {
+        "timeout": {"request_overrides": {**canon_format, "timeout": 17}},
+        "non_schema_override": {"request_overrides": {**canon_format, "temperature": 0.25}},
+        "tools": {"enabled_toolsets": ["web"]},
+        "skills": {"skill_refs": ["fixture"]},
+        "mcp": {"mcp_server_refs": ["fixture"]},
+        "provider": {"exact_provider": "different-provider"},
+        "model": {"exact_model": "different-model"},
+        "malformed_output_format": {"request_overrides": {"text": {"format": "not-an-object"}}},
+        "non_canon_output_format": {"request_overrides": {"text": {"format": {"type": "json_schema", "name": "other", "strict": True, "schema": schema}}}},
+    }
+    if case == "profile":
+        other_profile = tmp_path / "other-profile"
+        other_profile.mkdir()
+        (other_profile / "config.yaml").write_text("fixture", encoding="utf-8")
+        (other_profile / "SOUL.md").write_text("different identity", encoding="utf-8")
+        values["profile_home"] = other_profile
+    if case == "extra_format_field":
+        values["request_overrides"] = deepcopy(canon_format)
+        values["request_overrides"]["text"]["format"]["schema"] = {
+            "type": "object", "properties": {"other": {"type": "integer"}}
+        }
+    if case == "skills":
+        monkeypatch.setattr(skill_commands, "build_preloaded_skills_prompt", lambda *_args, **_kwargs: ("fixture skill", ["fixture"], []))
+    if case == "provider":
+        monkeypatch.setattr(
+            provider_module,
+            "resolve_runtime_provider",
+            lambda *, requested, **_kwargs: {"provider": requested, "api_mode": "openai_chat", "base_url": "https://example.invalid/v1", "api_key": "test-key"},
+        )
+    values.update(changes.get(case, {}))
+    calls_before = len(provider_requests)
+    with pytest.raises(runtime.ProfileAgentSessionContinuationUnsupported):
+        runtime.prepare_profile_agent_session(_request(tmp_path, **values), agent_factory=factory)
+    assert len(provider_requests) == calls_before
+    db = SessionDB(db_path=db_path)
+    try:
+        assert db.get_messages(private_session_id) == rows_before
+    finally:
+        db.close()
         fallback_db.close()
