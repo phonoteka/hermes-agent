@@ -2,6 +2,18 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+@pytest.fixture(autouse=True)
+def fake_event_source(monkeypatch):
+    from plugins.bitrix24 import ingress
+    from tests.plugins.test_bitrix24_event_enrichment import FakeEventSource
+
+    source = FakeEventSource('@hermes take a look')
+    monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    return source
+
+
 from plugins.bitrix24.dedup import InProcessEventDeduper
 from plugins.bitrix24.ingress import _make_webhook_ingress_handler
 
@@ -22,7 +34,7 @@ def _task_payload(*, event_id: str) -> dict:
         "event_id": event_id,
         "event": "ONTASKADD",
         "auth": {"domain": "example.com", "application_token": "expected-app-token"},
-        "data": {"FIELDS": {"ID": "42", "TITLE": "Webhook smoke", "DESCRIPTION": "@hermes review task"}},
+        "data": {"FIELDS_AFTER": {"ID": "42"}, "FIELDS_BEFORE": "undefined", "IS_ACCESSIBLE_AFTER": "undefined", "IS_ACCESSIBLE_BEFORE": "N"},
     }
 
 

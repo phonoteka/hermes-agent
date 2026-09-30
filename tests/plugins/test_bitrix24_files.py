@@ -4,6 +4,16 @@ import json
 from typing import Any
 
 import pytest
+
+@pytest.fixture(autouse=True)
+def fake_event_source(monkeypatch):
+    from plugins.bitrix24 import ingress
+    from tests.plugins.test_bitrix24_event_enrichment import FakeEventSource
+
+    source = FakeEventSource('@hermes проверь вложения')
+    monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    return source
+
 import yaml
 
 _APP_TOKEN = "expected-app-token"
@@ -94,10 +104,10 @@ def _comment_payload(*, event_id: str = "evt-files-1") -> dict:
         "event": "ONTASKCOMMENTADD",
         "auth": {"domain": "example.com", "application_token": _APP_TOKEN},
         "data": {
-            "FIELDS": {
-                "ID": "84",
+            "FIELDS_AFTER": {
+                "ID": "0",
+                "MESSAGE_ID": "84",
                 "TASK_ID": "42",
-                "POST_MESSAGE": "@hermes проверь вложения",
                 "FILE_IDS": ["111", "222", "333", "444"],
             }
         },
@@ -123,7 +133,7 @@ def test_bitrix24_files_comment_event_materializes_attachment_surface_before_vis
 
     assert result["accepted"] is True
     assert result["reason"] == "targeted_event"
-    assert result["targeting"]["mode"] == "mention"
+    assert result["targeting"]["mode"] == "bot_mention"
     assert result["task_id"] == "42"
     assert result["message"] == "@hermes проверь вложения"
     assert result["file_ids"] == ["111", "222", "333", "444"]
@@ -207,10 +217,10 @@ def test_bitrix24_files_marks_attachment_metadata_unavailable_when_lookup_fails(
             "event": "ONTASKCOMMENTADD",
             "auth": {"domain": "example.com", "application_token": _APP_TOKEN},
             "data": {
-                "FIELDS": {
-                    "ID": "84",
+                "FIELDS_AFTER": {
+                    "ID": "0",
+                "MESSAGE_ID": "84",
                     "TASK_ID": "42",
-                    "POST_MESSAGE": "@hermes broken metadata",
                     "FILE_IDS": ["777"],
                 }
             },

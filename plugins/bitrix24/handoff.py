@@ -40,7 +40,7 @@ def _task_payload_from_result(result: dict[str, Any], comments: list[dict[str, A
     task_id = _optional_text(result.get("task_id")) or "unknown-task"
     return {
         "id": task_id,
-        "title": f"Mocked task {task_id}",
+        "title": result["task_title"] if "task_title" in result else f"Mocked task {task_id}",
         "comments": comments,
         "source": "mocked_payload",
     }
@@ -112,13 +112,15 @@ def _tool_candidates(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _agent_request_from_result(result: dict[str, Any]) -> dict[str, Any] | None:
+    """Build deferred requests for accepted human/bot comments or mentioned chat messages."""
     if result.get("accepted") is not True:
         return None
     event = _optional_text(result.get("event"))
     if event not in (_COMMENT_EVENTS | _CHAT_EVENTS):
         return None
     targeting = result.get("targeting")
-    if not isinstance(targeting, dict) or targeting.get("mode") != "mention":
+    allowed_modes = {"bot_mention", "human_comment"} if event in _COMMENT_EVENTS else {"mention"}
+    if not isinstance(targeting, dict) or targeting.get("mode") not in allowed_modes:
         return None
 
     attachments = result.get("attachments")

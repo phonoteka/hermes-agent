@@ -5,6 +5,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .client import _validated_webhook_base_url
+from .enrichment import Bitrix24EventSource
 
 SUPPORTED_EVENTS = {
     "ONTASKADD",
@@ -79,7 +80,7 @@ def _payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
     data = payload.get("data")
     if not isinstance(data, dict):
         return {}
-    fields = data.get("FIELDS")
+    fields = data.get("FIELDS_AFTER" if _supported_event(payload) in (_TASK_EVENTS | _COMMENT_EVENTS) else "FIELDS")
     if not isinstance(fields, dict):
         return {}
     return fields
@@ -95,9 +96,6 @@ def _optional_text(value: Any) -> str:
 
 def _payload_message(payload: dict[str, Any], *, event: str) -> str:
     fields = _payload_fields(payload)
-    if event in _COMMENT_EVENTS:
-        message = fields.get("POST_MESSAGE")
-        return message.strip() if isinstance(message, str) else ""
     if event in _CHAT_EVENTS:
         data = payload.get("data")
         if isinstance(data, dict):
@@ -168,7 +166,8 @@ def _sanitized_payload(payload: dict[str, Any], *, event: str, event_id: str) ->
         return sanitized
 
     sanitized_data: dict[str, Any] = {}
-    fields = data.get("FIELDS")
+    fields_key = "FIELDS_AFTER" if event in (_TASK_EVENTS | _COMMENT_EVENTS) else "FIELDS"
+    fields = data.get(fields_key)
     if isinstance(fields, dict):
         sanitized_fields = {
             key: value
@@ -177,6 +176,7 @@ def _sanitized_payload(payload: dict[str, Any], *, event: str, event_id: str) ->
             in {
                 "ID",
                 "TASK_ID",
+                "MESSAGE_ID",
                 "TITLE",
                 "DESCRIPTION",
                 "POST_MESSAGE",
@@ -187,7 +187,7 @@ def _sanitized_payload(payload: dict[str, Any], *, event: str, event_id: str) ->
             }
         }
         if sanitized_fields:
-            sanitized_data["FIELDS"] = sanitized_fields
+            sanitized_data[fields_key] = sanitized_fields
 
     message = data.get("MESSAGE")
     if isinstance(message, str) and message.strip():
@@ -243,29 +243,59 @@ def _accepted_event_response(
 
 
 def _normalize_task_event(
-    payload: dict[str, Any], *, event: str, event_id: str, source_domain: str
+    payload: dict[str, Any], *, event: str, event_id: str, source_domain: str,
+    event_source: Bitrix24EventSource,
 ) -> dict[str, Any] | None:
-    fields = _payload_fields(payload)
-    object_id = fields.get("ID")
-    if not isinstance(object_id, str) or not object_id.strip():
+    """Enrich real task IDs; return None for malformed data, propagate source failure."""
+    task_id = _optional_text(_payload_fields(payload).get("ID"))
+    if not task_id:
         return None
-    if event == "ONTASKADD":
-        title = fields.get("TITLE")
-        if not isinstance(title, str) or not title.strip():
-            return None
-    elif event != "ONTASKUPDATE":
-        return None
-    return _accepted_event_response(
-        payload=payload,
-        event=event,
-        event_id=event_id,
-        source_domain=source_domain,
-        object_id=object_id.strip(),
-        targeting_mode="project_rule",
-        task_id=object_id.strip(),
-        message=_optional_text(fields.get("DESCRIPTION")),
-        file_ids=_payload_file_ids(payload),
+    task = event_source.get_task(task_id)
+    if task is None:
+        return {"accepted": False, "reason": "task_not_found"}
+    result = _accepted_event_response(
+        payload=payload, event=event, event_id=event_id, source_domain=source_domain,
+        object_id=task_id, targeting_mode="project_rule", task_id=task_id,
+        message=task.description, file_ids=_payload_file_ids(payload),
     )
+    result.update(task_title=task.title, message=task.description,
+                  actor_id=task.created_by if event == "ONTASKADD" else task.changed_by)
+    return result
+
+
+def _normalize_comment_event(
+    payload: dict[str, Any], *, event: str, event_id: str, source_domain: str,
+    event_source: Bitrix24EventSource, bot_user_id: str,
+) -> dict[str, Any] | None:
+    """Read exact task messages and apply author policy; source failures propagate."""
+    fields = _payload_fields(payload)
+    task_id = _optional_text(fields.get("TASK_ID"))
+    message_id = _optional_text(fields.get("MESSAGE_ID"))
+    if not task_id or not message_id:
+        return None
+    task = event_source.get_task(task_id)
+    if task is None or not task.chat_id:
+        return {"accepted": False, "reason": "task_not_found"}
+    message = event_source.get_task_message(task.chat_id, message_id)
+    if message is None:
+        return {"accepted": False, "reason": "message_not_found"}
+    mentioned = _targets_bot(message.text)
+    rejection = {
+        "accepted": False, "targeted": False, "event": event,
+        "event_id": event_id, "source_domain": source_domain,
+    }
+    if message.author_id == "0":
+        return {**rejection, "reason": "system_message"}
+    if not mentioned:
+        return {**rejection, "reason": "not_targeted"}
+    result = _accepted_event_response(
+        payload=payload, event=event, event_id=event_id, source_domain=source_domain,
+        object_id=message_id, targeting_mode="bot_mention" if message.author_id == bot_user_id else "human_comment",
+        task_id=task_id, message=message.text, file_ids=_payload_file_ids(payload),
+    )
+    result.update(task_title=task.title, message=message.text, message_id=message_id,
+                  author_id=message.author_id, mentioned=mentioned)
+    return result
 
 
 def _normalize_comment_or_chat_event(
@@ -305,20 +335,24 @@ def _normalize_comment_or_chat_event(
 
 
 def _normalize_supported_event(
-    payload: dict[str, Any], *, event: str, event_id: str, source_domain: str
+    payload: dict[str, Any], *, event: str, event_id: str, source_domain: str,
+    event_source: Bitrix24EventSource | None = None, bot_user_id: str = "",
 ) -> dict[str, Any] | None:
-    if event in _TASK_EVENTS:
-        return _normalize_task_event(
-            payload,
-            event=event,
-            event_id=event_id,
-            source_domain=source_domain,
+    """Normalize supported events; task/comment events require an authoritative source."""
+    if event in (_TASK_EVENTS | _COMMENT_EVENTS):
+        if event_source is None:
+            raise ValueError("task event source is required")
+        if event in _TASK_EVENTS:
+            return _normalize_task_event(
+                payload, event=event, event_id=event_id, source_domain=source_domain,
+                event_source=event_source,
+            )
+        return _normalize_comment_event(
+            payload, event=event, event_id=event_id, source_domain=source_domain,
+            event_source=event_source, bot_user_id=bot_user_id,
         )
-    if event in _MENTION_EVENTS:
+    if event in _CHAT_EVENTS:
         return _normalize_comment_or_chat_event(
-            payload,
-            event=event,
-            event_id=event_id,
-            source_domain=source_domain,
+            payload, event=event, event_id=event_id, source_domain=source_domain,
         )
     return None

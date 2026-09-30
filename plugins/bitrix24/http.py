@@ -132,8 +132,13 @@ def _existing_event_id(payload: dict[str, Any]) -> str:
 
 
 def _derived_event_id(payload: dict[str, Any]) -> str:
+    """Hash retry-stable identity; real events carry their ids only in FIELDS_AFTER."""
     fields = _payload_fields(payload)
+    fields_after = _payload_fields(payload, key="FIELDS_AFTER")
     material = {
+        "data_fields_after_id": _string_value(fields_after.get("ID")),
+        "data_fields_after_task_id": _string_value(fields_after.get("TASK_ID")),
+        "data_fields_after_message_id": _string_value(fields_after.get("MESSAGE_ID")),
         "event": _string_value(payload.get("event")).upper(),
         "ts": _string_value(payload.get("ts")),
         "event_handler_id": _string_value(payload.get("event_handler_id")),
@@ -148,11 +153,11 @@ def _derived_event_id(payload: dict[str, Any]) -> str:
     return f"b24_{digest[:24]}"
 
 
-def _payload_fields(payload: dict[str, Any]) -> dict[str, Any]:
+def _payload_fields(payload: dict[str, Any], *, key: str = "FIELDS") -> dict[str, Any]:
     data = payload.get("data")
     if not isinstance(data, dict):
         return {}
-    fields = data.get("FIELDS")
+    fields = data.get(key)
     if not isinstance(fields, dict):
         return {}
     return fields

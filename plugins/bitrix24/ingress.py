@@ -4,10 +4,16 @@ import json
 import os
 from typing import Any, Callable
 
-from .client import _validated_webhook_base_url
+from .client import Bitrix24Client, _validated_webhook_base_url
+from .enrichment import (
+    Bitrix24EventSource, Bitrix24SourceUnavailable, RestBitrix24EventSource,
+    bot_user_id_from_webhook_url,
+)
 from .dedup import InProcessEventDeduper, get_process_shared_event_deduper
 from .events import (
     _SUPPORTED_EVENTS,
+    _TASK_EVENTS,
+    _COMMENT_EVENTS,
     _configured_application_token,
     _configured_domain,
     _event_id,
@@ -45,10 +51,14 @@ def _make_webhook_ingress_handler(
     materialize_attachments: Callable[[dict[str, Any]], list[dict[str, Any]]] | None = None,
     agent_request_from_result: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     deduper: InProcessEventDeduper | None = None,
+    event_source: Bitrix24EventSource | None = None,
+    bot_user_id: str | None = None,
 ):
+    """Authenticate before lazy enrichment; remember only accepted events, never source failures."""
     event_deduper = deduper or get_process_shared_event_deduper()
 
     def _handle_bitrix24_webhook_ingress(args: dict[str, Any] | None = None, **_: Any) -> str:
+        nonlocal event_source, bot_user_id
         payload = args if isinstance(args, dict) else {}
         event = _supported_event(payload)
         event_id = _event_id(payload)
@@ -103,12 +113,18 @@ def _make_webhook_ingress_handler(
                 }
             )
 
-        normalized = _normalize_supported_event(
-            payload,
-            event=event,
-            event_id=event_id,
-            source_domain=source_domain,
-        )
+        try:
+            if event in (_TASK_EVENTS | _COMMENT_EVENTS):
+                if event_source is None:
+                    event_source = RestBitrix24EventSource(Bitrix24Client())
+                if bot_user_id is None:
+                    bot_user_id = bot_user_id_from_webhook_url(os.getenv("BITRIX24_WEBHOOK_URL", ""))
+            normalized = _normalize_supported_event(
+                payload, event=event, event_id=event_id, source_domain=source_domain,
+                event_source=event_source, bot_user_id=bot_user_id or "",
+            )
+        except Bitrix24SourceUnavailable:
+            return json.dumps({"accepted": False, "reason": "source_unavailable"})
         if normalized is None:
             return json.dumps(
                 {

@@ -5,6 +5,16 @@ from urllib.parse import urlencode
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def fake_event_source(monkeypatch):
+    from plugins.bitrix24 import ingress
+    from tests.plugins.test_bitrix24_event_enrichment import FakeEventSource
+
+    source = FakeEventSource('@hermes take a look')
+    monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    return source
+
+
 from plugins.bitrix24.dedup import InProcessEventDeduper
 from plugins.bitrix24.http import parse_bitrix24_webhook_payload
 from plugins.bitrix24.ingress import _make_webhook_ingress_handler
@@ -27,7 +37,7 @@ def test_parse_bitrix24_webhook_payload_normalizes_json_and_preserves_event_id()
             "event_id": "evt-json-1",
             "event": "ONTASKADD",
             "auth": {"domain": EXPECTED_DOMAIN, "application_token": EXPECTED_TOKEN},
-            "data": {"FIELDS": {"ID": "42", "TITLE": "Webhook smoke", "DESCRIPTION": "@hermes review task"}},
+            "data": {"FIELDS_AFTER": {"ID": "42"}},
         }
     ).encode("utf-8")
 
@@ -37,7 +47,7 @@ def test_parse_bitrix24_webhook_payload_normalizes_json_and_preserves_event_id()
         "event_id": "evt-json-1",
         "event": "ONTASKADD",
         "auth": {"domain": EXPECTED_DOMAIN, "application_token": EXPECTED_TOKEN},
-        "data": {"FIELDS": {"ID": "42", "TITLE": "Webhook smoke", "DESCRIPTION": "@hermes review task"}},
+        "data": {"FIELDS_AFTER": {"ID": "42"}},
     }
 
 
@@ -50,10 +60,9 @@ def test_parse_bitrix24_webhook_payload_normalizes_form_encoded_nested_keys():
             ("auth[domain]", EXPECTED_DOMAIN),
             ("auth[application_token]", EXPECTED_TOKEN),
             ("auth[member_id]", "member-77"),
-            ("data[FIELDS][ID]", "84"),
-            ("data[FIELDS][TASK_ID]", "42"),
-            ("data[FIELDS][POST_MESSAGE]", "@hermes take a look"),
-            ("data[MESSAGE]", "@hermes take a look"),
+            ("data[FIELDS_AFTER][ID]", "0"),
+            ("data[FIELDS_AFTER][TASK_ID]", "42"),
+            ("data[FIELDS_AFTER][MESSAGE_ID]", "84"),
         ]
     ).encode("utf-8")
 
@@ -66,12 +75,11 @@ def test_parse_bitrix24_webhook_payload_normalizes_form_encoded_nested_keys():
         "member_id": "member-77",
     }
     assert payload["data"] == {
-        "FIELDS": {
-            "ID": "84",
+        "FIELDS_AFTER": {
+            "ID": "0",
             "TASK_ID": "42",
-            "POST_MESSAGE": "@hermes take a look",
+            "MESSAGE_ID": "84",
         },
-        "MESSAGE": "@hermes take a look",
     }
     assert payload["event_id"].startswith("b24_")
 
@@ -84,21 +92,13 @@ def test_parse_bitrix24_webhook_payload_derives_retry_stable_event_id():
         ("auth[domain]", EXPECTED_DOMAIN),
         ("auth[application_token]", EXPECTED_TOKEN),
         ("auth[member_id]", "member-77"),
-        ("data[FIELDS][ID]", "84"),
-        ("data[FIELDS][TASK_ID]", "42"),
-        ("data[FIELDS][POST_MESSAGE]", "@hermes take a look"),
-        ("data[MESSAGE]", "@hermes take a look"),
+        ("data[FIELDS_AFTER][ID]", "0"),
+        ("data[FIELDS_AFTER][TASK_ID]", "42"),
+        ("data[FIELDS_AFTER][MESSAGE_ID]", "84"),
     ]
     same_retry_reordered = list(reversed(pairs))
-    changed_task = pairs[:-3] + [
-        ("data[FIELDS][TASK_ID]", "77"),
-        ("data[FIELDS][POST_MESSAGE]", "@hermes take a look"),
-        ("data[MESSAGE]", "@hermes take a look"),
-    ]
-    changed_message = pairs[:-2] + [
-        ("data[FIELDS][POST_MESSAGE]", "@hermes different message"),
-        ("data[MESSAGE]", "@hermes different message"),
-    ]
+    changed_task = [(key, "77" if key == "data[FIELDS_AFTER][TASK_ID]" else value) for key, value in pairs]
+    changed_message = [(key, "85" if key == "data[FIELDS_AFTER][MESSAGE_ID]" else value) for key, value in pairs]
 
     first = parse_bitrix24_webhook_payload(urlencode(pairs).encode("utf-8"), "application/x-www-form-urlencoded")
     second = parse_bitrix24_webhook_payload(
@@ -145,9 +145,7 @@ def test_parse_bitrix24_webhook_payload_output_is_accepted_by_ingress_handler(in
             ("auth[domain]", EXPECTED_DOMAIN),
             ("auth[application_token]", EXPECTED_TOKEN),
             ("auth[member_id]", "member-77"),
-            ("data[FIELDS][ID]", "42"),
-            ("data[FIELDS][TITLE]", "Webhook smoke"),
-            ("data[FIELDS][DESCRIPTION]", "@hermes review task"),
+            ("data[FIELDS_AFTER][ID]", "42"),
         ]
     ).encode("utf-8")
 
@@ -159,8 +157,6 @@ def test_parse_bitrix24_webhook_payload_output_is_accepted_by_ingress_handler(in
     assert result["event"] == "ONTASKADD"
     assert result["event_id"] == payload["event_id"]
     assert result["source_domain"] == EXPECTED_DOMAIN
-    assert result["payload"]["data"]["FIELDS"] == {
+    assert result["payload"]["data"]["FIELDS_AFTER"] == {
         "ID": "42",
-        "TITLE": "Webhook smoke",
-        "DESCRIPTION": "@hermes review task",
     }

@@ -4,6 +4,16 @@ import json
 from typing import Any
 
 import pytest
+
+@pytest.fixture(autouse=True)
+def fake_event_source(monkeypatch):
+    from plugins.bitrix24 import ingress
+    from tests.plugins.test_bitrix24_event_enrichment import FakeEventSource
+
+    source = FakeEventSource('@hermes сделай краткое резюме и потом mark done')
+    monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    return source
+
 import yaml
 
 _APP_TOKEN = "expected-app-token"
@@ -83,10 +93,10 @@ def _comment_payload(*, event_id: str = "evt-e2e-1", auth_extra: dict[str, Any] 
         "event": "ONTASKCOMMENTADD",
         "auth": auth,
         "data": {
-            "FIELDS": {
-                "ID": "84",
+            "FIELDS_AFTER": {
+                "ID": "0",
+                "MESSAGE_ID": "84",
                 "TASK_ID": "42",
-                "POST_MESSAGE": "@hermes сделай краткое резюме и потом mark done",
                 "FILE_IDS": ["111"],
             }
         },

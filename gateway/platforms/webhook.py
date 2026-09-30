@@ -21,6 +21,7 @@ import sys
 import time
 from collections import deque
 from contextlib import nullcontext, suppress
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
@@ -172,6 +173,12 @@ class WebhookAdapter(BasePlatformAdapter):
         raw_bitrix24_config = extra.get("bitrix24", {})
         self._bitrix24_config: Dict[str, Any] = (
             raw_bitrix24_config if isinstance(raw_bitrix24_config, dict) else {}
+        )
+        capture_path = self._bitrix24_config.get("capture_path")
+        self._bitrix24_capture_path: Optional[Path] = (
+            Path(capture_path)
+            if isinstance(capture_path, str) and capture_path and Path(capture_path).is_absolute()
+            else None
         )
         self._static_routes: Dict[str, dict] = extra.get("routes", {})
         self._dynamic_routes: Dict[str, dict] = {}
@@ -696,6 +703,7 @@ class WebhookAdapter(BasePlatformAdapter):
         return normalized
 
     def _sanitize_bitrix24_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Keep only safe normalized event context for dispatch."""
         allowed_keys = {
             "accepted",
             "reason",
@@ -710,6 +718,11 @@ class WebhookAdapter(BasePlatformAdapter):
             "normalized_turn",
             "turns",
             "task_id",
+            "task_title",
+            "message_id",
+            "author_id",
+            "mentioned",
+            "actor_id",
             "message",
             "file_ids",
             "attachments",
@@ -719,6 +732,7 @@ class WebhookAdapter(BasePlatformAdapter):
         return {key: value for key, value in result.items() if key in allowed_keys}
 
     def _render_bitrix24_prompt(self, result: dict[str, Any]) -> str:
+        """Render sanitized task/message facts into the bounded agent prompt."""
         prompt_payload: dict[str, Any] = {
             "source": "bitrix24_webhook",
             "event": result.get("event", ""),
@@ -726,6 +740,11 @@ class WebhookAdapter(BasePlatformAdapter):
             "reason": result.get("reason", ""),
             "source_domain": result.get("source_domain", ""),
             "task_id": result.get("task_id", ""),
+            "task_title": result.get("task_title", ""),
+            "message_id": result.get("message_id", ""),
+            "author_id": result.get("author_id", ""),
+            "mentioned": result.get("mentioned"),
+            "actor_id": result.get("actor_id", ""),
             "message": result.get("message", ""),
             "targeting": result.get("targeting", {}),
             "payload": result.get("payload", {}),
@@ -859,15 +878,80 @@ class WebhookAdapter(BasePlatformAdapter):
         env_file.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
 
     async def _handle_bitrix24_webhook(self, request: "web.Request") -> "web.Response":
+        """Capture diagnostics once when enabled, without altering the ingress response."""
+        response, payload = await self._process_bitrix24_webhook(request)
+        self._capture_bitrix24_webhook(request, response, payload)
+        return response
+
+    @staticmethod
+    def _redact_bitrix24_capture_payload(payload: dict) -> dict:
+        """Copy parsed data recursively, preserving domain but hiding auth, credentials and URLs."""
+        def redact(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: (
+                        "<redacted>"
+                        if key.upper() == "AUTH" or any(
+                            marker in key.upper()
+                            for marker in ("TOKEN", "SECRET", "PASSWORD", "URL")
+                        )
+                        else redact(item)
+                    )
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        redacted = redact(payload)
+        auth = payload.get("auth")
+        if isinstance(auth, dict):
+            redacted["auth"] = {
+                key: deepcopy(value) if key == "domain" else "<redacted>"
+                for key, value in auth.items()
+            }
+        return redacted
+
+    def _capture_bitrix24_webhook(
+        self, request: "web.Request", response: "web.Response", payload: Optional[dict]
+    ) -> None:
+        """Append one redacted JSON line if enabled; diagnostic failures never change the response."""
+        if self._bitrix24_capture_path is None:
+            return
+        try:
+            response_body = json.loads(response.body)
+            reason = response_body.get("reason") or response_body.get("error")
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "status": response.status,
+                "reason": reason if isinstance(reason, str) else None,
+                "content_type": request.headers.get("Content-Type", ""),
+                "user_agent": request.headers.get("User-Agent", ""),
+                "body_bytes": request.get("bitrix24_body_bytes", request.content_length),
+                "payload": self._redact_bitrix24_capture_payload(payload) if payload is not None else None,
+            }
+            line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+            self._bitrix24_capture_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._bitrix24_capture_path.open("a", encoding="utf-8") as capture_file:
+                capture_file.write(line)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.warning("[webhook] Bitrix24 capture failed: %s", type(exc).__name__)
+
+    async def _process_bitrix24_webhook(
+        self, request: "web.Request"
+    ) -> tuple["web.Response", Optional[dict]]:
+        """Preserve ingress responses and dispatch, returning the parsed payload if available."""
+        payload = None
         content_length = request.content_length or 0
         if content_length > self._max_body_bytes:
-            return web.json_response({"error": "Payload too large"}, status=413)
+            return web.json_response({"error": "Payload too large"}, status=413), payload
 
         try:
             raw_body = await request.read()
+            request["bitrix24_body_bytes"] = len(raw_body)
         except Exception as e:
             logger.error("[webhook] Failed to read Bitrix24 body: %s", e)
-            return web.json_response({"error": "Bad request"}, status=400)
+            return web.json_response({"error": "Bad request"}, status=400), payload
 
         try:
             from plugins.bitrix24.attachments import _materialize_attachments
@@ -879,23 +963,23 @@ class WebhookAdapter(BasePlatformAdapter):
                 raw_body, request.headers.get("Content-Type", "")
             )
         except ValueError:
-            return web.json_response({"error": "Cannot parse body"}, status=400)
+            return web.json_response({"error": "Cannot parse body"}, status=400), payload
         except Exception:
             logger.exception("[webhook] Bitrix24 payload parsing failed")
-            return web.json_response({"error": "Cannot parse body"}, status=400)
+            return web.json_response({"error": "Cannot parse body"}, status=400), payload
 
         ingress_handler = _make_webhook_ingress_handler(
             materialize_attachments=_materialize_attachments,
             agent_request_from_result=_agent_request_from_result,
         )
         try:
-            result = json.loads(ingress_handler(payload))
+            result = json.loads(await asyncio.to_thread(ingress_handler, payload))
         except Exception:
             logger.exception("[webhook] Bitrix24 ingress handler failed")
-            return web.json_response({"error": "Bad request"}, status=400)
+            return web.json_response({"error": "Bad request"}, status=400), payload
 
         if not isinstance(result, dict):
-            return web.json_response({"error": "Bad request"}, status=400)
+            return web.json_response({"error": "Bad request"}, status=400), payload
 
         reason = str(result.get("reason", "") or "")
         if result.get("accepted") is not True:
@@ -903,12 +987,12 @@ class WebhookAdapter(BasePlatformAdapter):
                 self._log_bitrix24_auth_rejection(payload, request)
                 if self._maybe_sync_bitrix24_application_token(payload):
                     try:
-                        result = json.loads(ingress_handler(payload))
+                        result = json.loads(await asyncio.to_thread(ingress_handler, payload))
                     except Exception:
                         logger.exception("[webhook] Bitrix24 ingress retry after token sync failed")
-                        return web.json_response({"error": "Bad request"}, status=400)
+                        return web.json_response({"error": "Bad request"}, status=400), payload
                     if not isinstance(result, dict):
-                        return web.json_response({"error": "Bad request"}, status=400)
+                        return web.json_response({"error": "Bad request"}, status=400), payload
                     reason = str(result.get("reason", "") or "")
                     if result.get("accepted") is True:
                         logger.info(
@@ -929,16 +1013,20 @@ class WebhookAdapter(BasePlatformAdapter):
                     "not_targeted": 200,
                     "project_not_allowed": 200,
                     "duplicate_event": 200,
+                    "task_not_found": 200,
+                    "message_not_found": 200,
+                    "system_message": 200,
+                    "source_unavailable": 502,
                 }
                 status = status_by_reason.get(reason, 400)
                 body = {"status": "ignored", "reason": reason or "invalid_payload"}
-                if status in {401, 403, 503}:
+                if status in {401, 403, 502, 503}:
                     body = {"error": reason or "invalid_payload"}
-                return web.json_response(body, status=status)
+                return web.json_response(body, status=status), payload
 
         now = time.time()
         if not self._record_rate_limit_hit("bitrix24", now):
-            return web.json_response({"error": "Rate limit exceeded"}, status=429)
+            return web.json_response({"error": "Rate limit exceeded"}, status=429), payload
 
         sanitized_result = self._sanitize_bitrix24_result(result)
         prompt = self._render_bitrix24_prompt(sanitized_result)
@@ -995,7 +1083,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 "delivery_id": delivery_id,
             },
             status=202,
-        )
+        ), payload
 
     # --- Signature validation ---
 

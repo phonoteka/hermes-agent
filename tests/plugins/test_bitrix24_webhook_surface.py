@@ -4,6 +4,16 @@ import json
 from pathlib import Path
 
 import pytest
+
+@pytest.fixture(autouse=True)
+def fake_event_source(monkeypatch):
+    from plugins.bitrix24 import ingress
+    from tests.plugins.test_bitrix24_event_enrichment import FakeEventSource
+
+    source = FakeEventSource('@hermes take a look')
+    monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    return source
+
 import yaml
 
 
@@ -50,7 +60,7 @@ def _supported_payload(domain: str = "example.com") -> dict:
         "event_id": "surface-task-42",
         "event": "ONTASKADD",
         "auth": {"domain": domain, "application_token": "expected-app-token"},
-        "data": {"FIELDS": {"ID": "42", "TITLE": "Webhook smoke"}},
+        "data": {"FIELDS_AFTER": {"ID": "42"}, "FIELDS_BEFORE": "undefined", "IS_ACCESSIBLE_AFTER": "undefined", "IS_ACCESSIBLE_BEFORE": "N"},
     }
 
 

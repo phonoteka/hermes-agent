@@ -18,7 +18,7 @@ EXPECTED_WEBHOOK_URL = "https://example.com/rest/1/test"
 DOWNLOAD_URL = "https://files.example.com/download/secret.bin"
 
 
-def _make_adapter(*, bitrix24_enabled: bool, route_path: str = "/bitrix24/webhook") -> WebhookAdapter:
+def _make_adapter(*, bitrix24_enabled: bool, route_path: str = "/bitrix24/webhook", capture_path=None) -> WebhookAdapter:
     config = PlatformConfig(
         enabled=True,
         extra={
@@ -39,6 +39,8 @@ def _make_adapter(*, bitrix24_enabled: bool, route_path: str = "/bitrix24/webhoo
             },
         },
     )
+    if capture_path is not None:
+        config.extra["bitrix24"]["capture_path"] = capture_path
     return WebhookAdapter(config)
 
 
@@ -52,18 +54,10 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
 
 
 def _bitrix_payload(*, token: str = EXPECTED_TOKEN, domain: str = EXPECTED_DOMAIN, event: str = "ONTASKADD", event_id: str = "evt-accepted-1", description: str = "@hermes review task", title: str = "Webhook smoke") -> dict:
-    fields: dict[str, object] = {
-        "ID": "42",
-        "TITLE": title,
-        "DOWNLOAD_URL": DOWNLOAD_URL,
-    }
-    data: dict[str, object] = {"FIELDS": fields}
+    fields: dict[str, object] = {"ID": "42", "DOWNLOAD_URL": DOWNLOAD_URL}
     if event in {"ONTASKCOMMENTADD", "ONTASKCOMMENTUPDATE"}:
-        fields["TASK_ID"] = "42"
-        fields["POST_MESSAGE"] = description
-        data["MESSAGE"] = description
-    else:
-        fields["DESCRIPTION"] = description
+        fields = {"ID": "0", "TASK_ID": "42", "MESSAGE_ID": "84", "DOWNLOAD_URL": DOWNLOAD_URL}
+    data: dict[str, object] = {"FIELDS_AFTER": fields, "FIELDS_BEFORE": "undefined", "IS_ACCESSIBLE_AFTER": "undefined", "IS_ACCESSIBLE_BEFORE": "N"}
     return {
         "event_id": event_id,
         "event": event,
@@ -81,6 +75,11 @@ def bitrix_env(monkeypatch):
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", EXPECTED_WEBHOOK_URL)
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", EXPECTED_TOKEN)
     monkeypatch.setenv("BITRIX24_BOT_MENTION", "@hermes")
+    from plugins.bitrix24 import ingress
+    from tests.plugins.test_bitrix24_event_enrichment import FakeEventSource
+    source = FakeEventSource()
+    monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    return source
 
 
 async def _capturing_client(adapter: WebhookAdapter):
@@ -124,7 +123,8 @@ async def test_bitrix24_dedicated_route_accepts_unsigned_payload_and_sanitizes_e
     assert event.source.user_name == "bitrix24"
     assert event.message_id == "evt-accepted-1"
     assert event.raw_message["event_id"] == "evt-accepted-1"
-    assert event.raw_message["payload"]["data"]["FIELDS"]["TITLE"] == "Webhook smoke"
+    assert event.raw_message["task_title"] == "Webhook smoke"
+    assert event.raw_message["payload"]["data"]["FIELDS_AFTER"]["ID"] == "42"
     assert "auth" not in json.dumps(event.raw_message)
     assert EXPECTED_TOKEN not in json.dumps(event.raw_message)
     assert EXPECTED_WEBHOOK_URL not in json.dumps(event.raw_message)
@@ -168,6 +168,9 @@ async def test_generic_webhook_route_still_rejects_unsigned_requests(bitrix_env)
     ],
 )
 async def test_bitrix24_route_maps_ingress_rejections_without_dispatch(bitrix_env, monkeypatch, payload, env, expected_status, expected_reason):
+    if expected_reason == "not_targeted":
+        from plugins.bitrix24.enrichment import MessageFacts
+        bitrix_env.message = MessageFacts("84", "5", "please review without mention")
     if env:
         for key, value in env.items():
             monkeypatch.setenv(key, value)
@@ -311,11 +314,10 @@ async def test_bitrix24_route_parses_form_payload_and_dedupes(bitrix_env):
             ("auth[domain]", EXPECTED_DOMAIN),
             ("auth[application_token]", EXPECTED_TOKEN),
             ("auth[member_id]", "member-77"),
-            ("data[FIELDS][ID]", "84"),
-            ("data[FIELDS][TASK_ID]", "42"),
-            ("data[FIELDS][POST_MESSAGE]", "@hermes take a look"),
-            ("data[FIELDS][DOWNLOAD_URL]", DOWNLOAD_URL),
-            ("data[MESSAGE]", "@hermes take a look"),
+            ("data[FIELDS_AFTER][ID]", "0"),
+            ("data[FIELDS_AFTER][TASK_ID]", "42"),
+            ("data[FIELDS_AFTER][MESSAGE_ID]", "84"),
+            ("data[FIELDS_AFTER][DOWNLOAD_URL]", DOWNLOAD_URL),
         ]
     ).encode("utf-8")
 
@@ -339,7 +341,8 @@ async def test_bitrix24_route_parses_form_payload_and_dedupes(bitrix_env):
     assert len(captured) == 1
     event = captured[0]
     assert event.message_id == "evt-form-dup"
-    assert "auth" not in event.text
+    assert '"auth"' not in event.text
+    assert "application_token" not in event.text
     assert EXPECTED_TOKEN not in event.text
     assert "DOWNLOAD_URL" not in event.text
     assert DOWNLOAD_URL not in event.text
@@ -362,3 +365,238 @@ async def test_bitrix24_route_returns_400_for_parse_errors(bitrix_env):
         await asyncio.sleep(0)
 
     assert captured == []
+
+
+@pytest.mark.asyncio
+async def test_bitrix24_capture_accepted_payload(bitrix_env, tmp_path):
+    capture_path = tmp_path / "nested" / "capture.jsonl"
+    adapter = _make_adapter(bitrix24_enabled=True, capture_path=str(capture_path))
+    client, dispatched = await _capturing_client(adapter)
+    from dataclasses import replace
+    bitrix_env.task = replace(bitrix_env.task, title="Задача")
+    payload = _bitrix_payload(event_id="evt-capture-accepted", title="Задача")
+    payload["data"]["nested"] = [{
+        "auth": {"domain": "hidden"}, "access_token": "hidden-token",
+        "client_secret": "hidden-secret", "PASSWORD": "hidden-password",
+        "sourceUrl": "hidden-url", "ID": 17, "message": "Оставить текст",
+    }]
+    raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    async with client as cli:
+        resp = await cli.post(
+            "/bitrix24/webhook", data=raw_body,
+            headers={"Content-Type": "application/json", "User-Agent": "Bitrix24 diagnostic test"},
+        )
+        assert resp.status == 202
+        assert await resp.json() == {
+            "status": "accepted", "route": "bitrix24", "event": "ONTASKADD",
+            "delivery_id": "evt-capture-accepted",
+        }
+        await asyncio.sleep(0)
+    lines = capture_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert set(record) == {"ts", "status", "reason", "content_type", "user_agent", "body_bytes", "payload"}
+    assert record["ts"].endswith("Z")
+    assert record["status"] == 202
+    assert record["reason"] is None
+    assert record["content_type"] == "application/json"
+    assert record["user_agent"] == "Bitrix24 diagnostic test"
+    assert record["body_bytes"] == len(raw_body)
+    assert record["payload"]["event"] == "ONTASKADD"
+    assert record["payload"]["auth"] == {
+        "domain": EXPECTED_DOMAIN, "application_token": "<redacted>", "member_id": "<redacted>",
+    }
+    assert record["payload"]["data"]["FIELDS_AFTER"]["DOWNLOAD_URL"] == "<redacted>"
+    assert record["payload"]["data"]["FIELDS_AFTER"]["ID"] == "42"
+    assert record["payload"]["data"]["nested"] == [{
+        "auth": "<redacted>", "access_token": "<redacted>", "client_secret": "<redacted>",
+        "PASSWORD": "<redacted>", "sourceUrl": "<redacted>", "ID": 17, "message": "Оставить текст",
+    }]
+    assert EXPECTED_TOKEN not in lines[0]
+    assert DOWNLOAD_URL not in lines[0]
+    assert len(dispatched) == 1
+    assert dispatched[0].raw_message["task_title"] == "Задача"
+    assert payload["auth"]["application_token"] == EXPECTED_TOKEN
+
+
+@pytest.mark.asyncio
+async def test_bitrix24_capture_real_form_shape(bitrix_env, tmp_path):
+    capture_path = tmp_path / "capture.jsonl"
+    adapter = _make_adapter(bitrix24_enabled=True, capture_path=str(capture_path))
+    client, dispatched = await _capturing_client(adapter)
+    body = urlencode([
+        ("event", "ONTASKUPDATE"), ("data[FIELDS_BEFORE][ID]", "42"),
+        ("data[FIELDS_AFTER][ID]", "42"), ("auth[domain]", EXPECTED_DOMAIN),
+        ("auth[application_token]", EXPECTED_TOKEN),
+    ]).encode("utf-8")
+    async with client as cli:
+        resp = await cli.post(
+            "/bitrix24/webhook", data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert resp.status == 202
+        assert (await resp.json())["status"] == "accepted"
+        await asyncio.sleep(0)
+    text = capture_path.read_text(encoding="utf-8")
+    assert len(text.splitlines()) == 1
+    record = json.loads(text)
+    assert record["status"] == 202
+    assert record["reason"] is None
+    assert record["payload"]["data"]["FIELDS_AFTER"]["ID"] == "42"
+    assert record["payload"]["data"]["FIELDS_BEFORE"]["ID"] == "42"
+    assert record["payload"]["auth"]["application_token"] == "<redacted>"
+    assert record["body_bytes"] == len(body)
+    assert EXPECTED_TOKEN not in text
+    assert len(dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_bitrix24_capture_unparseable_body(bitrix_env, tmp_path):
+    capture_path = tmp_path / "capture.jsonl"
+    adapter = _make_adapter(bitrix24_enabled=True, capture_path=str(capture_path))
+    client, dispatched = await _capturing_client(adapter)
+    raw_body = b'{"event":"ONTASKADD","auth":'
+    async with client as cli:
+        resp = await cli.post(
+            "/bitrix24/webhook", data=raw_body, headers={"Content-Type": "application/json"},
+        )
+        assert resp.status == 400
+        assert await resp.json() == {"error": "Cannot parse body"}
+    record = json.loads(capture_path.read_text(encoding="utf-8"))
+    assert record["payload"] is None
+    assert record["status"] == 400
+    assert record["reason"] == "Cannot parse body"
+    assert record["body_bytes"] == len(raw_body)
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_bitrix24_capture_wrong_token(bitrix_env, tmp_path):
+    capture_path = tmp_path / "capture.jsonl"
+    adapter = _make_adapter(bitrix24_enabled=True, capture_path=str(capture_path))
+    client, dispatched = await _capturing_client(adapter)
+    async with client as cli:
+        resp = await cli.post(
+            "/bitrix24/webhook", json=_bitrix_payload(token="wrong-token", event_id="evt-capture-wrong"),
+        )
+        assert resp.status == 401
+        assert await resp.json() == {"error": "unauthorized_application_token"}
+    text = capture_path.read_text(encoding="utf-8")
+    record = json.loads(text)
+    assert record["status"] == 401
+    assert record["reason"] == "unauthorized_application_token"
+    assert record["payload"]["auth"]["application_token"] == "<redacted>"
+    assert "wrong-token" not in text
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+async def test_bitrix24_capture_disabled(bitrix_env, tmp_path):
+    adapter = _make_adapter(bitrix24_enabled=True)
+    client, dispatched = await _capturing_client(adapter)
+    existing_files = set(tmp_path.rglob("*"))
+    async with client as cli:
+        resp = await cli.post("/bitrix24/webhook", json=_bitrix_payload(event_id="evt-capture-disabled"))
+        assert resp.status == 202
+        assert await resp.json() == {
+            "status": "accepted", "route": "bitrix24", "event": "ONTASKADD",
+            "delivery_id": "evt-capture-disabled",
+        }
+        await asyncio.sleep(0)
+    assert set(tmp_path.rglob("*")) == existing_files
+    assert len(dispatched) == 1
+
+
+@pytest.mark.asyncio
+async def test_bitrix24_capture_write_failure_keeps_response(bitrix_env, tmp_path, caplog):
+    parent = tmp_path / "regular-file"
+    parent.write_text("do not change", encoding="utf-8")
+    adapter = _make_adapter(bitrix24_enabled=True, capture_path=str(parent / "capture.jsonl"))
+    client, dispatched = await _capturing_client(adapter)
+    with caplog.at_level(logging.WARNING, logger="gateway.platforms.webhook"):
+        async with client as cli:
+            resp = await cli.post("/bitrix24/webhook", json=_bitrix_payload(event_id="evt-capture-write-failure"))
+            assert resp.status == 202
+            assert await resp.json() == {
+                "status": "accepted", "route": "bitrix24", "event": "ONTASKADD",
+                "delivery_id": "evt-capture-write-failure",
+            }
+            await asyncio.sleep(0)
+    warnings = [record for record in caplog.records if "Bitrix24 capture failed" in record.message]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert EXPECTED_TOKEN not in caplog.text
+    assert parent.read_text(encoding="utf-8") == "do not change"
+    assert len(dispatched) == 1
+
+
+def _real_comment_form(message_id: str = "84") -> bytes:
+    return urlencode([
+        ("event", "ONTASKCOMMENTADD"), ("event_handler_id", "208"),
+        ("data[FIELDS_AFTER][ID]", "0"), ("data[FIELDS_AFTER][MESSAGE_ID]", message_id),
+        ("data[FIELDS_AFTER][TASK_ID]", "42"), ("data[FIELDS_BEFORE]", "undefined"),
+        ("data[IS_ACCESSIBLE_AFTER]", "undefined"), ("data[IS_ACCESSIBLE_BEFORE]", "N"),
+        ("ts", "1790784385"), ("auth[domain]", EXPECTED_DOMAIN),
+        ("auth[application_token]", EXPECTED_TOKEN), ("auth[member_id]", "member-77"),
+    ]).encode("utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("author_id", "text", "message_id", "expected_status", "expected_body", "dispatched_mode"),
+    [
+        ("5", "@hermes посмотри", "201", 202, None, "human_comment"),
+        ("1", "@hermes отчёт готов", "202", 202, None, "bot_mention"),
+        ("5", "просто коммент", "203", 200, {"status": "ignored", "reason": "not_targeted"}, None),
+        ("5", "[USER=1]Bot[/USER] без короткого тега", "204", 200, {"status": "ignored", "reason": "not_targeted"}, None),
+        ("1", "[USER=1]Bot[/USER]", "205", 200, {"status": "ignored", "reason": "not_targeted"}, None),
+        ("0", "@hermes создал задачу", "206", 200, {"status": "ignored", "reason": "system_message"}, None),
+    ],
+)
+async def test_bitrix24_route_real_comment_shape_author_and_tag_policy(
+    bitrix_env, author_id, text, message_id, expected_status, expected_body, dispatched_mode,
+):
+    from plugins.bitrix24.enrichment import MessageFacts, TaskFacts
+    bitrix_env.task = TaskFacts("42", "Настоящая задача", "", "5", "5", "99")
+    bitrix_env.message = MessageFacts(message_id, author_id, text)
+    adapter = _make_adapter(bitrix24_enabled=True)
+    client, captured = await _capturing_client(adapter)
+    async with client as cli:
+        resp = await cli.post(
+            "/bitrix24/webhook", data=_real_comment_form(message_id),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        assert resp.status == expected_status
+        if expected_body is not None:
+            assert await resp.json() == expected_body
+        await asyncio.sleep(0)
+    assert ("message", "99", message_id) in bitrix_env.calls
+    if dispatched_mode is None:
+        assert captured == []
+    else:
+        assert len(captured) == 1
+        prompt = captured[0].text
+        assert text in prompt
+        assert "Настоящая задача" in prompt
+        assert dispatched_mode in prompt
+        assert EXPECTED_TOKEN not in prompt
+
+
+@pytest.mark.asyncio
+async def test_bitrix24_route_source_unavailable_is_502_and_retry_is_not_deduped(bitrix_env):
+    from plugins.bitrix24.enrichment import MessageFacts
+    bitrix_env.message = MessageFacts("301", "5", "@hermes повтори")
+    bitrix_env.unavailable = True
+    adapter = _make_adapter(bitrix24_enabled=True)
+    client, captured = await _capturing_client(adapter)
+    body = _real_comment_form("301")
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    async with client as cli:
+        first = await cli.post("/bitrix24/webhook", data=body, headers=headers)
+        assert first.status == 502
+        assert await first.json() == {"error": "source_unavailable"}
+        bitrix_env.unavailable = False
+        retry = await cli.post("/bitrix24/webhook", data=body, headers=headers)
+        assert retry.status == 202
+        await asyncio.sleep(0)
+    assert len(captured) == 1

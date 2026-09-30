@@ -3,6 +3,18 @@ from __future__ import annotations
 import json
 
 import pytest
+
+@pytest.fixture(autouse=True)
+def fake_event_source(monkeypatch):
+    from plugins.bitrix24 import ingress
+    from tests.plugins.test_bitrix24_event_enrichment import FakeEventSource
+
+    source = FakeEventSource('@hermes take a look')
+    from plugins.bitrix24.enrichment import MessageFacts
+    source.messages = {str(84 + i): MessageFacts(str(84 + i), "1", text) for i, text in enumerate(_COMMENT_TEXTS)}
+    monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    return source
+
 import yaml
 
 
@@ -42,6 +54,9 @@ def ingress_tool(hermes_home):
     return tool
 
 
+_COMMENT_TEXTS = ['plain update without bot mention', '@hermes take a look', '@hermes updated context']
+
+
 def _task_payload(
     *,
     event_id: str = "evt-task-1",
@@ -54,17 +69,12 @@ def _task_payload(
     auth = {"domain": domain, "application_token": "expected-app-token"}
     if isinstance(auth_extra, dict):
         auth.update(auth_extra)
-    fields = {
-        "ID": "42",
-        "DESCRIPTION": description,
-    }
-    if title is not None:
-        fields["TITLE"] = title
+    fields = {"ID": "42"}
     return {
         "event_id": event_id,
         "event": event,
         "auth": auth,
-        "data": {"FIELDS": fields},
+        "data": {"FIELDS_AFTER": fields, "FIELDS_BEFORE": "undefined", "IS_ACCESSIBLE_AFTER": "undefined", "IS_ACCESSIBLE_BEFORE": "N"},
     }
 
 
@@ -80,10 +90,10 @@ def _comment_payload(
         "event": event,
         "auth": {"domain": domain, "application_token": "expected-app-token"},
         "data": {
-            "FIELDS": {
-                "ID": "84",
+            "FIELDS_AFTER": {
+                "ID": "0",
+                "MESSAGE_ID": str(84 + _COMMENT_TEXTS.index(post_message)),
                 "TASK_ID": "42",
-                "POST_MESSAGE": post_message,
             }
         },
     }
@@ -242,7 +252,7 @@ def test_bitrix24_webhook_rejects_supported_event_without_event_id_as_unknown_sh
         {
             "event": "ONTASKCOMMENTADD",
             "auth": {"domain": "example.com", "application_token": "expected-app-token"},
-            "data": {"FIELDS": {"ID": "84", "TASK_ID": "42", "POST_MESSAGE": "@hermes hi"}},
+            "data": {"FIELDS_AFTER": {"ID": "0", "TASK_ID": "42", "MESSAGE_ID": "84"}},
         },
     )
 
@@ -266,7 +276,7 @@ def test_bitrix24_webhook_rejects_bad_supported_event_shape_as_unknown_payload_s
             "event_id": "evt-bad-shape-1",
             "event": "ONTASKCOMMENTADD",
             "auth": {"domain": "example.com", "application_token": "expected-app-token"},
-            "data": {"FIELDS": {"ID": "84", "TASK_ID": "42"}},
+            "data": {"FIELDS_AFTER": {"ID": "0", "TASK_ID": "42"}},
         },
     )
 
@@ -374,7 +384,7 @@ def test_bitrix24_webhook_accepts_sparse_task_update_without_title(
     assert result["event"] == "ONTASKUPDATE"
     assert result["task_id"] == "42"
     assert result["reason"] == "targeted_event"
-    assert result["payload"]["data"]["FIELDS"] == {"ID": "42", "DESCRIPTION": "description only update"}
+    assert result["payload"]["data"]["FIELDS_AFTER"] == {"ID": "42"}
 
 
 def test_bitrix24_webhook_sanitizes_auth_fields_from_accepted_result(
@@ -421,24 +431,24 @@ def test_bitrix24_webhook_normalizes_targeted_comment_add_and_update_mentions(
 
     assert add_result["accepted"] is True
     assert add_result["reason"] == "targeted_event"
-    assert add_result["targeting"]["mode"] == "mention"
+    assert add_result["targeting"]["mode"] == "bot_mention"
     assert add_result["message"] == "@hermes take a look"
     assert add_result["normalized_turn"] == {
         "source": "bitrix24",
         "event": "ONTASKCOMMENTADD",
         "event_id": "evt-comment-add-1",
-        "object_id": "84",
+        "object_id": "85",
     }
 
     assert update_result["accepted"] is True
     assert update_result["reason"] == "targeted_event"
-    assert update_result["targeting"]["mode"] == "mention"
+    assert update_result["targeting"]["mode"] == "bot_mention"
     assert update_result["message"] == "@hermes updated context"
     assert update_result["normalized_turn"] == {
         "source": "bitrix24",
         "event": "ONTASKCOMMENTUPDATE",
         "event_id": "evt-comment-update-1",
-        "object_id": "84",
+        "object_id": "86",
     }
     assert update_result["agent_request"]["source"] == "bitrix24_webhook_ingress"
     assert update_result["agent_request"]["task"]["id"] == "42"
