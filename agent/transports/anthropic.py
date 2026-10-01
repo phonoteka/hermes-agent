@@ -9,6 +9,18 @@ _MCP_PREFIX = "mcp__"
 _THINKING_TYPES = ("thinking", "redacted_thinking")
 
 
+def build_canon_anthropic_output_format(output_schema: Any) -> dict[str, Any]:
+    """Build an Anthropic JSON-schema format from a detached, validated Canon schema.
+
+    Validation and detachment use the Codex transport's JSON projection; its
+    ``ValueError`` for non-JSON schemas is propagated unchanged.
+    """
+    from agent.transports.codex import build_canon_responses_text_format
+
+    detached_schema = build_canon_responses_text_format(output_schema)["text"]["format"]["schema"]
+    return {"output_config": {"format": {"type": "json_schema", "schema": detached_schema}}}
+
+
 def _unprefix_oauth_tool_name(name: str) -> str:
     """Reverse the OAuth-wire ``mcp__`` prefix back to the registered tool name.
     Two originals map onto one wire name (``read_file`` / ``mcp_linear_get_issue``), so
@@ -27,6 +39,7 @@ def _unprefix_oauth_tool_name(name: str) -> str:
 _BUILD_KWARG_DEFAULTS = {
     "max_tokens": 16384, "reasoning_config": None, "tool_choice": None, "is_oauth": False, "preserve_dots": False,
     "context_length": None, "base_url": None, "fast_mode": False, "drop_context_1m_beta": False,
+    "output_format": None,
 }
 
 
