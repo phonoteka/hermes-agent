@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import re
-import shlex
 import sys
 import time
 import threading
@@ -31,7 +30,6 @@ import atexit
 from copy import deepcopy
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from types import MappingProxyType
 from typing import Optional, Dict, Any, List
 
@@ -61,7 +59,6 @@ from tools.terminal_tool_backends import (
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
 from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled
 from tools.terminal_scope import reset_terminal_scope, set_terminal_scope
-from tools.tool_execution_scope import get_tool_execution_scope
 
 
 def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
@@ -981,54 +978,6 @@ def _resolve_notification_flag_conflict(*, notify_on_complete: bool, watch_patte
     return watch_patterns, ""
 
 
-_SCOPED_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_@%+=:,.-])/(?:[A-Za-z0-9._~+@%:=,/-]+)")
-_SCOPED_RUNTIME_ROOTS = tuple(Path(path).resolve(strict=False) for path in ("/usr", "/bin", "/lib", "/lib64"))
-
-
-def _scoped_command_path_error(command: str) -> str | None:
-    """Reject explicit absolute command paths outside the active scope."""
-    scope = get_tool_execution_scope()
-    if scope is None:
-        return None
-    for match in _SCOPED_ABSOLUTE_PATH_RE.finditer(command):
-        raw = match.group(0).rstrip(".,;:)]}")
-        if not raw or raw == "/":
-            continue
-        try:
-            candidate = Path(raw).expanduser().resolve(strict=False)
-        except (OSError, RuntimeError, ValueError):
-            return f"Terminal command path literal '{raw}' is invalid under the active tool execution scope"
-        if not scope.contains(candidate) and not any(
-            runtime_root == candidate or runtime_root in candidate.parents
-            for runtime_root in _SCOPED_RUNTIME_ROOTS
-        ):
-            return (
-                f"Terminal command path literal '{candidate}' is outside the active tool execution root "
-                f"'{scope.root_directory}'"
-            )
-    return None
-
-
-def _landlock_scoped_command(command: str) -> str:
-    """Wrap an opaque scoped command in the current-checkout Landlock launcher."""
-    scope = get_tool_execution_scope()
-    if scope is None:
-        return command
-    launcher = Path(__file__).with_name("tool_execution_scope.py")
-    return " ".join(
-        shlex.quote(value)
-        for value in (
-            sys.executable, str(launcher), "--landlock-launch",
-            "--root", scope.root_directory,
-            "--read-roots", json.dumps(list(scope.read_roots), separators=(",", ":")),
-            "--write-roots", json.dumps(list(scope.write_roots), separators=(",", ":")),
-            "--read", json.dumps(list(scope.read_allowlist), separators=(",", ":")),
-            "--write", json.dumps(list(scope.write_allowlist), separators=(",", ":")),
-            "--command", command,
-        )
-    )
-
-
 def _resolve_command_cwd(
     *,
     workdir: Optional[str],
@@ -1170,7 +1119,7 @@ _PROMOTED_NOTE = (
 
 def _plan_execution(
     command: Any, *, task_id: Optional[str], timeout: Optional[int],
-    background: bool, _host_local: bool, workdir: Optional[str] = None,
+    background: bool, _host_local: bool,
 ) -> _ExecPlan:
     """Resolve backend, env-cache key, image, cwd and timeout for one call.
 
@@ -1186,20 +1135,6 @@ def _plan_execution(
 
     config = resolve_task_environment_config(task_id)
     env_type = "local" if _host_local else config["env_type"]
-    scope = get_tool_execution_scope()
-    if scope is not None:
-        if scope.mode != "read-write":
-            raise _Rejected(_error_json(
-                f"Terminal tool is unavailable for read-only Canon phase {scope.phase_id or 'unknown-phase'} "
-                f"in run {scope.run_id or 'unknown-run'}", status="blocked"
-            ))
-        if env_type != "local":
-            raise _Rejected(_error_json(
-                "Terminal tool is unavailable under an active scope for non-local backends", status="blocked"
-            ))
-        path_error = _scoped_command_path_error(command)
-        if path_error:
-            raise _Rejected(_error_json(path_error, status="blocked"))
 
     # Fail closed under a refusal scope: the routed profile's terminal
     # policy could not be resolved, so running with the launch process's
@@ -1223,14 +1158,6 @@ def _plan_execution(
     image = _select_image(env_type, overrides, config)
 
     cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-    if scope is not None:
-        scoped_workdir = scope.resolve_path(workdir) if workdir else Path(scope.working_directory)
-        if not scope.contains(scoped_workdir):
-            raise _Rejected(_error_json(
-                f"Terminal working directory '{scoped_workdir}' is outside the active tool execution root "
-                f"'{scope.root_directory}'", status="blocked"
-            ))
-        cwd = str(scoped_workdir)
     host_cwd = _resolve_task_host_cwd(config, task_id)
     # config["cwd"] was sanitized for container backends in _get_env_config
     # but an override / session record is raw: a host path would reach
@@ -1355,7 +1282,6 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
-    execution_command: Optional[str] = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
     max_retries = 3
@@ -1379,7 +1305,7 @@ def _run_foreground(
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
-                execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
+                command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
             )
@@ -1495,11 +1421,7 @@ def terminal_tool(
     try:
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
-            workdir=workdir,
         )
-        scope = get_tool_execution_scope()
-        if scope is not None and workdir is not None:
-            workdir = str(scope.resolve_path(workdir))
         env = _acquire_env(plan, task_id)
         env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
 
@@ -1520,10 +1442,9 @@ def terminal_tool(
             # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
             # caller could not have meant for a foreground call, and the two are exclusive anyway.
             background, notify_on_complete, watch_patterns = True, True, None
-        execution_command = _landlock_scoped_command(command)
         if background:
             result = spawn_background_process(
-                command=execution_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
+                command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
@@ -1536,7 +1457,6 @@ def terminal_tool(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-            execution_command=execution_command,
         )
     except _Rejected as r:
         return r.result_json
@@ -1674,9 +1594,11 @@ registry.register(
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
 # The whole block is removed by reverting the commit that added it.
+from pathlib import Path  # noqa: F401,E402
 import importlib.util  # noqa: F401,E402
 import platform  # noqa: F401,E402
 import re  # noqa: F401,E402
+import shlex  # noqa: F401,E402
 import shutil  # noqa: F401,E402
 import stat  # noqa: F401,E402
 import subprocess  # noqa: F401,E402
