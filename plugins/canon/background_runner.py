@@ -231,7 +231,7 @@ def _valid_failed_result(stdout: bytes | str) -> dict[str, Any] | None:
     if execution_facts is not None:
         if not isinstance(execution_facts, dict) or set(execution_facts) - {
             "inputPublications", "profileId", "settingsDigest", "modelSelections",
-            "phaseAuthorities", "outputPublications", "humanGateApprovals",
+            "backendSessions", "phaseAuthorities", "outputPublications", "humanGateApprovals",
         }:
             return None
         if any(

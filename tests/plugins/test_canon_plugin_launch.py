@@ -1116,6 +1116,43 @@ def test_preserves_current_v2_failed_result_on_nonzero_child_exit(tmp_path: Path
     assert parsed == typed_failed
 
 
+def test_preserves_failed_result_with_backend_sessions_execution_facts() -> None:
+    """A real failed Canon run carries schema-required executionFacts.backendSessions."""
+
+    typed_failed = _typed_failed_result()
+    typed_failed["executionFacts"] = {
+        "inputPublications": [],
+        "profileId": "default",
+        "settingsDigest": "sha256:" + "a" * 64,
+        "modelSelections": [],
+        "backendSessions": [{
+            "nodeId": "phase",
+            "sessionRef": "sha256:" + "b" * 64,
+            "settingsDigest": "sha256:" + "c" * 64,
+            "routeSettingsDigest": "sha256:" + "d" * 64,
+        }],
+        "phaseAuthorities": [],
+        "outputPublications": [],
+        "humanGateApprovals": [],
+    }
+    serialized = json.dumps(typed_failed, ensure_ascii=False, separators=(",", ":"))
+
+    parsed = transport._parse_runner_result({"status": "exited", "exit_code": 1, "output": serialized})
+
+    assert parsed == typed_failed
+
+
+def test_failed_result_with_unknown_execution_fact_stays_rejected() -> None:
+    typed_failed = _typed_failed_result()
+    typed_failed["executionFacts"] = {
+        "modelSelections": [], "backendSessions": [], "phaseAuthorities": [],
+        "outputPublications": [], "humanGateApprovals": [], "branchLineages": [],
+    }
+    serialized = json.dumps(typed_failed, ensure_ascii=False, separators=(",", ":"))
+
+    assert background_runner._valid_failed_result(serialized) is None
+
+
 def test_v1_failed_result_remains_rejected_as_stale_authority(tmp_path: Path) -> None:
     stale = _typed_failed_result()
     stale["schemaVersion"] = "canon-run-result.schema.v1"
