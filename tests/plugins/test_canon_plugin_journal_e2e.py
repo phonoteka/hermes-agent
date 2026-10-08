@@ -28,7 +28,7 @@ CANON_ROOT = _installed_canon_root()
 sys.path.insert(0, str(CANON_ROOT / "src"))
 
 from hermes_cli.plugins import PluginManager, parse_manifest_file
-from plugins.canon.transport import build_run_request
+from canon.cli import _load_source_bound_cli_request
 from tools.process_registry import process_registry
 from tools.registry import registry
 
@@ -378,7 +378,7 @@ def _write_bootstrap(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def real_canon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Load the bundled plugin and route every child to tmp-owned durable roots."""
+    """Pre: isolated temp profile. Post: plugin children use test-owned durable roots; unload on exit. Raises: setup errors."""
 
     _assert_preconditions()
     profile_root = tmp_path / "hermes-home"
@@ -408,17 +408,12 @@ def real_canon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         except queue.Empty:
             break
     manager._load_plugin(manifest)
-    for tool_name in (
-        "canon_gateway_launch",
-        "canon_gateway_checkpoint",
-        "canon_workflow_observe",
-    ):
+    monkeypatch.setenv("HERMES_HOME", str(profile_root))
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    for tool_name in ("canon_run", "canon_checkpoint", "canon_inspect"):
         entry = registry.get_entry(tool_name, scope=manager.scope_key)
         assert entry is not None
-        if tool_name == "canon_gateway_launch":
-            handle = inspect.getclosurevars(entry.handler).globals["handle_tool"]
-        else:
-            handle = inspect.signature(entry.handler).parameters["_handler"].default
+        handle = inspect.getclosurevars(entry.handler).globals["handle_command"]
         monkeypatch.setitem(handle.__globals__, "_canon_command_prefix", lambda: [str(CANON_VENV), str(bootstrap)])
         monkeypatch.setitem(handle.__globals__, "get_hermes_home", lambda: profile_root)
         monkeypatch.setitem(handle.__globals__, "get_default_hermes_root", lambda: profile_root)
@@ -436,6 +431,13 @@ def real_canon(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             if session.get("status") == "running":
                 process_registry.kill_process(session["session_id"])
         assert not any(session.get("status") == "running" for session in process_registry.list_sessions())
+
+
+def _workflow_input_file(execution: Path, value: dict[str, Any]) -> str:
+    """Pre: execution is test-owned. Post: writes exact input for CLI; returns path. Raises: OSError."""
+    path = execution / "workflow-input.json"
+    _write_json(path, value)
+    return str(path)
 
 
 def _dispatch(scope: str, tool: str, args: dict[str, Any], *, task_id: str | None = None) -> dict[str, Any]:
@@ -498,10 +500,10 @@ def test_completed_launch_has_fresh_correlated_journal_projection(
     execution.mkdir(exist_ok=True)
     result = _dispatch(
         real_canon["scope"],
-        "canon_gateway_launch",
+        "canon_run",
         {
-            "workflow_name": str(pack / "workflow.json"),
-            "workflow_input": {"task": "J05 completed launch"},
+            "workflow": str(pack / "workflow.json"),
+            "workflow_input_json": _workflow_input_file(execution, {"task": "J05 completed launch"}),
             "execution_root": str(execution),
             "wait_mode": "sync-short",
             "timeout_seconds": 90,
@@ -550,11 +552,15 @@ def _solution_modeling_checkpoint_payload(
     decision: dict[str, Any],
     request_id: str,
 ) -> dict[str, Any]:
-    """Frame one production workflow decision from Canon-owned run authority."""
-    framing = build_run_request(
+    """Pre: Canon-valid input and prompt. Post: decision uses Canon-owned framing. Raises: Canon validation errors."""
+    framing = _load_source_bound_cli_request(
         workflow_path=workflow_path,
         workflow_input=workflow_input,
-        execution_root=execution_root,
+        execution_root=str(execution_root),
+        profile_id="default",
+        require_explicit_identity=False,
+        runtime_mode="durable-production",
+        recursion_limit=64,
     )
     handle = prompt["resumeHandle"]
     return {
@@ -595,24 +601,36 @@ def _fresh_checkpoint_prompt(result: dict[str, Any], db_path: Path) -> dict[str,
 
 
 def _await_completion(session_id: str) -> dict[str, Any]:
+    """Pre: tracked child. Post: returns its native completion event. Raises: queue.Empty on timeout."""
     while True:
         event = process_registry.completion_queue.get(timeout=90)
         if event.get("type") == "completion" and event.get("session_id") == session_id:
             return event
 
 
+def _full_child_result(session_id: str) -> dict[str, Any]:
+    """Pre: child has completed. Post: decodes full native stdout, not the completion tail. Raises: JSON/assertion errors."""
+    raw = registry.dispatch("process_manage", {
+        "action": "log", "session_id": session_id, "offset": 0, "limit": 1048576,
+    })
+    logged = json.loads(raw) if isinstance(raw, str) else raw
+    assert "error" not in logged, logged
+    return json.loads(logged["output"])
+
+
 def test_checkpoint_lifecycle_preserves_one_journal_lineage(
     tmp_path: Path, real_canon: dict[str, Any],
 ) -> None:
+    """Pre: isolated real CLI. Post: revisions and approval preserve one durable lineage. Raises: assertion failures."""
     pack = _human_gate_pack(tmp_path)
     execution = real_canon["execution"]
     execution.mkdir(exist_ok=True)
     launch = _dispatch(
         real_canon["scope"],
-        "canon_gateway_launch",
+        "canon_run",
         {
-            "workflow_name": str(pack / "workflow.json"),
-            "workflow_input": {"task": "J05 revision lifecycle"},
+            "workflow": str(pack / "workflow.json"),
+            "workflow_input_json": _workflow_input_file(execution, {"task": "J05 revision lifecycle"}),
             "execution_root": str(execution),
             "wait_mode": "sync-short",
             "timeout_seconds": 90,
@@ -633,12 +651,12 @@ def test_checkpoint_lifecycle_preserves_one_journal_lineage(
 
     foreign = _checkpoint_payload(pack, prompt, {"action": "approve"}, "foreign")
     foreign["threadId"] = "foreign-thread"
-    rejected = _dispatch(real_canon["scope"], "canon_gateway_checkpoint", {
-        "workflow_name": str(pack / "workflow.json"),
-        "mode": "continue_paused",
+    rejected = _dispatch(real_canon["scope"], "canon_checkpoint", {
+        "workflow": str(pack / "workflow.json"),
+        "subcommand": "continue-paused",
         "run_id": run_id,
         "thread_id": thread_id,
-        "payload": foreign,
+        "request_json": foreign,
         "wait_mode": "sync-real",
         "timeout_seconds": 90,
     })
@@ -653,22 +671,22 @@ def test_checkpoint_lifecycle_preserves_one_journal_lineage(
         payload = _checkpoint_payload(pack, prompt, decision, f"j05-decision-{index}")
         accepted = _dispatch(
             real_canon["scope"],
-            "canon_gateway_checkpoint",
+            "canon_checkpoint",
             {
-                "workflow_name": str(pack / "workflow.json"),
-                "mode": "continue_paused",
+                "workflow": str(pack / "workflow.json"),
+                "subcommand": "continue-paused",
                 "run_id": run_id,
                 "thread_id": thread_id,
-                "payload": payload,
+                "request_json": payload,
                 "wait_mode": "async-no-wait",
                 "timeout_seconds": 90,
             },
             task_id=f"j05-checkpoint-{index}",
         )
-        assert accepted.get("accepted") is True, accepted
-        completion = _await_completion(accepted["processSessionId"])
+        assert accepted.get("notify_on_complete") is True, accepted
+        completion = _await_completion(accepted["session_id"])
         assert completion["exit_code"] == 0, completion
-        child_result = json.loads(completion["output"])
+        child_result = _full_child_result(accepted["session_id"])
         if decision["action"] == "revise":
             assert child_result["resumeHandle"]["runId"] == run_id
             assert child_result["resumeHandle"]["threadId"] == thread_id
@@ -724,16 +742,17 @@ def test_oracle_sensitivity_rejects_schema_valid_output_without_journal_evidence
 def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     tmp_path: Path, real_canon: dict[str, Any],
 ) -> None:
+    """Pre: installed workflow and isolated host. Post: revision replays the session and approval completes its journal. Raises: assertion failures."""
     workflow_path = CANON_ROOT / "src" / "canon_workflows" / "packs" / "solution_modeling_workflow_pack" / "workflow.json"
     workflow_input = {"taskInput": SOLUTION_MODELING_TASK_INPUT}
     execution = real_canon["execution"]
     execution.mkdir(exist_ok=True)
     launch = _dispatch(
         real_canon["scope"],
-        "canon_gateway_launch",
+        "canon_run",
         {
-            "workflow_name": str(workflow_path),
-            "workflow_input": workflow_input,
+            "workflow": str(workflow_path),
+            "workflow_input_json": _workflow_input_file(execution, workflow_input),
             "execution_root": str(execution),
             "wait_mode": "sync-short",
             "timeout_seconds": 90,
@@ -781,11 +800,10 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
 
     observed = _dispatch(
         real_canon["scope"],
-        "canon_workflow_observe",
+        "canon_inspect",
         {"surface": "report", "run_id": run_id},
     )
-    assert "result" in observed, observed
-    initial_report = observed["result"]
+    initial_report = observed
     assert initial_report["status"] == "paused"
     assert initial_report["runId"] == run_id
     assert initial_report["threadId"] == thread_id
@@ -799,10 +817,10 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     for _ in range(2):
         inspected = _dispatch(
             real_canon["scope"],
-            "canon_workflow_observe",
+            "canon_inspect",
             {"surface": "inspect", "run_id": run_id},
         )
-        assert "result" in inspected and inspected["result"]["runId"] == run_id, inspected
+        assert inspected["runId"] == run_id, inspected
 
     revise_payload = _solution_modeling_checkpoint_payload(
         workflow_path,
@@ -814,24 +832,24 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     )
     revise_accepted = _dispatch(
         real_canon["scope"],
-        "canon_gateway_checkpoint",
+        "canon_checkpoint",
         {
-            "workflow_name": str(workflow_path),
-            "mode": "continue_paused",
+            "workflow": str(workflow_path),
+            "subcommand": "continue-paused",
             "run_id": run_id,
             "thread_id": thread_id,
-            "payload": revise_payload,
+            "request_json": revise_payload,
             "wait_mode": "async-no-wait",
             "timeout_seconds": 90,
         },
         task_id="s7-solution-modeling-revise",
     )
-    assert revise_accepted.get("accepted") is True, revise_accepted
-    revise_completion = _await_completion(revise_accepted["processSessionId"])
+    assert revise_accepted.get("notify_on_complete") is True, revise_accepted
+    revise_completion = _await_completion(revise_accepted["session_id"])
     assert revise_completion["exit_code"] == 0, revise_completion.get("output", revise_completion)
-    revised_result = json.loads(revise_completion["output"])
+    revised_result = _full_child_result(revise_accepted["session_id"])
     assert revised_result["status"] == "paused"
-    revised_prompt = revised_result.get("humanGatePrompt") if isinstance(revised_result.get("humanGatePrompt"), dict) else revised_result
+    revised_prompt = revised_result["humanGatePrompt"]
     assert "gateId" in revised_prompt, revised_result
     assert revised_prompt["workflowRef"] == "workflow:solution-modeling-workflow"
     assert revised_prompt["resumeHandle"]["runId"] == run_id
@@ -857,10 +875,10 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
 
     observed = _dispatch(
         real_canon["scope"],
-        "canon_workflow_observe",
+        "canon_inspect",
         {"surface": "report", "run_id": run_id},
     )
-    revised_report = observed["result"]
+    revised_report = observed
     assert revised_report["status"] == "paused"
     assert revised_report["runId"] == run_id
     assert revised_report["threadId"] == thread_id
@@ -873,10 +891,10 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     assert revised_report["gateDecisions"][0]["decision"] == "revise"
     inspected = _dispatch(
         real_canon["scope"],
-        "canon_workflow_observe",
+        "canon_inspect",
         {"surface": "inspect", "run_id": run_id},
     )
-    assert "result" in inspected and inspected["result"]["runId"] == run_id, inspected
+    assert inspected["runId"] == run_id, inspected
 
     approve_payload = _solution_modeling_checkpoint_payload(
         workflow_path,
@@ -888,22 +906,22 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
     )
     approve_accepted = _dispatch(
         real_canon["scope"],
-        "canon_gateway_checkpoint",
+        "canon_checkpoint",
         {
-            "workflow_name": str(workflow_path),
-            "mode": "continue_paused",
+            "workflow": str(workflow_path),
+            "subcommand": "continue-paused",
             "run_id": run_id,
             "thread_id": thread_id,
-            "payload": approve_payload,
+            "request_json": approve_payload,
             "wait_mode": "async-no-wait",
             "timeout_seconds": 90,
         },
         task_id="s7-solution-modeling-approve",
     )
-    assert approve_accepted.get("accepted") is True, approve_accepted
-    approve_completion = _await_completion(approve_accepted["processSessionId"])
+    assert approve_accepted.get("notify_on_complete") is True, approve_accepted
+    approve_completion = _await_completion(approve_accepted["session_id"])
     assert approve_completion["exit_code"] == 0, approve_completion.get("output", approve_completion)
-    final_result = json.loads(approve_completion["output"])
+    final_result = _full_child_result(approve_accepted["session_id"])
     assert final_result["runId"] == run_id
     assert final_result["threadId"] == thread_id
     assert final_result["status"] == "completed"
@@ -913,10 +931,10 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
 
     observed = _dispatch(
         real_canon["scope"],
-        "canon_workflow_observe",
+        "canon_inspect",
         {"surface": "report", "run_id": run_id},
     )
-    final_report = observed["result"]
+    final_report = observed
     assert final_report["status"] == "completed"
     assert final_report["runId"] == run_id
     assert final_report["threadId"] == thread_id
