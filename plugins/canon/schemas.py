@@ -36,7 +36,7 @@ for _command, _parameters in _COMMAND_PARAMETERS.items():
         if _key in _JSON_PARAMETERS:
             _property = {"anyOf": [{"type": "string"}, {"type": "object"}]}
         if _command == "run" and _key == "host_session":
-            _property = {"type": ["string", "null"]}
+            _property = {"type": "string", "description": "Hermes session key the run is bound to; defaults to the current gateway session."}
         if _key in _ENUMS:
             _property["enum"] = _ENUMS[_key]
         if _key == "mode":

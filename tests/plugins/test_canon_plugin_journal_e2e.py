@@ -502,6 +502,7 @@ def test_completed_launch_has_fresh_correlated_journal_projection(
         real_canon["scope"],
         "canon_run",
         {
+            "host_session": "j05-session",
             "workflow": str(pack / "workflow.json"),
             "workflow_input_json": _workflow_input_file(execution, {"task": "J05 completed launch"}),
             "execution_root": str(execution),
@@ -629,6 +630,7 @@ def test_checkpoint_lifecycle_preserves_one_journal_lineage(
         real_canon["scope"],
         "canon_run",
         {
+            "host_session": "j05-session",
             "workflow": str(pack / "workflow.json"),
             "workflow_input_json": _workflow_input_file(execution, {"task": "J05 revision lifecycle"}),
             "execution_root": str(execution),
@@ -751,6 +753,7 @@ def test_solution_modeling_workflow_revise_then_approve_installed_e2e(
         real_canon["scope"],
         "canon_run",
         {
+            "host_session": "j05-session",
             "workflow": str(workflow_path),
             "workflow_input_json": _workflow_input_file(execution, workflow_input),
             "execution_root": str(execution),

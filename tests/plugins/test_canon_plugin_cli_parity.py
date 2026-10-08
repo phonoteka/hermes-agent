@@ -344,42 +344,163 @@ class LaunchRecorder:
         return {"session_id": "test-launch", "exit_code": 0, "notify_on_complete": True}
 
 
-def recorded_launch(command, args, gateway_session_key):
+def recorded_launch(command, args):
     """Call the production handler, replacing only native process dispatch."""
     ctx = LaunchRecorder()
     output = asyncio.run(transport.handle_command(
         command, {**args, "wait_mode": "async-no-wait"}, ctx=ctx,
-        gateway_session_key=gateway_session_key,
     ))
     assert json.loads(output).get("session_id") == "test-launch", output
     return ctx
 
 
-@pytest.mark.parametrize("args,gateway,expected", [
-    ({}, "gateway-key", "gateway-key"),
-    ({"host_session": "bitrix-thread"}, "gateway-key", "bitrix-thread"),
-    ({"host_session": None}, "gateway-key", None),
-    ({}, None, None),
-], ids=["gateway-default", "explicit-wins", "explicit-null", "outside-gateway"])
-def test_host_session_default_run(args, gateway, expected, isolated_profile):
-    ctx = recorded_launch("run", {"workflow": "opaque.json", **args}, gateway)
-    if expected is None:
-        assert "--host-session" not in ctx.argv
+class NativeCanonContext:
+    """Call the real scoped plugin through normal model-tool dispatch."""
+
+    def __init__(self, manager, handle):
+        """Retain the loaded transport owner and observed native calls."""
+        self.manager = manager
+        self.handle = handle
+        self.calls = []
+
+    def invoke(self, name, args):
+        """Dispatch without scope overrides or injected gateway kwargs."""
+        from model_tools import handle_function_call
+        return handle_function_call(name, args, task_id="canon-p2-red")
+
+
+@pytest.fixture
+def native_context(isolated_profile, monkeypatch):
+    """Load the real plugin in a temporary profile, then unload and clear context."""
+    import inspect
+    from unittest.mock import patch
+    import model_tools
+    from gateway.session_context import clear_session_vars
+    from hermes_cli.plugins import PluginManager, parse_manifest_file
+    from tools.registry import registry
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    clear_session_vars([])
+    manager = PluginManager(scope_key=str(isolated_profile))
+    plugin_dir = ROOT / "plugins/canon"
+    manifest = parse_manifest_file(plugin_dir / "plugin.yaml", plugin_dir, "bundled", "")
+    assert manifest is not None
+    manager._load_plugin(manifest)
+    entry = registry.get_entry("canon_run", scope=manager.scope_key)
+    assert entry is not None
+    variables = inspect.getclosurevars(entry.handler)
+    handle = variables.globals["handle_command"]
+    context = NativeCanonContext(manager, handle)
+    plugin_ctx = variables.nonlocals["ctx"]
+    dispatch = plugin_ctx.dispatch_tool
+
+    def observe_dispatch(name, args, **kwargs):
+        """Observe collaborator calls while retaining real process execution."""
+        context.calls.append((name, args))
+        return dispatch(name, args, **kwargs)
+
+    monkeypatch.setattr(plugin_ctx, "dispatch_tool", observe_dispatch)
+    monkeypatch.setitem(handle.__globals__, "get_default_hermes_root", lambda: isolated_profile)
+    try:
+        with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+            yield context
+    finally:
+        clear_session_vars([])
+        manager.unload()
+
+
+@pytest.fixture
+def argv_recorder(native_context, tmp_path, monkeypatch):
+    """Record actual child argv; absent output proves the CLI never started."""
+    record = tmp_path / "argv.json"
+    recorder = tmp_path / "recorder.py"
+    recorder.write_text("import json, pathlib, sys\n"
+                        f"pathlib.Path({str(record)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+                        "print('{\"status\":\"completed\"}')\n")
+    monkeypatch.setitem(native_context.handle.__globals__, "_canon_command_prefix",
+                        lambda: [sys.executable, "-I", str(recorder)])
+    return native_context, record
+
+
+def session_invoke(context, name, args, session_key):
+    """Bind real gateway context for one call and always clear it."""
+    from gateway.session_context import set_session_vars, clear_session_vars
+    if session_key:
+        tokens = set_session_vars(session_key=session_key)
     else:
-        assert ctx.argv.count("--host-session") == 1
-        assert ctx.argv[ctx.argv.index("--host-session") + 1] == expected
-    assert "--human-gate-delivery" not in ctx.argv
+        clear_session_vars([])
+        tokens = []
+    try:
+        return context.invoke(name, {**args, "wait_mode": "sync-real", "timeout_seconds": 30})
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_host_session_from_session_context(argv_recorder):
+    context, record = argv_recorder
+    output = session_invoke(context, "canon_run", {"workflow": "opaque.json"}, "agent:main:telegram:dm:42")
+    assert json.loads(output).get("status") == "completed", output
+    argv = json.loads(record.read_text())
+    assert argv.count("--host-session") == 1, argv
+    assert argv[argv.index("--host-session") + 1] == "agent:main:telegram:dm:42"
+    assert "--human-gate-delivery" not in argv
+
+
+def test_host_session_override(argv_recorder):
+    context, record = argv_recorder
+    output = session_invoke(context, "canon_run", {"workflow": "opaque.json", "host_session": "other-thread"}, "agent:main:telegram:dm:42")
+    assert json.loads(output).get("status") == "completed", output
+    argv = json.loads(record.read_text())
+    assert argv.count("--host-session") == 1
+    assert argv[argv.index("--host-session") + 1] == "other-thread"
+    assert "--human-gate-delivery" not in argv
 
 
 @pytest.mark.parametrize("command,explicit", [("inspect", None), ("index", None), ("index", "explicit-index")])
-def test_host_session_default_negative_control_other_commands(command, explicit, isolated_profile):
+def test_host_session_from_session_context_negative_control_other_commands(command, explicit, argv_recorder):
+    context, record = argv_recorder
     args = {} if explicit is None else {"host_session": explicit}
-    ctx = recorded_launch(command, args, "gateway-key")
+    output = session_invoke(context, "canon_" + command, args, "agent:main:telegram:dm:42")
+    assert json.loads(output).get("status") == "completed", output
+    argv = json.loads(record.read_text())
     if explicit is None:
-        assert "--host-session" not in ctx.argv
+        assert "--host-session" not in argv
     else:
-        assert ctx.argv.count("--host-session") == 1
-        assert ctx.argv[ctx.argv.index("--host-session") + 1] == explicit
+        assert argv.count("--host-session") == 1
+        assert argv[argv.index("--host-session") + 1] == explicit
+
+
+@pytest.mark.parametrize("session_key,explicit", [("", False), ("", True), ("agent:main:telegram:dm:42", True)],
+                         ids=["outside-session", "empty-outside", "empty-inside"])
+def test_host_session_required(session_key, explicit, argv_recorder):
+    context, record = argv_recorder
+    args = {"workflow": "opaque.json"}
+    if explicit:
+        args["host_session"] = ""
+    result = json.loads(session_invoke(context, "canon_run", args, session_key))
+    assert "error" in result and "host session" in result["error"], {
+        "result": result, "cli_started": record.exists(),
+        "native_tools": [name for name, _ in context.calls],
+    }
+    assert result["error"] == "canon_run needs a host session: pass host_session or call from a gateway session"
+    assert not record.exists(), "refused launcher must never start the CLI"
+    assert not context.calls, "refused launcher must not dispatch native process tools"
+
+
+def test_host_session_required_schema_rejects_null(native_context):
+    from tools.registry import registry
+    entry = registry.get_entry("canon_run", scope=native_context.manager.scope_key)
+    assert entry is not None
+    validator = Draft202012Validator(entry.schema["parameters"])
+    validator.validate({"workflow": "opaque.json", "host_session": "other-thread"})
+    with pytest.raises(ValidationError) as error:
+        validator.validate({"workflow": "opaque.json", "host_session": None})
+    assert error.value.validator == "type"
+
+
+def test_host_session_required_negative_control_direct_cli():
+    result = direct_cli(["validate", str(minimal_workflow())])
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "PASS: minimal-pack\n"
 
 
 def test_run_argv_workflow_input_object_carrier(isolated_profile):
@@ -397,7 +518,7 @@ def test_run_argv_handler_new_parameters(isolated_profile):
         "workflow": "opaque.json", "workflow_input_json": payload,
         "profile_id": "profile-marker", "max_graph_steps": 23,
         "host_session": "bitrix-thread", "human_gate_delivery": "verbatim delivery text",
-    }, "gateway-key")
+    })
     for flag, value in [
         ("--profile-id", "profile-marker"), ("--max-graph-steps", "23"),
         ("--host-session", "bitrix-thread"), ("--human-gate-delivery", "verbatim delivery text"),
@@ -426,19 +547,21 @@ def test_run_argv_negative_control_scalar_flags_and_input_path(isolated_profile,
     ctx = recorded_launch("run", {
         "workflow": "opaque.json", "workflow_input_json": str(carrier),
         "profile_id": "default", "max_graph_steps": 64,
+        "host_session": "scalar-thread",
         "human_gate_delivery": "delivery supplied independently",
-    }, None)
+    })
     for flag, value in [
         ("--workflow-input-json", str(carrier)), ("--profile-id", "default"),
         ("--max-graph-steps", "64"), ("--human-gate-delivery", "delivery supplied independently"),
     ]:
         assert ctx.argv.count(flag) == 1
         assert ctx.argv[ctx.argv.index(flag) + 1] == value
-    assert "--host-session" not in ctx.argv
+    assert ctx.argv.count("--host-session") == 1
+    assert ctx.argv[ctx.argv.index("--host-session") + 1] == "scalar-thread"
 
 
 @pytest.fixture
-def binding_context(real_context, tmp_path, monkeypatch):
+def binding_context(native_context, tmp_path, monkeypatch):
     """Run the real CLI with only its external phase host replaced; no provider calls."""
     import shutil
     canon_root = minimal_workflow().parents[4]
@@ -448,7 +571,7 @@ def binding_context(real_context, tmp_path, monkeypatch):
     routing = json.loads(routing_path.read_text())
     routing["profiles"]["default"]["hermesProfileId"] = "test-only-profile"
     routing_path.write_text(json.dumps(routing))
-    real_context.workflow = str(pack / "workflow.json")
+    native_context.workflow = str(pack / "workflow.json")
     bootstrap = tmp_path / "binding-bootstrap.py"
     bootstrap.write_text(
         "import sys, types\n"
@@ -470,8 +593,8 @@ def binding_context(real_context, tmp_path, monkeypatch):
         "from canon.cli import main\n"
         "raise SystemExit(main(sys.argv[1:]))\n"
     )
-    monkeypatch.setattr(transport, "_canon_command_prefix", lambda: [sys.executable, "-I", str(bootstrap)])
-    return real_context
+    monkeypatch.setitem(native_context.handle.__globals__, "_canon_command_prefix", lambda: [sys.executable, "-I", str(bootstrap)])
+    return native_context
 
 
 def test_real_run_binding_object_input_and_launch_binding(binding_context, tmp_path):
@@ -489,16 +612,20 @@ def test_real_run_binding_object_input_and_launch_binding(binding_context, tmp_p
     assert any(name == "process_manage" for name, _ in binding_context.calls)
 
 
-def test_real_run_binding_negative_control_without_binding(binding_context, tmp_path):
+@pytest.mark.parametrize("host_session", [None, "override-thread"], ids=["session-default", "explicit-override"])
+def test_real_run_binding_session_context_and_override(binding_context, tmp_path, host_session):
     carrier = tmp_path / "control-input.json"
     carrier.write_text(json.dumps({"task": "Summarize the request."}))
-    output = binding_context.invoke("canon_run", {
+    args = {
         "workflow": binding_context.workflow, "workflow_input_json": str(carrier),
-        "execution_root": str(tmp_path), "wait_mode": "sync-real", "timeout_seconds": 30,
-    })
+        "execution_root": str(tmp_path),
+    }
+    if host_session is not None:
+        args["host_session"] = host_session
+    output = session_invoke(binding_context, "canon_run", args, "agent:main:telegram:dm:42")
     result = json.loads(output)
     assert result.get("status") == "completed", result
-    assert "hostSession" not in result
+    assert result.get("hostSession") == (host_session or "agent:main:telegram:dm:42"), result
     assert "humanGateDelivery" not in result
     assert any(name == "terminal" for name, _ in binding_context.calls)
     assert any(name == "process_manage" for name, _ in binding_context.calls)
