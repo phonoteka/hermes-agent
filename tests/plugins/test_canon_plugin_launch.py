@@ -82,3 +82,93 @@ def test_timeout_cancels_native_process_and_cleans_carriers(profile, monkeypatch
         ("terminal", None), ("process_manage", "wait"), ("process_manage", "kill"),
     ]
     assert not list((profile / "runtime/canon").glob("hermes-canon-*"))
+
+
+@pytest.fixture
+def human_gate_launch(profile, tmp_path, monkeypatch):
+    """Launch the real plugin/CLI with a fake phase host and preserve CLI input bytes."""
+    import model_tools
+    from tests.plugins.test_canon_plugin_cli_parity import RegisteredContext, minimal_workflow
+    from tests.plugins.test_canon_plugin_journal_e2e import _human_gate_pack
+
+    canon_root = minimal_workflow().parents[4]
+    hermes_root = Path(__file__).resolve().parents[2]
+    pack = _human_gate_pack(tmp_path)
+    execution = tmp_path / "execution"
+    execution.mkdir()
+    seen_config = tmp_path / "seen-host-config.json"
+    seen_argv = tmp_path / "seen-cli-argv.json"
+    bootstrap = tmp_path / "human-gate-bootstrap.py"
+    bootstrap.write_text(
+        "import sys, types, json\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(hermes_root)!r})\n"
+        f"sys.path.insert(0, {str(canon_root / 'src')!r})\n"
+        "import profile_runtime\n"
+        "tests = types.ModuleType('tests')\n"
+        f"tests.__path__ = [{str(canon_root / 'tests')!r}]\n"
+        "sys.modules['tests'] = tests\n"
+        "from tests.helpers.fake_host import FakeHostAdapter\n"
+        "from canon.host_provider_registry import HostAdapterProviderRegistry\n"
+        "def resolve(self, selector, request):\n"
+        "    \"Return an isolated phase host backed by the real CLI stores.\"\n"
+        "    assert selector == 'canon-hermes-profile'\n"
+        "    host = FakeHostAdapter(capabilities=set(request.capabilities), "
+        "checkpoint_backend=request.store.checkpoint_backend, artifact_backend=request.store.artifact_backend)\n"
+        "    host.journal = request.store.journal\n"
+        "    return host\n"
+        "HostAdapterProviderRegistry.resolve = resolve\n"
+        "from canon.cli import main\n"
+        f"Path({str(seen_argv)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+        "if '--host-config' in sys.argv:\n"
+        "    config_path = Path(sys.argv[sys.argv.index('--host-config') + 1])\n"
+        f"    Path({str(seen_config)!r}).write_bytes(config_path.read_bytes())\n"
+        "raise SystemExit(main(sys.argv[1:]))\n"
+    )
+    monkeypatch.setattr(transport, "_canon_command_prefix", lambda: [sys.executable, "-I", str(bootstrap)])
+    context = RegisteredContext(real=True)
+    args = {
+        "workflow": str(pack / "workflow.json"),
+        "host_session": "x3-session", "workflow_input_json": {"task": "X3"},
+        "execution_root": str(execution), "wait_mode": "sync-real", "timeout_seconds": 60,
+    }
+    return context, args, seen_config, seen_argv
+
+
+@pytest.mark.parametrize("observation", ["host-config", "journal"])
+def test_human_gate_pause_without_hook(human_gate_launch, profile, observation):
+    """A real Human Gate pause neither requests a hook nor records hook-delivery events."""
+    from canon.journal import SqliteExecutionJournal
+
+    context, args, seen_config, _ = human_gate_launch
+    result = json.loads(context.invoke("canon_run", args))
+    assert result.get("status") == "paused", result
+    assert result["hostSession"] == "x3-session"
+    config = json.loads(seen_config.read_bytes())
+    rows = SqliteExecutionJournal(profile / "runtime/canon/durable/journal.sqlite").list_run(result["runId"])
+    kinds = [row["eventKind"] for row in rows]
+    assert "run.accepted" in kinds, kinds
+    if observation == "host-config":
+        assert "humanGateNotification" not in config, config
+    else:
+        assert not [kind for kind in kinds if kind.startswith("human-gate.")], kinds
+
+
+def test_human_gate_pause_without_hook_explicit_config_control(human_gate_launch, profile, tmp_path):
+    """An explicit user config reaches the real CLI at its exact path and bytes."""
+    context, args, seen_config, seen_argv = human_gate_launch
+    explicit = tmp_path / "user-host-config.json"
+    (profile / "runtime/canon/durable").mkdir(parents=True)
+    payload = json.dumps({
+        "mode": "production", "hostAdapter": "canon-hermes-profile",
+        "hostConfiguration": {"profilesRoot": str(profile)},
+        "durableRoot": str(profile / "runtime/canon/durable"),
+    }, indent=2).encode()
+    explicit.write_bytes(payload)
+    result = json.loads(context.invoke("canon_run", {**args, "host_config": str(explicit)}))
+    assert result.get("status") == "paused", result
+    argv = json.loads(seen_argv.read_text())
+    assert argv.count("--host-config") == 1
+    assert argv[argv.index("--host-config") + 1] == str(explicit)
+    assert seen_config.read_bytes() == payload
+    assert explicit.read_bytes() == payload

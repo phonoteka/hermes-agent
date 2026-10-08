@@ -55,19 +55,6 @@ def _canon_command_prefix() -> list[str]:
     return [sys.executable, "-I", "-c", bootstrap]
 
 
-def _human_gate_command() -> list[str]:
-    """Pre: hook ships beside this module. Post: isolated hook pins this checkout's profile runtime without carrying secrets. Raises: none."""
-    root = Path(__file__).resolve().parents[2]
-    bootstrap = (
-        "import runpy,sys;"
-        f"sys.path.insert(0,{str(root)!r});"
-        "import profile_runtime;"
-        "sys.argv=sys.argv[1:];"
-        "runpy.run_path(sys.argv[0],run_name='__main__')"
-    )
-    return [sys.executable, "-I", "-c", bootstrap, str(Path(__file__).with_name("human_gate_hook.py").resolve())]
-
-
 def _ensure_private_directory(path: Path) -> None:
     """Pre: path is plugin-owned. Post: directory exists with mode 0700. Raises: OSError."""
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -75,7 +62,7 @@ def _ensure_private_directory(path: Path) -> None:
 
 
 def _default_arguments(command: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Pre: command is supported. Post: generated host config binds the isolated notification hook; adds defaults and provisions stores only absent explicit authority. Raises: OSError."""
+    """Pre: command is supported. Post: generates host config without a notification hook; preserves explicit host_config and provisions default stores only absent explicit authority. Raises: OSError."""
     values = dict(args)
     durable = Path(get_hermes_home()) / "runtime" / "canon" / "durable"
     explicit_backend = bool(_BACKEND_PARAMETERS & values.keys())
@@ -84,7 +71,6 @@ def _default_arguments(command: str, args: dict[str, Any]) -> dict[str, Any]:
             config: dict[str, Any] = {
                 "mode": "production", "hostAdapter": "canon-hermes-profile",
                 "hostConfiguration": {"profilesRoot": str(get_default_hermes_root())},
-                "humanGateNotification": {"command": _human_gate_command(), "timeoutSeconds": 30},
             }
             if command == "run":
                 config["durableRoot"] = str(durable)
