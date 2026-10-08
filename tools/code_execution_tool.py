@@ -557,14 +557,9 @@ def _sandbox_tools_for(enabled_tools: Optional[List[str]]) -> frozenset:
 
 def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
                          sandbox_tools: frozenset, *, timeout: int, max_tool_calls: int,
-                         exec_start: float, gateway_session_key: Optional[str] = None) -> str:
+                         exec_start: float) -> str:
     """Per-call script ship: stage hermes_tools.py + script.py in a fresh remote sandbox dir,
-    serve file-RPC from a polling thread, run, clean up.
-
-    Pre: env is the selected backend; budgets and tools are caller-authorized.
-    Post: poll-thread dispatch receives the gateway key; staging is cleaned up.
-    Raises: execution errors return JSON failures; initial staging setup errors may propagate.
-    """
+    serve file-RPC from a polling thread, run, clean up."""
     sandbox_dir = f"{_env_temp_dir(env)}/hermes_exec_{uuid.uuid4().hex[:12]}"
     quoted_sandbox_dir = shlex.quote(sandbox_dir)
     quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
@@ -581,8 +576,7 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
             args=(env, f"{sandbox_dir}/rpc", effective_task_id, [], tool_call_counter,
-                  max_tool_calls, sandbox_tools, stop_event, rpc_token),
-            kwargs={"gateway_session_key": gateway_session_key})
+                  max_tool_calls, sandbox_tools, stop_event, rpc_token))
         rpc_thread.start()
         env_prefix = (f"HERMES_RPC_DIR={quoted_rpc_dir} HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
                       "PYTHONDONTWRITEBYTECODE=1")
@@ -621,15 +615,10 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
 
 
 def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[List[str]],
-                    reset: bool = False, *, gateway_session_key: Optional[str] = None) -> str:
+                    reset: bool = False) -> str:
     """Run code on the remote terminal backend: the owner's persistent remote session kernel
     (tools/code_kernel_remote.py) first, else the per-call script ship — the fail-open route when
-    a kernel cannot be spawned and the only route for hosts that cannot sustain a background process.
-
-    Pre: code and optional gateway key belong to this invocation.
-    Post: remote kernel and per-call RPC receive the same gateway key.
-    Raises: backend failures return JSON errors; configuration/setup errors may propagate.
-    """
+    a kernel cannot be spawned and the only route for hosts that cannot sustain a background process."""
     _cfg = _load_config()
     timeout, max_tool_calls = _cfg.get("timeout", DEFAULT_TIMEOUT), _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
     sandbox_tools, effective_task_id = _sandbox_tools_for(enabled_tools), task_id or "default"
@@ -653,7 +642,6 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[L
                 sandbox_tools=frozenset(sandbox_tools), timeout=timeout,
                 max_tool_calls=max_tool_calls, reset=bool(reset),
                 idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
-                gateway_session_key=gateway_session_key,
             )
         except Exception:
             logger.warning("remote session-kernel path failed; falling back to per-call", exc_info=True)
@@ -664,8 +652,7 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[L
     except Exception as exc:
         return _remote_failure(exc, exec_start, 0)
     return _run_remote_per_call(env, env_type, code, effective_task_id, sandbox_tools,
-                                timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start,
-                                gateway_session_key=gateway_session_key)
+                                timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start)
 
 
 # ---- Main entry point ----
@@ -676,18 +663,12 @@ def execute_code(
     task_id: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     reset: bool = False,
-    gateway_session_key: Optional[str] = None,
 ) -> str:
     """Run Python in the session's persistent kernel (local) or on the remote terminal backend,
     with RPC access to a subset of Hermes tools; returns the JSON result string. "Sandbox" means
     the security envelope (env scrubbing, tool whitelist + call budget, output redaction), not an
     isolation jail: default `project` mode runs in the session's cwd with the project venv.
-    ``enabled_tools`` ∩ SANDBOX_ALLOWED_TOOLS; ``reset`` kills the existing kernel first.
-
-    Pre: code is Python source; gateway key is caller-supplied or None.
-    Post: local and remote tool RPC preserve the call gateway key; guards still run first.
-    Raises: execution failures return JSON errors; configuration/setup errors may propagate.
-    """
+    ``enabled_tools`` ∩ SANDBOX_ALLOWED_TOOLS; ``reset`` kills the existing kernel first."""
     if not SANDBOX_AVAILABLE:
         return tool_error("execute_code sandbox is unavailable in this environment. "
                           "Use normal tool calls (terminal, read_file, write_file, ...) instead.")
@@ -737,8 +718,7 @@ def execute_code(
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools, reset=bool(reset),
-                               gateway_session_key=gateway_session_key)
+        return _execute_remote(code, task_id, enabled_tools, reset=bool(reset))
     from tools.interrupt import is_interrupted as _is_interrupted
     # Session kernels are always on locally (one interpreter per conversation); the guards above
     # already ran for this cell, and the kernel path shares env builder, RPC server and redaction.
@@ -752,7 +732,6 @@ def execute_code(
         timeout=_cfg.get("timeout", DEFAULT_TIMEOUT),
         max_tool_calls=_cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS),
         reset=bool(reset), is_interrupted=_is_interrupted,
-        gateway_session_key=gateway_session_key,
     )
 
 
@@ -904,12 +883,7 @@ EXECUTE_CODE_SCHEMA = build_execute_code_schema()
 
 def _execute_code_handler(args: dict, **kwargs) -> str:
     """Redirect misdirected calls (terminal's ``command`` arg, non-string ``code``) with an
-    actionable error before dispatching to ``execute_code``.
-
-    Pre: args contains tool input; kwargs carries dispatcher-owned identities.
-    Post: valid source runs with the exact gateway key from kwargs; invalid input returns an error.
-    Raises: execution setup errors propagate to registry error handling.
-    """
+    actionable error before dispatching to ``execute_code``."""
     if "code" not in args and "command" in args:
         logger.warning("execute_code received 'command' instead of the required 'code' argument")
         return tool_error("execute_code received a 'command' parameter, but it requires "
@@ -920,9 +894,7 @@ def _execute_code_handler(args: dict, **kwargs) -> str:
         return tool_error(f"execute_code received a {type(code).__name__} in 'code', but it "
                           "requires Python source as a string. Retry as execute_code(code=\"...\").")
     return execute_code(code=code or "", task_id=kwargs.get("task_id"),
-                        enabled_tools=kwargs.get("enabled_tools"),
-                        gateway_session_key=kwargs.get("gateway_session_key"),
-                        reset=bool(args.get("reset", False)))
+                        enabled_tools=kwargs.get("enabled_tools"), reset=bool(args.get("reset", False)))
 
 
 registry.register(

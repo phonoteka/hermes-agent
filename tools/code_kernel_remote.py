@@ -301,16 +301,10 @@ def _run_remote_cell(kernel: RemoteKernel, code: str, timeout: int) -> Tuple[str
 def execute_in_remote_kernel(
     code: str, *, env, env_type: str, task_env_id: str, sandbox_tools: frozenset,
     timeout: int, max_tool_calls: int, reset: bool, idle_exit: int = 1800,
-    gateway_session_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run one cell in the owner's remote kernel. Returns the raw cell result dict (caller
     post-processes output), or ``None`` when no kernel could be spawned (caller falls open to
-    per-call). ``state_lost``/``state_reset``/``reused`` ride in the ``kernel`` sub-dict.
-
-    Pre: remote env and tool budget are caller-authorized; gateway key is call-local.
-    Post: attached cell RPC receives its gateway key; spawn failure still returns None.
-    Raises: transport/setup errors may propagate to the remote entry point.
-    """
+    per-call). ``state_lost``/``state_reset``/``reused`` ride in the ``kernel`` sub-dict."""
     from tools.code_kernel import _resolve_owner
     owner = _resolve_owner(task_env_id)
     kernel, reused, state_reset, state_lost = _acquire_remote_kernel(
@@ -327,8 +321,7 @@ def execute_in_remote_kernel(
     try:
         return _run_attached_cell(kernel, key, code, env=env, task_env_id=task_env_id,
                                   sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                                  reused=reused, state_reset=state_reset, state_lost=state_lost,
-                                  gateway_session_key=gateway_session_key)
+                                  reused=reused, state_reset=state_reset, state_lost=state_lost)
     finally:
         with _REGISTRY.lock:
             kernel.attached -= 1
@@ -337,14 +330,7 @@ def execute_in_remote_kernel(
 
 def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task_env_id: str,
                        sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-                       reused: bool, state_reset: bool, state_lost: bool,
-                       gateway_session_key: Optional[str] = None) -> Dict[str, Any]:
-    """_run_attached_cell: preserve call-local authority.
-
-    Pre: kernel is attached for this invocation with its allowed tools and budget.
-    Post: per-cell poll thread receives the explicit gateway key and is stopped after the cell.
-    Raises: transport/setup errors propagate; timeout/protocol failures return failure payloads.
-    """
+                       reused: bool, state_reset: bool, state_lost: bool) -> Dict[str, Any]:
     from tools.code_execution_tool import _rpc_poll_loop
     from tools.thread_context import propagate_context_to_thread
     # Clean stale tool-RPC requests from a previous cell before arming this cell's poll loop, so
@@ -360,8 +346,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: Tuple, code: str, *, env, task
     rpc_thread = threading.Thread(
         target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
         args=(env, f"{kernel.kernel_dir}/rpc", task_env_id, [], tool_call_counter,
-              max_tool_calls, sandbox_tools, stop_event, kernel.rpc_token),
-        kwargs={"gateway_session_key": gateway_session_key})
+              max_tool_calls, sandbox_tools, stop_event, kernel.rpc_token))
     rpc_thread.start()
     cell_status, cell_payload = "no-result", {}
     try:

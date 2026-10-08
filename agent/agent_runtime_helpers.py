@@ -2232,12 +2232,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                  skip_tool_execution_middleware: bool = False) -> str:
     """Invoke a single tool (agent-level or registry-dispatched) and return the result string;
     no display logic. Used by the concurrent path; the sequential path keeps its own inline
-    invocation for display.
-
-    Pre: agent owns the call and its optional gateway key.
-    Post: concurrent registry calls receive getattr(agent, "_gateway_session_key", None).
-    Raises: inline handler and execution middleware errors propagate.
-    """
+    invocation for display."""
     from agent.inline_tool_executors import (
         InlineToolContext, emit_terminal_post_tool_call, resolve_invoke_tool_executor, tool_hook_ids
     )
@@ -2286,12 +2281,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return result
     else:
         def _execute(next_args: dict) -> Any:
-            """Dispatch approved arguments for this agent.
-
-            Pre: arguments belong to this call.
-            Post: registry receives the agent gateway key unchanged.
-            Raises: dispatcher setup errors propagate.
-            """
             dispatch_kwargs = dict(
                 tool_call_id=tool_call_id, session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
@@ -2300,7 +2289,6 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                gateway_session_key=getattr(agent, "_gateway_session_key", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),
             )
             if skip_tool_execution_middleware:

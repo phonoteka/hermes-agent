@@ -205,18 +205,7 @@ class WebhookAdapter(BasePlatformAdapter):
     # --- Lifecycle ---
 
     def _validate_route(self, name: str, route: dict) -> None:
-        """Validate authentication and mutually exclusive route pipelines.
-
-        Pre: name identifies a route configuration object.
-        Post: valid routes are unchanged; wake routes cannot run another pipeline.
-        Raises: ValueError naming the route for missing/unsafe secrets or conflicts.
-        """
-        if route.get("wake_session"):
-            conflicts = [key for key in ("cron_job", "deliver_only", "script", "skills", "prompt")
-                         if key in route]
-            if conflicts:
-                raise ValueError(f"[webhook] Route '{name}' sets wake_session with incompatible options: "
-                                 f"{', '.join(conflicts)}")
+        """Startup validation: secret required; INSECURE_NO_AUTH only on loopback (crash early on a public footgun)."""
         secret = route.get("secret", self._global_secret)
         if not secret:
             raise ValueError(f"[webhook] Route '{name}' has no HMAC secret. Set 'secret' on the route or globally. "
@@ -590,15 +579,7 @@ class WebhookAdapter(BasePlatformAdapter):
         return prompt
 
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
-        """Authenticate and admit an event through its configured route pipeline.
-
-        Pre: request targets a configured webhook route.
-        Post: wake requests never create sessions or render prompts; authenticated,
-        valid wake requests inject once per delivery ID and map refusal to HTTP status.
-        Ordinary routes retain their existing processing and delivery behavior.
-        Raises: cancellation or injection infrastructure errors propagate to aiohttp;
-        malformed/authentication/rate-limit requests return error responses.
-        """
+        """POST /webhooks/{route_name} — receive and process a webhook event."""
         route_name, route_config, profile, error_response = self._resolve_route(request)
         if error_response is None:
             raw_body, error_response = await self._read_authenticated_body(request, route_name, route_config)
@@ -611,28 +592,6 @@ class WebhookAdapter(BasePlatformAdapter):
         if payload is _UNPARSEABLE:
             return _json_error("Cannot parse body", 400)
         headers = request.headers
-        if route_config.get("wake_session"):
-            if not isinstance(payload, dict) or any(
-                not isinstance(payload.get(key), str) or not payload[key].strip()
-                for key in ("session_key", "text")
-            ):
-                return _json_error("session_key and text must be nonempty strings", 400)
-            delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
-                "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000))))))
-            if not self._record_delivery_id(delivery_id, time.time()):
-                return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
-            runner = self.gateway_runner
-            if runner is None:
-                result = "not_accepting"
-            else:
-                result = await runner.inject_session_turn(
-                    session_key=payload["session_key"], content=payload["text"],
-                    origin={"hermes_wake_origin": f"webhook:{route_name}"},
-                )
-            status = {"accepted": 202, "unknown_session": 404, "session_ended": 409,
-                      "not_accepting": 503, "no_adapter": 503, "unauthorized": 403}[result]
-            return web.json_response({"status": result, "route": route_name,
-                                      "delivery_id": delivery_id}, status=status)
         event_type = (headers.get("X-GitHub-Event", "") or headers.get("X-GitLab-Event", "")
                       or payload.get("event_type", "") or payload.get("type", "") or "unknown")
         allowed_events = route_config.get("events", [])
