@@ -98,7 +98,8 @@ def _run(manifest: dict[str, Any]) -> int:
     output = ""
     exit_code = 125
     try:
-        _child = subprocess.Popen(manifest["argv"], shell=False, start_new_session=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _child = subprocess.Popen(manifest["argv"], shell=False, start_new_session=True, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             stdout, stderr = _child.communicate(timeout=manifest["timeoutSeconds"])
             exit_code = int(_child.returncode)
