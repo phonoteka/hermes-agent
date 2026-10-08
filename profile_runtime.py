@@ -400,7 +400,17 @@ def _effective_reasoning(
 
 
 def _effective_max_turns(agent_config: Mapping[str, Any], request: ProfileAgentSessionRequest) -> int:
-    value = request.exact_max_turns if request.exact_max_turns is not None else agent_config.get("max_turns", 500)
+    """Pre: agent_config is the profile ``agent`` section. Post: exact route limit wins; profile null or an
+    unlimited spelling means unlimited as everywhere else in Hermes; a positive int is kept. Raises:
+    ProfileAgentSessionError for any other value."""
+    from hermes_cli.config import TURN_LIMIT_UNLIMITED, _UNLIMITED_SPELLINGS
+
+    if request.exact_max_turns is not None:
+        value = request.exact_max_turns
+    else:
+        value = agent_config.get("max_turns")
+        if value is None or (isinstance(value, str) and value.strip().lower() in _UNLIMITED_SPELLINGS):
+            return TURN_LIMIT_UNLIMITED
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ProfileAgentSessionError("effective max turns must be a positive integer")
     return value
