@@ -1,6 +1,6 @@
 name: canon
 version: "1.0.0"
-description: Mechanical Hermes transport for Canon CLI commands
+description: "Mechanical Hermes transport for Canon CLI commands. Pause notifications require plugins.entries.canon.allow_gateway_injection: true and cover only runs in the plugin default store."
 kind: standalone
 provides_tools:
   - canon_validate

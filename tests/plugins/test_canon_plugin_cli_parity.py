@@ -108,6 +108,11 @@ class RegisteredContext:
         assert entry["name"] not in self.tools
         self.tools[entry["name"]] = entry
 
+    def on_unload(self, callback):
+        """Run plugin cleanup at interpreter exit, as PluginManager.unload would on teardown."""
+        import atexit
+        atexit.register(callback)
+
     def dispatch_tool(self, name, args, **kwargs):
         assert self.real, "unexpected transport dispatch in schema proof"
         assert name in {"terminal", "process_manage"}
