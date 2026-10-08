@@ -63,8 +63,13 @@ from tools.code_execution_tool import (
 from tools.registry import registry
 
 
-def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
-    """Mock dispatcher that returns canned responses for each tool."""
+def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None, gateway_session_key=None):
+    """Mock dispatcher that returns canned responses for each tool.
+
+    Pre: tool arguments match the sandbox dispatcher interface.
+    Post: returns canned tool results and accepts the explicit gateway identity.
+    Raises: unsupported mock operations follow their existing error behavior.
+    """
     if function_name == "terminal":
         cmd = function_args.get("command", "")
         return json.dumps({"output": f"mock output for: {cmd}", "exit_code": 0})
@@ -331,7 +336,13 @@ else:
     print(f"OK {N}/{N}")
 '''
 
-        def slow_mock(function_name, function_args, task_id=None, user_task=None):
+        def slow_mock(function_name, function_args, task_id=None, user_task=None, gateway_session_key=None):
+            """Delay mock terminal calls to exercise overlapping requests.
+
+            Pre: arguments match the dispatcher interface.
+            Post: accepts explicit gateway identity without changing canned responses.
+            Raises: mock runtime errors propagate.
+            """
             import time as _t
             if function_name == "terminal":
                 _t.sleep(0.05)  # ensure requests overlap on the socket

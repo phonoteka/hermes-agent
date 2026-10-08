@@ -2401,7 +2401,12 @@ class TestConcurrentToolExecution:
 
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
-        """_invoke_tool should route regular tools through handle_function_call."""
+        """_invoke_tool should route regular tools through handle_function_call.
+
+        Pre: agent fixture has no gateway identity.
+        Post: real invoke_tool passes None with the existing dispatch metadata.
+        Raises: assertion failures expose mismatched dispatch arguments.
+        """
         with patch("model_tools.handle_function_call", return_value="result") as mock_hfc:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
             mock_hfc.assert_called_once_with(
@@ -2415,6 +2420,7 @@ class TestConcurrentToolExecution:
                 skip_tool_request_middleware=True,
                 enabled_toolsets=agent.enabled_toolsets,
                 disabled_toolsets=agent.disabled_toolsets,
+                gateway_session_key=None,
                 tool_request_middleware_trace=[],
             )
             assert result == "result"

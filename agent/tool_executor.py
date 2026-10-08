@@ -1499,7 +1499,12 @@ class _SequentialDispatch:
 def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _SequentialDispatch:
     """Pick the execute callable for one sequential call and start its spinner. Precedence:
     inline agent-level tools, delegate_task, context-engine tools, memory-provider tools,
-    then the registry."""
+    then the registry.
+
+    Pre: ref identifies a call belonging to agent.
+    Post: quiet and nonquiet registry calls preserve the agent gateway key.
+    Raises: dispatch selection or spinner setup errors propagate.
+    """
     function_name, function_args, effective_task_id, tool_call_id, middleware_trace = (
         ref.name, ref.args, ref.task_id, ref.call_id, ref.trace,
     )
@@ -1530,6 +1535,12 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
 
     # Registry tools: post hook is owned by this executor (inner observer suppressed).
     def _execute(next_args: dict) -> Any:
+        """Dispatch the sequential call without a duplicate post hook.
+
+        Pre: next_args are approved for this call.
+        Post: quiet and nonquiet dispatch preserve the agent gateway key.
+        Raises: dispatcher setup errors propagate to sequential error handling.
+        """
         import model_tools
 
         with model_tools.suppress_post_tool_call_hook():
@@ -1548,6 +1559,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 tool_request_middleware_trace=list(middleware_trace),
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                gateway_session_key=getattr(agent, "_gateway_session_key", None),
             )
 
     return _SequentialDispatch(

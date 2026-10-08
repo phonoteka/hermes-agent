@@ -236,9 +236,16 @@ class CellAuthority:
     refused instead of running under a stale approval/session/turn identity.
     """
 
-    def __init__(self, task_id: str):
+    def __init__(self, task_id: str, *, gateway_session_key: Optional[str] = None):
+        """__init__: preserve call-local authority.
+
+        Pre: task and optional gateway identity belong to this cell.
+        Post: identities are captured explicitly, independently of the copied approval context.
+        Raises: context capture errors propagate.
+        """
         import contextvars
         self.task_id = task_id
+        self.gateway_session_key = gateway_session_key
         self.ctx = contextvars.copy_context()
         self.active = True
         # ((getter, setter), captured value) per thread-local prompt callback (approval, sudo, vault unlock…)
@@ -262,6 +269,12 @@ class CellAuthority:
         return self.ctx.run(self._invoke, tool_name, tool_args)
 
     def _invoke(self, tool_name: str, tool_args: dict) -> str:
+        """_invoke: preserve call-local authority.
+
+        Pre: tool request belongs to this active cell authority.
+        Post: dispatcher receives the captured gateway key; prompt callbacks are restored afterward.
+        Raises: dispatcher errors propagate after callback restoration.
+        """
         from model_tools import handle_function_call
         previous = None
         if self._callbacks:
@@ -272,7 +285,8 @@ class CellAuthority:
             except Exception:
                 previous = None
         try:
-            return handle_function_call(tool_name, tool_args, task_id=self.task_id)
+            return handle_function_call(tool_name, tool_args, task_id=self.task_id,
+                                        gateway_session_key=self.gateway_session_key)
         finally:
             if previous is not None:
                 try:
@@ -743,16 +757,23 @@ def _cell_result(kernel: SessionKernel, key: Tuple, status: str, payload: Dict[s
 def execute_in_session_kernel(
     code: str, *, task_id: str, mode: str, child_python: str, child_cwd: str,
     sandbox_tools: frozenset, timeout: int, max_tool_calls: int, reset: bool, is_interrupted,
+    gateway_session_key: Optional[str] = None,
 ) -> str:
     """Run one cell in the (owner, mode, python, cwd, tools) session kernel. The owner is the
-    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns."""
+    session key (``_resolve_owner``), not the per-turn task id, so state survives across turns.
+
+    Pre: code, budgets and optional gateway key belong to this cell.
+    Post: cell RPC receives its explicit gateway key, even when the kernel is reused.
+    Raises: cell errors become JSON failures; kernel acquisition/setup errors may propagate.
+    """
     key = (_resolve_owner(task_id) or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
     exec_start = time.monotonic()
     kernel, state_reset = _acquire_kernel(key, reset)
     try:
         return _run_cell(kernel, key, code, task_id=task_id, child_python=child_python, child_cwd=child_cwd,
                          sandbox_tools=sandbox_tools, timeout=timeout, max_tool_calls=max_tool_calls,
-                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset)
+                         is_interrupted=is_interrupted, exec_start=exec_start, state_reset=state_reset,
+                         gateway_session_key=gateway_session_key)
     finally:
         with _REGISTRY.lock:
             kernel.attached -= 1
@@ -766,11 +787,18 @@ def execute_in_session_kernel(
 
 def _run_cell(kernel: SessionKernel, key: Tuple, code: str, *, task_id: str, child_python: str,
               child_cwd: str, sandbox_tools: frozenset, timeout: int, max_tool_calls: int,
-              is_interrupted, exec_start: float, state_reset: bool) -> str:
+              is_interrupted, exec_start: float, state_reset: bool,
+              gateway_session_key: Optional[str] = None) -> str:
+    """_run_cell: preserve call-local authority.
+
+    Pre: kernel is acquired for key and identities describe this invocation.
+    Post: each RPC call uses this cell gateway key; authority is retired on settlement.
+    Raises: cell execution errors return JSON failures; authority creation errors propagate.
+    """
     reused = kernel.proc is not None
     # Captured on the calling thread BEFORE the cell runs (the snapshot a per-call RPC thread
     # would get) and installed on the kernel so RPC dispatches under THIS cell's identity.
-    authority = CellAuthority(task_id)
+    authority = CellAuthority(task_id, gateway_session_key=gateway_session_key)
     with kernel.lock:
         try:
             if kernel.proc is None:
