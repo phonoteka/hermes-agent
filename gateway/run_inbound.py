@@ -1775,50 +1775,73 @@ class GatewayInboundMixin:
     async def _dispatch_plugin_message_injection(
         self, *, session_key: str, content: str, plugin_id: str
     ) -> bool:
-        """Route a plugin-triggered turn through the session's live adapter."""
+        """Dispatch a consented plugin request through the shared injection seam.
+
+        Pre: the plugin caller has already checked injection consent.
+        Post: return True only when the existing session's adapter accepted the turn.
+        Raises: storage, delivery and cancellation errors propagate from the seam.
+        """
+        return await self.inject_session_turn(
+            session_key=session_key, content=content,
+            origin={"hermes_plugin_id": plugin_id, "hermes_plugin_injection": True},
+        ) == "accepted"
+
+    async def inject_session_turn(
+        self, *, session_key: str, content: str, origin: dict
+    ) -> str:
+        """Submit an internal turn to an existing, live, authorized session.
+
+        Pre: callers validate nonempty session_key/content and supply origin metadata.
+        Post: return accepted, not_accepting, unknown_session, session_ended,
+        unauthorized or no_adapter; rejection delivers nothing and never creates a
+        session. Accepted turns retain exact content, pin session identity and queue
+        rather than interrupt busy sessions. This seam does not deduplicate calls.
+        Raises: storage, delivery and cancellation errors propagate; authorization
+        errors fail closed as unauthorized.
+        """
         def _accepting() -> bool:
+            """Pre: runner lifecycle is initialized. Post: report admission state.
+
+            Raises: none; this read does not mutate lifecycle state.
+            """
             return getattr(self, "_running", False) and not getattr(self, "_draining", False)
 
         if not _accepting():
-            return False
+            return "not_accepting"
         entry = await self.async_session_store.lookup_by_session_key(session_key)
-        if entry is None or entry.origin is None or not _accepting():
-            return False
+        if not _accepting():
+            return "not_accepting"
+        if entry is None:
+            return "unknown_session"
+        if self.session_store._is_session_ended_in_db(entry.session_id):
+            return "session_ended"
+        if entry.origin is None:
+            return "no_adapter"
 
         source = dataclasses.replace(entry.origin)
         try:
             authorized = self._is_user_authorized_for_source(source, allow_adapter_delegation=False)
         except Exception:
-            logger.warning(
-                "Plugin message injection authorization check failed: plugin=%s session=%s",
-                plugin_id, session_key, exc_info=True,
-            )
-            return False
+            logger.warning("Session turn authorization check failed: session=%s", session_key, exc_info=True)
+            return "unauthorized"
         if not authorized:
-            logger.warning(
-                "Plugin message injection denied by current gateway authorization: "
-                "plugin=%s session=%s", plugin_id, session_key,
-            )
-            return False
+            logger.warning("Session turn denied by current gateway authorization for %s", session_key)
+            return "unauthorized"
 
         adapter = self._adapter_for_source(source)
         if adapter is None:
-            return False
+            return "no_adapter"
 
         await adapter.handle_message(MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
             allow_gateway_control=False,
             metadata={
-                "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
                 "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
-                "gateway_session_strict": True,
+                "gateway_session_strict": True, **origin,
             },
         ))
-        logger.info(
-            "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
-            plugin_id, session_key, entry.session_id,
-        )
-        return True
+        logger.info("Session turn dispatched: session=%s session_id=%s", session_key, entry.session_id)
+        return "accepted"
 
     def _decide_image_input_mode(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,

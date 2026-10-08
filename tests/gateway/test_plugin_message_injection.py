@@ -42,8 +42,14 @@ def _entry(*, origin=True) -> SessionEntry:
 
 
 def _runner(entry: SessionEntry | None, adapter=None) -> GatewayRunner:
+    """Build collaborators for real injection, with a live persisted session.
+
+    Pre: entry may be absent; adapter may be unavailable.
+    Post: storage exposes the session-ended query used by the injection owner.
+    Raises: none.
+    """
     runner = object.__new__(GatewayRunner)
-    runner.session_store = SimpleNamespace()
+    runner.session_store = SimpleNamespace(_is_session_ended_in_db=MagicMock(return_value=False))
     runner._async_session_store = SimpleNamespace(
         _store=runner.session_store, lookup_by_session_key=AsyncMock(return_value=entry)
     )
