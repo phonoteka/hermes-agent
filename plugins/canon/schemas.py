@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-_JSON_PARAMETERS = {"request_json", "state_patch_json", "host_config", "backend"}
+_JSON_PARAMETERS = {"request_json", "state_patch_json", "host_config", "backend", "workflow_input_json"}
 _BACKENDS = "checkpoint_backend checkpoint_db artifact_backend artifact_root journal_backend journal_db"
 _CHECKPOINT = "mode host_adapter host_config request_json request_file " + _BACKENDS + " run_id thread_id reason workflow"
 _COMMAND_PARAMETERS = {
@@ -35,6 +35,8 @@ for _command, _parameters in _COMMAND_PARAMETERS.items():
         _property = {"type": "integer" if _key in _INTEGER_PARAMETERS else "string"}
         if _key in _JSON_PARAMETERS:
             _property = {"anyOf": [{"type": "string"}, {"type": "object"}]}
+        if _command == "run" and _key == "host_session":
+            _property = {"type": ["string", "null"]}
         if _key in _ENUMS:
             _property["enum"] = _ENUMS[_key]
         if _key == "mode":

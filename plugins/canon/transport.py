@@ -17,7 +17,7 @@ from jsonschema.exceptions import ValidationError
 from .background_runner import _redact_cli_text
 from .schemas import TOOL_SCHEMAS
 
-_JSON_PARAMETERS = {"request_json", "state_patch_json", "host_config", "backend"}
+_JSON_PARAMETERS = {"request_json", "state_patch_json", "host_config", "backend", "workflow_input_json"}
 _BACKEND_PARAMETERS = {"backend", "checkpoint_backend", "checkpoint_db", "artifact_backend", "artifact_root", "journal_backend", "journal_db"}
 _PROCESS_PARAMETERS = {"wait_mode", "timeout_seconds"}
 
@@ -96,13 +96,15 @@ def _default_arguments(command: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_argv(command: str, args: dict[str, Any], root: Path) -> list[str]:
-    """Pre: transport owns root. Post: flags are forwarded without semantic compatibility checks. Raises: OSError/TypeError/ValueError/KeyError."""
+    """Pre: transport owns root. Post: forwards flags and private JSON carriers without semantic checks; run host_session=None emits no flag. Raises: OSError/TypeError/ValueError/KeyError."""
     values = _default_arguments(command, args)
     argv = [*_canon_command_prefix(), command]
     if command == "checkpoint" and "subcommand" in values:
         argv.append(str(values["subcommand"]))
     for key, value in values.items():
         if key in _PROCESS_PARAMETERS or key in {"workflow", "subcommand"}:
+            continue
+        if command == "run" and key == "host_session" and value is None:
             continue
         if key in _JSON_PARAMETERS and isinstance(value, dict):
             value = _write_private_json(root / (key + ".json"), value)
@@ -130,8 +132,8 @@ def _process_result(raw: Any) -> dict[str, Any]:
     return value
 
 
-async def handle_command(command: str, args: dict[str, Any], *, ctx: Any, task_id: str | None = None, **_: Any) -> str:
-    """Pre: ctx dispatches native tools. Post: CLI stdout unchanged except secrets, or bounded error; async returns native acceptance. Raises: none; owns carrier cleanup."""
+async def handle_command(command: str, args: dict[str, Any], *, ctx: Any, task_id: str | None = None, gateway_session_key: str | None = None, **_: Any) -> str:
+    """Pre: ctx dispatches native tools. Post: run defaults an absent host_session to gateway_session_key, preserving explicit values/null and caller args; no delivery default. Returns redacted CLI stdout/error or async native acceptance. Raises: none; owns carrier cleanup."""
     root: Path | None = None
     result_root: Path | None = None
     native_id: str | None = None
@@ -141,7 +143,10 @@ async def handle_command(command: str, args: dict[str, Any], *, ctx: Any, task_i
         timeout = args.get("timeout_seconds", 600 if args.get("wait_mode") == "sync-real" else 90)
         asynchronous = args.get("wait_mode") == "async-no-wait"
         root = _private_root()
-        argv = _build_argv(command, args, root)
+        values = dict(args)
+        if command == "run" and "host_session" not in values and gateway_session_key is not None:
+            values["host_session"] = gateway_session_key
+        argv = _build_argv(command, values, root)
         manifest = {"schemaVersion": "canon-plugin-background-manifest.v1", "operation": "command", "argv": argv, "timeoutSeconds": timeout, "cleanupRoot": str(root)}
         # Native log APIs drop trailing newlines and bound output. A private
         # capture carries bytes exactly; logs remain ordinary CLI stdout.

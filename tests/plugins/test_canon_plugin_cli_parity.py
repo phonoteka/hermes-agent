@@ -52,7 +52,7 @@ from jsonschema.exceptions import ValidationError
 from plugins.canon import register, transport
 
 PROCESS_PARAMETERS = {"wait_mode", "timeout_seconds"}
-JSON_PARAMETERS = {"request_json", "state_patch_json", "host_config", "backend"}
+JSON_PARAMETERS = {"request_json", "state_patch_json", "host_config", "backend", "workflow_input_json"}
 
 
 def cli_leaves(parser=None, prefix=()):
@@ -321,3 +321,184 @@ def test_real_cli_direct_negative_control_valid_and_invalid_workflow(tmp_path):
     invalid.write_text("{}")
     failed = direct_cli(["validate", str(invalid)])
     assert failed.returncode != 0 and failed.stderr.startswith("FAIL: ")
+
+
+class LaunchRecorder:
+    """Capture the real handler's manifest before its async transport returns."""
+
+    def __init__(self):
+        self.argv: list[str] = []
+        self.carriers = {}
+
+    def dispatch_tool(self, name, args, **kwargs):
+        import shlex
+        assert name == "terminal"
+        manifest = json.loads(Path(shlex.split(args["command"])[-1]).read_text())
+        self.argv = manifest["argv"]
+        for key in JSON_PARAMETERS:
+            flag = "--" + key.replace("_", "-")
+            if flag in self.argv:
+                path = Path(self.argv[self.argv.index(flag) + 1])
+                if path.is_file():
+                    self.carriers[key] = (path, path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        return {"session_id": "test-launch", "exit_code": 0, "notify_on_complete": True}
+
+
+def recorded_launch(command, args, gateway_session_key):
+    """Call the production handler, replacing only native process dispatch."""
+    ctx = LaunchRecorder()
+    output = asyncio.run(transport.handle_command(
+        command, {**args, "wait_mode": "async-no-wait"}, ctx=ctx,
+        gateway_session_key=gateway_session_key,
+    ))
+    assert json.loads(output).get("session_id") == "test-launch", output
+    return ctx
+
+
+@pytest.mark.parametrize("args,gateway,expected", [
+    ({}, "gateway-key", "gateway-key"),
+    ({"host_session": "bitrix-thread"}, "gateway-key", "bitrix-thread"),
+    ({"host_session": None}, "gateway-key", None),
+    ({}, None, None),
+], ids=["gateway-default", "explicit-wins", "explicit-null", "outside-gateway"])
+def test_host_session_default_run(args, gateway, expected, isolated_profile):
+    ctx = recorded_launch("run", {"workflow": "opaque.json", **args}, gateway)
+    if expected is None:
+        assert "--host-session" not in ctx.argv
+    else:
+        assert ctx.argv.count("--host-session") == 1
+        assert ctx.argv[ctx.argv.index("--host-session") + 1] == expected
+    assert "--human-gate-delivery" not in ctx.argv
+
+
+@pytest.mark.parametrize("command,explicit", [("inspect", None), ("index", None), ("index", "explicit-index")])
+def test_host_session_default_negative_control_other_commands(command, explicit, isolated_profile):
+    args = {} if explicit is None else {"host_session": explicit}
+    ctx = recorded_launch(command, args, "gateway-key")
+    if explicit is None:
+        assert "--host-session" not in ctx.argv
+    else:
+        assert ctx.argv.count("--host-session") == 1
+        assert ctx.argv[ctx.argv.index("--host-session") + 1] == explicit
+
+
+def test_run_argv_workflow_input_object_carrier(isolated_profile):
+    payload = {"task": "opaque", "not-a-declared-port": {"z": 1, "a": 2}}
+    argv = build_cli_argv("run", {"workflow": "opaque.json", "workflow_input_json": payload})
+    path = Path(argv[argv.index("--workflow-input-json") + 1])
+    assert path.is_relative_to(isolated_profile)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.read_bytes() == json.dumps(payload, sort_keys=False).encode("utf-8")
+
+
+def test_run_argv_handler_new_parameters(isolated_profile):
+    payload = {"task": "opaque", "not-a-declared-port": 17}
+    ctx = recorded_launch("run", {
+        "workflow": "opaque.json", "workflow_input_json": payload,
+        "profile_id": "profile-marker", "max_graph_steps": 23,
+        "host_session": "bitrix-thread", "human_gate_delivery": "verbatim delivery text",
+    }, "gateway-key")
+    for flag, value in [
+        ("--profile-id", "profile-marker"), ("--max-graph-steps", "23"),
+        ("--host-session", "bitrix-thread"), ("--human-gate-delivery", "verbatim delivery text"),
+    ]:
+        assert ctx.argv.count(flag) == 1
+        assert ctx.argv[ctx.argv.index(flag) + 1] == value
+    path, content, mode = ctx.carriers["workflow_input_json"]
+    assert path.is_relative_to(isolated_profile)
+    assert content == json.dumps(payload, sort_keys=False).encode("utf-8")
+    assert mode == 0o600
+
+
+def test_run_argv_negative_control_deleted_input_parameter_is_rejected():
+    schema = deepcopy(RegisteredContext().tools["canon_run"]["schema"]["parameters"])
+    del schema["properties"]["workflow_input_json"]
+    with pytest.raises(ValidationError) as error:
+        Draft202012Validator(schema).validate({
+            "workflow": "opaque.json", "workflow_input_json": "/opaque/input.json",
+        })
+    assert error.value.validator == "additionalProperties"
+
+
+def test_run_argv_negative_control_scalar_flags_and_input_path(isolated_profile, tmp_path):
+    carrier = tmp_path / "input.json"
+    carrier.write_text(json.dumps({"task": "test input"}))
+    ctx = recorded_launch("run", {
+        "workflow": "opaque.json", "workflow_input_json": str(carrier),
+        "profile_id": "default", "max_graph_steps": 64,
+        "human_gate_delivery": "delivery supplied independently",
+    }, None)
+    for flag, value in [
+        ("--workflow-input-json", str(carrier)), ("--profile-id", "default"),
+        ("--max-graph-steps", "64"), ("--human-gate-delivery", "delivery supplied independently"),
+    ]:
+        assert ctx.argv.count(flag) == 1
+        assert ctx.argv[ctx.argv.index(flag) + 1] == value
+    assert "--host-session" not in ctx.argv
+
+
+@pytest.fixture
+def binding_context(real_context, tmp_path, monkeypatch):
+    """Run the real CLI with only its external phase host replaced; no provider calls."""
+    import shutil
+    canon_root = minimal_workflow().parents[4]
+    pack = tmp_path / "minimal-pack"
+    shutil.copytree(minimal_workflow().parent, pack)
+    routing_path = pack / "policies/model-routing.json"
+    routing = json.loads(routing_path.read_text())
+    routing["profiles"]["default"]["hermesProfileId"] = "test-only-profile"
+    routing_path.write_text(json.dumps(routing))
+    real_context.workflow = str(pack / "workflow.json")
+    bootstrap = tmp_path / "binding-bootstrap.py"
+    bootstrap.write_text(
+        "import sys, types\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        f"sys.path.insert(0, {str(canon_root / 'src')!r})\n"
+        "import profile_runtime\n"
+        "tests = types.ModuleType('tests')\n"
+        f"tests.__path__ = [{str(canon_root / 'tests')!r}]\n"
+        "sys.modules['tests'] = tests\n"
+        "from tests.helpers.fake_host import FakeHostAdapter\n"
+        "from canon.host_provider_registry import HostAdapterProviderRegistry\n"
+        "def resolve(self, selector, request):\n"
+        "    assert selector == 'canon-hermes-profile'\n"
+        "    host = FakeHostAdapter(capabilities=set(request.capabilities), "
+        "checkpoint_backend=request.store.checkpoint_backend, artifact_backend=request.store.artifact_backend)\n"
+        "    host.journal = request.store.journal\n"
+        "    return host\n"
+        "HostAdapterProviderRegistry.resolve = resolve\n"
+        "from canon.cli import main\n"
+        "raise SystemExit(main(sys.argv[1:]))\n"
+    )
+    monkeypatch.setattr(transport, "_canon_command_prefix", lambda: [sys.executable, "-I", str(bootstrap)])
+    return real_context
+
+
+def test_real_run_binding_object_input_and_launch_binding(binding_context, tmp_path):
+    output = binding_context.invoke("canon_run", {
+        "workflow": binding_context.workflow, "workflow_input_json": {"task": "Summarize the request."},
+        "execution_root": str(tmp_path), "profile_id": "default", "max_graph_steps": 100,
+        "host_session": "bitrix-thread", "human_gate_delivery": "Deliver the approval to this thread.",
+        "wait_mode": "sync-real", "timeout_seconds": 30,
+    })
+    result = json.loads(output)
+    assert result.get("status") == "completed", result
+    assert result["hostSession"] == "bitrix-thread"
+    assert result["humanGateDelivery"] == "Deliver the approval to this thread."
+    assert any(name == "terminal" for name, _ in binding_context.calls)
+    assert any(name == "process_manage" for name, _ in binding_context.calls)
+
+
+def test_real_run_binding_negative_control_without_binding(binding_context, tmp_path):
+    carrier = tmp_path / "control-input.json"
+    carrier.write_text(json.dumps({"task": "Summarize the request."}))
+    output = binding_context.invoke("canon_run", {
+        "workflow": binding_context.workflow, "workflow_input_json": str(carrier),
+        "execution_root": str(tmp_path), "wait_mode": "sync-real", "timeout_seconds": 30,
+    })
+    result = json.loads(output)
+    assert result.get("status") == "completed", result
+    assert "hostSession" not in result
+    assert "humanGateDelivery" not in result
+    assert any(name == "terminal" for name, _ in binding_context.calls)
+    assert any(name == "process_manage" for name, _ in binding_context.calls)
