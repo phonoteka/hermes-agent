@@ -1124,9 +1124,15 @@ class SessionStore(
     # Compression repoint is store bookkeeping, not user activity — leave ``updated_at`` alone so a
     # background compression on an idle session cannot make it look fresh to the
     # restart-resume freshness gate (#85709).
-    def switch_session(self, session_key: str, target_session_id: str) -> Optional[SessionEntry]:
+    def switch_session(
+        self, session_key: str, target_session_id: str, *, end_reason: str = "session_switch",
+    ) -> Optional[SessionEntry]:
         """Point a session key at an existing session ID (``/resume``): ends the current row and
-        reopens the target so resume matches the CLI."""
+        reopens the target so resume matches the CLI.
+
+        ``end_reason`` is stamped on the session the key moves away from: ``session_switch`` (a user
+        boundary) for /resume, /branch, handoff and topic heal; the async-delegation re-pin passes its
+        own non-boundary reason so later results for the old session are not dropped."""
         with self._lock:
             old_entry = self._entry_locked(session_key)
             if old_entry is None:
@@ -1140,7 +1146,7 @@ class SessionStore(
 
         if self._db_for_key(session_key) and old_entry.session_id:
             self._promote_session_reset(
-                session_key, old_entry.session_id, "session_switch",
+                session_key, old_entry.session_id, end_reason,
                 log=lambda e: logger.debug("Session DB end_session failed: %s", e),
             )
         if self._db_for_key(session_key):

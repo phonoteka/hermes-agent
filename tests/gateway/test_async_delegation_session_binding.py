@@ -114,7 +114,7 @@ class TestGatewayPinningFailsClosed:
 
         assert resolved is pinned
         getattr(runner.session_store, "switch_session").assert_called_once_with(
-            current.session_key, "sess_live"
+            current.session_key, "sess_live", end_reason="async_delegation_repin",
         )
 
     @pytest.mark.asyncio
