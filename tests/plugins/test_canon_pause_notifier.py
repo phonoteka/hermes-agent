@@ -214,7 +214,7 @@ async def _run(env, run_id, key, *, human=True, delivery="Deliver in this chat")
         value = json.loads(output)
     assert value.get("status") == ("paused" if human else "completed"), value
     result = await asyncio.to_thread(
-        subprocess.run, transport.build_argv("index", {}), capture_output=True, text=True, timeout=30,
+        subprocess.run, transport.build_argv("index", {"limit": 100000}), capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
     rows = json.loads(result.stdout)
@@ -264,6 +264,41 @@ async def test_delivers_once(notifier_env, monkeypatch, target, delivery):
     _assert_event(env, env.keys[target], row)
     assert not _events(env, env.keys[1 - target])
     assert stat.S_IMODE(env.state.stat().st_mode) == 0o600
+
+
+def _seed_older_runs(env, count):
+    """Occupy the CLI index default window with real journal copies of one completed run."""
+    from copy import deepcopy
+    from canon.journal import SqliteExecutionJournal
+
+    journal = SqliteExecutionJournal(env.home / "runtime/canon/durable/journal.sqlite")
+    template = journal.list_run("run-x4-page-seed")
+    assert template
+    for n in range(count):
+        for row in template:
+            entry = deepcopy(row)
+            entry.pop("sequence", None)
+            entry.pop("appendSequence", None)
+            entry["runId"] = f"run-x4-page-filler-{n:03d}"
+            assert isinstance(journal.append(entry), dict)
+
+
+@pytest.mark.asyncio
+async def test_delivers_once_beyond_first_index_page(notifier_env, monkeypatch):
+    """A bound pause older runs push past the CLI index default window is still delivered."""
+    env = notifier_env
+    _load(env, monkeypatch)
+    # Small pages force several real index calls per tick (63 runs / 20 per page).
+    import sys as _sys
+    for name, module in list(_sys.modules.items()):
+        if name.endswith(".pause_notifier") and hasattr(module, "INDEX_PAGE_SIZE"):
+            monkeypatch.setattr(module, "INDEX_PAGE_SIZE", 20)
+    await _run(env, "run-x4-page-seed", None, human=False, delivery=None)
+    _seed_older_runs(env, 60)
+    row = await _run(env, "run-x4-page-late", env.keys[0])
+    await _wait_events(env, env.keys[0])
+    _assert_event(env, env.keys[0], row)
+    assert not _events(env, env.keys[1])
 
 
 @pytest.mark.asyncio

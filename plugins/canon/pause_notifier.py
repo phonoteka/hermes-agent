@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from hermes_cli.plugins import PluginContext
 
 TICK_SECONDS = 30.0
+# Canon `index` returns a bounded window; the notifier pages until a short page.
+INDEX_PAGE_SIZE = 200
 _logger = logging.getLogger(__name__)
 
 
@@ -71,7 +73,8 @@ class PauseNotifier:
 
     def _tick(self) -> None:
         """Pre: called serially by this worker. Post: no action without a gateway;
-        otherwise queries CLI index once, injects new bound pauses and atomically
+        otherwise reads every CLI index page (INDEX_PAGE_SIZE rows each, offset
+        advancing until a short page), injects new bound pauses and atomically
         records only accepted keys. Failures warn without payloads and skip the
         remainder of this tick. Raises: none; owns CLI carrier cleanup.
         """
@@ -79,17 +82,22 @@ class PauseNotifier:
             if not plugins.get_plugin_manager().has_gateway_message_injector:
                 return
             root = transport._private_root()
+            rows: list = []
             try:
-                argv = transport._build_argv("index", {}, root)
-                result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+                while True:
+                    argv = transport._build_argv("index", {"limit": INDEX_PAGE_SIZE, "offset": len(rows)}, root)
+                    result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+                    if result.returncode != 0:
+                        _logger.warning("Canon pause notifier: index failed; skipping tick")
+                        return
+                    page = json.loads(result.stdout)
+                    if not isinstance(page, list):
+                        raise ValueError("Invalid index result")
+                    rows.extend(page)
+                    if len(page) < INDEX_PAGE_SIZE:
+                        break
             finally:
                 shutil.rmtree(root, ignore_errors=True)
-            if result.returncode != 0:
-                _logger.warning("Canon pause notifier: index failed; skipping tick")
-                return
-            rows = json.loads(result.stdout)
-            if not isinstance(rows, list):
-                raise ValueError("Invalid index result")
             state = Path(get_hermes_home()) / "runtime" / "canon" / "pause-notifier.json"
             notified = self._read_state(state)
             for row in rows:
