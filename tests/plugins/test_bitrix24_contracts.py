@@ -23,6 +23,9 @@ class _CapturingContext:
     def register_tool(self, **kwargs) -> None:
         self.tools.append(kwargs)
 
+    def register_platform(self, **kwargs) -> None:
+        self.platforms = [*getattr(self, "platforms", []), kwargs]
+
 
 def _register_bitrix24_status_tool() -> dict:
     from plugins.bitrix24 import register

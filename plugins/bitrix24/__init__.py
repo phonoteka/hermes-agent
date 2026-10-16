@@ -156,3 +156,19 @@ def register(ctx) -> None:
             requires_env=tool["requires_env"],
             emoji=tool["emoji"],
         )
+
+    from .platform import PLATFORM_HINT, PLATFORM_NAME, Bitrix24Adapter
+
+    ctx.register_platform(
+        name=PLATFORM_NAME,
+        label="Bitrix24",
+        adapter_factory=Bitrix24Adapter,
+        check_fn=ingress_check_fn,
+        validate_config=lambda config: ingress_check_fn(),
+        required_env=["BITRIX24_WEBHOOK_URL", "BITRIX24_APPLICATION_TOKEN"],
+        install_hint="Set BITRIX24_WEBHOOK_URL and BITRIX24_APPLICATION_TOKEN",
+        allowed_users_env="BITRIX24_ALLOWED_USERS",
+        allow_all_env="BITRIX24_ALLOW_ALL_USERS",
+        platform_hint=PLATFORM_HINT,
+        emoji="📎",
+    )

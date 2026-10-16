@@ -15,6 +15,9 @@ class _CapturingContext:
     def register_tool(self, **kwargs) -> None:
         self.tools.append(kwargs)
 
+    def register_platform(self, **kwargs) -> None:
+        self.platforms = [*getattr(self, "platforms", []), kwargs]
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_MANIFEST = REPO_ROOT / "plugins" / "bitrix24" / "plugin.yaml"

@@ -25,6 +25,9 @@ class _CapturingContext:
     def register_tool(self, **kwargs) -> None:
         self.tools.append(kwargs)
 
+    def register_platform(self, **kwargs) -> None:
+        self.platforms = [*getattr(self, "platforms", []), kwargs]
+
 
 @pytest.fixture
 def hermes_home(tmp_path, monkeypatch):

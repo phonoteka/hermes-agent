@@ -1,0 +1,235 @@
+"""Bitrix24 plugin platform: one gateway session per task, replies posted back to the task."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import socket
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+from urllib.parse import urlencode
+
+import aiohttp
+import pytest
+import yaml
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.session import SessionStore, build_session_key
+from plugins.bitrix24.enrichment import MessageFacts, TaskFacts
+
+TOKEN = "app-token-test"
+DOMAIN = "portal.example.bitrix24.ru"
+WEBHOOK = f"https://{DOMAIN}/rest/77/secret-value/"
+
+
+class _Source:
+    """Authoritative task/message facts keyed by message id (no network)."""
+
+    def __init__(self) -> None:
+        self.messages: dict[str, tuple[str, str, str]] = {}
+
+    def get_task(self, task_id):
+        return TaskFacts(task_id, f"Task {task_id}", "", "1", "1", f"9{task_id}")
+
+    def get_task_message(self, chat_id, message_id):
+        task_id, author, text = self.messages[message_id]
+        return MessageFacts(message_id, author, text)
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": ["bitrix24"]}}))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("BITRIX24_WEBHOOK_URL", WEBHOOK)
+    monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", TOKEN)
+    monkeypatch.setenv("BITRIX24_BOT_MENTION", "@tux")
+    monkeypatch.delenv("BITRIX24_ALLOWED_GROUP_IDS", raising=False)
+    source = _Source()
+    from plugins.bitrix24 import ingress
+    monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    from plugins.bitrix24 import dedup
+    monkeypatch.setattr(ingress, "get_process_shared_event_deduper", lambda: dedup.InProcessEventDeduper())
+    # Gateway order: plugin discovery registers the platform before any adapter is built.
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    import plugins.bitrix24 as bitrix24
+    manager = PluginManager()
+    bitrix24.register(PluginContext(PluginManifest(name="bitrix24", key="bitrix24", source="bundled"), manager))
+    yield SimpleNamespace(home=home, source=source, manager=manager)
+    manager.unload()
+
+
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _comment(event_id: str, task_id: str, message_id: str, token: str = TOKEN) -> bytes:
+    return urlencode({
+        "event": "ONTASKCOMMENTADD",
+        "event_id": event_id,
+        "data[FIELDS_AFTER][TASK_ID]": task_id,
+        "data[FIELDS_AFTER][MESSAGE_ID]": message_id,
+        "data[FIELDS_AFTER][ID]": message_id,
+        "auth[application_token]": token,
+        "auth[domain]": DOMAIN,
+    }).encode()
+
+
+async def _adapter(port: int):
+    from plugins.bitrix24.platform import Bitrix24Adapter
+    adapter = Bitrix24Adapter(PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "port": port}))
+    events = []
+
+    async def _handler(event):
+        events.append(event)
+
+    adapter.handle_message = AsyncMock(side_effect=_handler)
+    assert await adapter.connect() is True
+    return adapter, events
+
+
+async def _post(port: int, body: bytes):
+    async with aiohttp.ClientSession() as http:
+        async with http.post(
+            f"http://127.0.0.1:{port}/bitrix24/webhook", data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        ) as response:
+            return response.status, json.loads(await response.text())
+
+
+async def _drain(adapter):
+    for _ in range(50):
+        pending = [t for t in getattr(adapter, "_background_tasks", set()) if not t.done()]
+        if not pending:
+            return
+        await asyncio.sleep(0.01)
+
+
+def _key(event) -> str:
+    cfg = GatewayConfig()
+    return build_session_key(
+        event.source, group_sessions_per_user=cfg.group_sessions_per_user,
+        thread_sessions_per_user=cfg.thread_sessions_per_user,
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_comments_share_one_session(env):
+    env.source.messages = {
+        "501": ("42", "1", "@tux first"),
+        "502": ("42", "7", "@tux second from another person"),
+        "503": ("43", "1", "@tux other task"),
+    }
+    port = _free_port()
+    adapter, events = await _adapter(port)
+    try:
+        results = [
+            await _post(port, _comment("e1", "42", "501")),
+            await _post(port, _comment("e2", "42", "502")),
+            await _post(port, _comment("e3", "43", "503")),
+        ]
+        await _drain(adapter)
+    finally:
+        await adapter.disconnect()
+    assert [status for status, _ in results] == [202, 202, 202]
+    assert len(events) == 3
+    keys = [_key(event) for event in events]
+    assert keys[0] == keys[1]
+    assert "task:42" in keys[0]
+    assert keys[2] != keys[0] and "task:43" in keys[2]
+    assert all(event.source.platform == Platform("bitrix24") for event in events)
+    assert {event.source.user_id for event in events[:2]} == {"1", "7"}
+
+
+@pytest.mark.asyncio
+async def test_reject_unauthorized_and_untargeted(env):
+    env.source.messages = {"601": ("42", "1", "plain note"), "602": ("42", "1", "@tux go")}
+    port = _free_port()
+    adapter, events = await _adapter(port)
+    try:
+        bad = await _post(port, _comment("e10", "42", "602", token="wrong"))
+        quiet = await _post(port, _comment("e11", "42", "601"))
+        good = await _post(port, _comment("e12", "42", "602"))
+        await _drain(adapter)
+    finally:
+        await adapter.disconnect()
+    assert bad == (401, {"error": "unauthorized_application_token"})
+    assert quiet == (200, {"status": "ignored", "reason": "not_targeted"})
+    assert good[0] == 202
+    assert len(events) == 1
+
+
+@pytest.mark.asyncio
+async def test_send_posts_to_task_or_dialog(env, monkeypatch):
+    from plugins.bitrix24 import platform as platform_mod
+    calls = []
+
+    class _Client:
+        def call(self, method, **payload):
+            calls.append((method, payload))
+            return {"result": 9001}
+
+    monkeypatch.setattr(platform_mod, "Bitrix24Client", lambda *a, **k: _Client())
+    adapter = platform_mod.Bitrix24Adapter(PlatformConfig(enabled=True, extra={}))
+    task = await adapter.send("task:42", "**Итог** и `code`")
+    chat = await adapter.send("chat:chat77", "привет")
+    other = await adapter.send("telegram:1", "x")
+    assert task.success and chat.success and not other.success
+    assert calls == [
+        ("task.commentitem.add", {"taskId": "42", "fields": {"POST_MESSAGE": "[B]Итог[/B] и [CODE]code[/CODE]"}}),
+        ("im.message.add", {"DIALOG_ID": "chat77", "MESSAGE": "привет"}),
+    ]
+
+    class _Broken:
+        def call(self, method, **payload):
+            raise RuntimeError(f"boom {WEBHOOK}")
+
+    monkeypatch.setattr(platform_mod, "Bitrix24Client", lambda *a, **k: _Broken())
+    failed = await adapter.send("task:42", "x")
+    assert failed.success is False
+    assert "secret-value" not in str(failed.error)
+
+
+@pytest.mark.asyncio
+async def test_register_and_injection_reach_task_session(env, tmp_path):
+    from gateway.platform_registry import platform_registry
+    from gateway.run import GatewayRunner
+    (env.home / "config.yaml").write_text(yaml.safe_dump({
+        "plugins": {"enabled": ["bitrix24"], "entries": {"notify-plugin": {"allow_gateway_injection": True}}}
+    }))
+    try:
+        entry = platform_registry.get("bitrix24")
+        assert entry is not None
+        adapter = entry.adapter_factory(PlatformConfig(enabled=True, extra={}))
+        from plugins.bitrix24.platform import Bitrix24Adapter
+        assert isinstance(adapter, Bitrix24Adapter)
+
+        source = adapter.build_source(chat_id="task:42", chat_type="group", thread_id="42", user_id="1")
+        store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        session = store.get_or_create_session(source)
+        delivered = []
+        adapter.handle_message = AsyncMock(side_effect=lambda event: delivered.append(event))
+
+        runner = object.__new__(GatewayRunner)
+        runner.session_store = store
+        runner.adapters = {Platform("bitrix24"): adapter}
+        runner._profile_adapters = {}
+        runner._running = True
+        runner._draining = False
+        runner._background_tasks = set()
+        runner._is_user_authorized = MagicMock(return_value=True)
+        runner._is_user_authorized_for_source = MagicMock(return_value=True)
+        ok = await runner._dispatch_plugin_message_injection(
+            session_key=session.session_key, content="wake", plugin_id="notify-plugin")
+        missing = await runner._dispatch_plugin_message_injection(
+            session_key="agent:main:bitrix24:group:task:404:404", content="wake", plugin_id="notify-plugin")
+    finally:
+        pass
+    assert ok is True and missing is False
+    assert len(delivered) == 1
+    assert delivered[0].source.chat_id == "task:42"
+    assert "task:42" in session.session_key

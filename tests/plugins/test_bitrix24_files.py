@@ -26,6 +26,9 @@ class _CapturingContext:
     def register_tool(self, **kwargs) -> None:
         self.tools.append(kwargs)
 
+    def register_platform(self, **kwargs) -> None:
+        self.platforms = [*getattr(self, "platforms", []), kwargs]
+
 
 class _MockBitrix24Client:
     def __init__(self, metadata_by_id: dict[str, dict[str, Any]]) -> None:
