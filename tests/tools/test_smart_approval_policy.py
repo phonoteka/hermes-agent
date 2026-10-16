@@ -150,5 +150,31 @@ class TestSmartApprovePolicyInjection(unittest.TestCase):
         assert "TimeoutError" in str(args)
 
 
+class TestSmartApproveVerdictParsing(unittest.TestCase):
+    """The guard is told to answer with one word, but models sometimes append
+    an explanation. The verdict is the first word; anything else escalates."""
+
+    def _verdict(self, answer):
+        with patch("tools.approval_context._get_approval_config", return_value={"mode": "smart"}), \
+             patch("agent.auxiliary_client.call_llm", return_value=_make_response(answer)):
+            return _smart_approve("python3 tools/run.py", "flagged")
+
+    def test_verdict_followed_by_explanation(self):
+        assert self._verdict("APPROVE\n\nThe command runs a local Python script.") == "approve"
+        assert self._verdict("DENY\n\nThis wipes the disk.") == "deny"
+        assert self._verdict("ESCALATE\n\nUnclear remote effects.") == "escalate"
+
+    def test_verdict_with_trailing_punctuation_or_case(self):
+        assert self._verdict("approve.") == "approve"
+        assert self._verdict("  Deny: destructive") == "deny"
+
+    def test_non_verdict_first_word_escalates(self):
+        assert self._verdict("") == "escalate"
+        assert self._verdict(None) == "escalate"
+        assert self._verdict("The command looks safe. APPROVE") == "escalate"
+        assert self._verdict("APPROVED") == "escalate"
+        assert self._verdict("NOT APPROVE") == "escalate"
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,7 @@ Inspired by OpenAI Codex's Smart Approvals guardian subagent.
 """
 
 import logging
+import re
 import time
 from tools import approval_context as _ctx
 
@@ -31,6 +32,7 @@ _SYSTEM_PROMPT = (
     "Respond with exactly one word: APPROVE, DENY, or ESCALATE"
 )
 _VERDICTS = {"APPROVE": "approve", "DENY": "deny"}
+_LEADING_WORD = re.compile(r"\s*([A-Za-z]+)\b")
 
 
 def _strip_line_comment(line: str) -> str:
@@ -111,8 +113,10 @@ def _smart_approve(command: str, description: str) -> str:
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
         )
         logger.debug("Smart approvals: LLM call completed in %.1fs", time.monotonic() - _smart_t0)
-        answer = (response.choices[0].message.content or "").strip().upper()
-        return _VERDICTS.get(answer, "escalate")
+        # The verdict is the leading word; models sometimes append an explanation
+        # despite the one-word instruction. Anything else (incl. APPROVED) escalates.
+        match = _LEADING_WORD.match(response.choices[0].message.content or "")
+        return _VERDICTS.get(match.group(1).upper() if match else "", "escalate")
     except Exception as e:
         # WARNING, not DEBUG: a failed/blocked guardian call is a real event
         # the operator needs to see (the hang was invisible at DEBUG).
