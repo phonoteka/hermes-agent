@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import importlib.util
 import json
 from pathlib import Path
 import stat
+import sys
 import subprocess
 import threading
 from types import SimpleNamespace
@@ -135,6 +137,9 @@ def _load(env, monkeypatch, *, injector=True):
         if importlib.util.find_spec(notifier_name) is not None:
             notifier = importlib.import_module(notifier_name)
             monkeypatch.setattr(notifier, "TICK_SECONDS", TICK)
+            for name, value in env.notifier_overrides.items():
+                monkeypatch.setattr(notifier, name, value, raising=False)
+            env.notifier_modules.append(notifier)
         return module
 
     monkeypatch.setattr(manager, "_load_directory_module", load_module)
@@ -162,6 +167,12 @@ async def notifier_env(binding_context, isolated_profile, tmp_path, monkeypatch)
         home=home, tmp_path=tmp_path, ctx=binding_context,
         prefix=prefix,
         runner=runner, adapter=adapter, keys=keys, managers=[],
+        # binding_context already loaded the real plugin (and its notifier) once;
+        # keep that module so patched constants reach every live notifier instance.
+        notifier_modules=[m for n, m in sys.modules.items() if n.endswith(".pause_notifier")],
+        # Plugin discovery inside a real tool call may load a fresh notifier module later;
+        # load_module applies these overrides to it as well.
+        notifier_overrides={},
         state=home / "runtime/canon/pause-notifier.json",
     )
     yield env
@@ -228,26 +239,127 @@ async def _run(env, run_id, key, *, human=True, delivery="Deliver in this chat")
     return row
 
 
-def _message(row):
-    """Render the exact approved notification contract from real CLI index data."""
-    delivery = row["humanGateDelivery"] or "not specified — ask the user of this session"
-    run_id = row["runId"]
-    return (
-        f"Canon run {run_id} ({row['workflowRef']}) is paused at a Human Gate. "
-        f"Delivery: {delivery}. Read the card with canon_inspect run_id={run_id}; "
-        "answer with canon_checkpoint subcommand=continue-paused."
-    )
+async def _prompt(env, row):
+    """Read Canon's real card and continuation request from the default stores off the gateway loop."""
+    argv = transport.build_argv("inspect", {"surface": "prompt", "run_id": row["runId"]})
+    argv.extend(["--checkpoint-backend", "sqlite", "--checkpoint-db",
+                 str(env.home / "runtime/canon/durable/checkpoint.sqlite")])
+    result = await asyncio.to_thread(subprocess.run, argv, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
 
 
-def _assert_event(env, key, row):
-    """Require one exact internal event without interrupting or invoking a busy handler."""
+async def _assert_message(env, text, row, *, file_card=False):
+    """Require an unchanged Canon card or private full-prompt file in a JSON wake."""
+    prompt = await _prompt(env, row)
+    message = json.loads(text)
+    assert "\n" not in text
+    assert message["type"] == "canon_human_gate_wake"
+    for key in ("runId", "workflowRef", "humanGateDelivery"):
+        assert message[key] == row[key]
+    assert isinstance(message["instruction"], str) and message["instruction"].strip()
+    assert message["actions"] == prompt["humanGatePrompt"]["actions"]
+    assert message["continuePaused"] == prompt["continuePaused"]
+    if file_card:
+        assert "cardBody" not in message
+        path = Path(message["cardBodyFile"])
+        assert path.is_absolute()
+        assert path == env.home / "runtime/canon/prompts" / f"{row['runId']}-{row['eventCount']}.json"
+        assert path.is_file()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        content = path.read_bytes()
+        assert hashlib.sha256(content).hexdigest() == message["cardBodySha256"]
+        assert json.loads(content) == prompt
+    else:
+        assert message["cardBody"] == prompt["humanGatePrompt"]["cardBody"]
+        assert "cardBodyFile" not in message and "cardBodySha256" not in message
+    return message
+
+
+async def _assert_event(env, key, row, *, file_card=False):
+    """Require one internal wake without interrupting or invoking a busy handler."""
     events = _events(env, key)
     assert len(events) == 1
-    assert events[0].text == _message(row)
     assert events[0].internal is True
     assert events[0].allow_gateway_control is False
     assert not env.adapter._active_sessions[key].is_set()
     env.adapter._message_handler.assert_not_awaited()
+    return await _assert_message(env, events[0].text, row, file_card=file_card)
+
+
+async def _approve(env, cp):
+    """Approve the real pause using the continuation authority returned by Canon."""
+    output = await asyncio.to_thread(env.ctx.invoke, "canon_checkpoint", {
+        "subcommand": "continue-paused", "workflow": cp["workflow"],
+        "request_json": {**cp["request"], "gateDecision": {"action": "approve"}},
+        "wait_mode": "sync-real", "timeout_seconds": 180,
+    })
+    value = json.loads(output)
+    assert value.get("status") == "completed", value
+
+
+def _small_inline_limit(env, monkeypatch):
+    """Force every live and later-loaded real notifier to use its oversize-card path."""
+    env.notifier_overrides["MAX_INLINE_CHARS"] = 200
+    for module in env.notifier_modules:
+        monkeypatch.setattr(module, "MAX_INLINE_CHARS", 200, raising=False)
+
+
+async def _run_unbound_refused(env, run_id):
+    """Require Canon itself to refuse a Human Gate run without a host session."""
+    pack = _pack(env, run_id)
+    argv = transport.build_argv("run", {
+        "workflow": str(pack / "workflow.json"),
+        "request_json": str(pack / "run-request.json"),
+    })
+    result = await asyncio.to_thread(subprocess.run, argv, capture_output=True, text=True, timeout=190)
+    assert result.returncode != 0, result.stdout
+    assert "host-session" in result.stderr, result.stderr
+
+
+@pytest.mark.asyncio
+async def test_card_delivered(notifier_env, monkeypatch):
+    """Deliver the real card only to its bound session and approve its continuation."""
+    env = notifier_env
+    _load(env, monkeypatch)
+    row = await _run(env, "run-x5-inline", env.keys[0])
+    await _wait_events(env, env.keys[0])
+    assert not _events(env, env.keys[1])
+    message = await _assert_event(env, env.keys[0], row)
+    await _approve(env, message["continuePaused"])
+    assert not _events(env, env.keys[1])
+
+
+@pytest.mark.asyncio
+async def test_card_file(notifier_env, monkeypatch):
+    """An oversize wake carries an intact private prompt file, not an inline card."""
+    env = notifier_env
+    _load(env, monkeypatch)
+    _small_inline_limit(env, monkeypatch)
+    row = await _run(env, "run-x5-file", env.keys[0])
+    await _wait_events(env, env.keys[0])
+    assert not _events(env, env.keys[1])
+    await _assert_event(env, env.keys[0], row, file_card=True)
+
+
+@pytest.mark.asyncio
+async def test_card_file_removed(notifier_env, monkeypatch):
+    """Keep the file while paused, then delete it after real approval completes."""
+    env = notifier_env
+    _load(env, monkeypatch)
+    _small_inline_limit(env, monkeypatch)
+    row = await _run(env, "run-x5-cleanup", env.keys[0])
+    await _wait_events(env, env.keys[0])
+    message = await _assert_event(env, env.keys[0], row, file_card=True)
+    path = Path(message["cardBodyFile"])
+    await asyncio.sleep(2)
+    assert path.is_file()
+    await _approve(env, message["continuePaused"])
+    deadline = asyncio.get_running_loop().time() + 10
+    while path.exists() and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(TICK)
+    assert not path.exists(), "completed run retained its Human Gate prompt file"
 
 
 @pytest.mark.asyncio
@@ -259,9 +371,9 @@ async def test_delivers_once(notifier_env, monkeypatch, target, delivery):
     _load(env, monkeypatch)
     row = await _run(env, "run-x4-deliver", env.keys[target], delivery=delivery)
     await _wait_events(env, env.keys[target])
-    _assert_event(env, env.keys[target], row)
+    await _assert_event(env, env.keys[target], row)
     await asyncio.sleep(2)
-    _assert_event(env, env.keys[target], row)
+    await _assert_event(env, env.keys[target], row)
     assert not _events(env, env.keys[1 - target])
     assert stat.S_IMODE(env.state.stat().st_mode) == 0o600
 
@@ -297,7 +409,7 @@ async def test_delivers_once_beyond_first_index_page(notifier_env, monkeypatch):
     _seed_older_runs(env, 60)
     row = await _run(env, "run-x4-page-late", env.keys[0])
     await _wait_events(env, env.keys[0])
-    _assert_event(env, env.keys[0], row)
+    await _assert_event(env, env.keys[0], row)
     assert not _events(env, env.keys[1])
 
 
@@ -329,8 +441,10 @@ async def test_no_injection(notifier_env, monkeypatch, control):
             "enabled": ["canon"], "entries": {"canon": {"allow_gateway_injection": False}},
         }}))
     _load(env, monkeypatch, injector=control != "no-injector")
-    await _run(env, "run-x4-control", None if control == "no-host-session" else env.keys[0],
-               human=control != "completed-run")
+    if control == "no-host-session":
+        await _run_unbound_refused(env, "run-x4-control")
+    else:
+        await _run(env, "run-x4-control", env.keys[0], human=control != "completed-run")
     await _observe_quiet(env)
 
 
@@ -342,7 +456,7 @@ async def test_restart(notifier_env, monkeypatch, delete_state):
     first_manager, threads = _load(env, monkeypatch)
     pause_a = await _run(env, "run-x4-a", env.keys[0])
     await _wait_events(env, env.keys[0])
-    _assert_event(env, env.keys[0], pause_a)
+    await _assert_event(env, env.keys[0], pause_a)
     assert stat.S_IMODE(env.state.stat().st_mode) == 0o600
     first_manager.unload()
     assert threads, "register did not start a notifier thread"
@@ -355,13 +469,17 @@ async def test_restart(notifier_env, monkeypatch, delete_state):
     if delete_state:
         env.state.unlink()
     _load(env, monkeypatch)
-    expected = [_message(pause_b)]
+    expected = {pause_b["runId"]: pause_b}
     if delete_state:
-        expected.append(_message(pause_a))
+        expected[pause_a["runId"]] = pause_a
     await _wait_events(env, env.keys[0], len(expected))
     await asyncio.sleep(2)
     events = _events(env, env.keys[0])
-    assert sorted(event.text for event in events) == sorted(expected)
+    assert len(events) == len(expected)
+    messages = [json.loads(event.text) for event in events]
+    assert sorted(message["runId"] for message in messages) == sorted(expected)
+    for event, message in zip(events, messages):
+        await _assert_message(env, event.text, expected[message["runId"]])
     assert all(event.internal and not event.allow_gateway_control for event in events)
     assert not _events(env, env.keys[1])
     assert not env.adapter._active_sessions[env.keys[0]].is_set()

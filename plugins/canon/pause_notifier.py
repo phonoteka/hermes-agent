@@ -1,6 +1,8 @@
 """Deliver Canon default-store Human Gate pauses through the native gateway."""
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +24,14 @@ if TYPE_CHECKING:
 TICK_SECONDS = 30.0
 # Canon `index` returns a bounded window; the notifier pages until a short page.
 INDEX_PAGE_SIZE = 200
+MAX_INLINE_CHARS = 6000
+WAKE_INSTRUCTION = (
+    "Show cardBody to the user as-is (read cardBodyFile when present and verify cardBodySha256), "
+    "with actions, via clarify in this session or by the humanGateDelivery route when set. "
+    "Then call canon_checkpoint subcommand=continue-paused with workflow=continuePaused.workflow "
+    "and request_json=continuePaused.request plus gateDecision {action, and feedback when the action requires it}. "
+    "Never decide for the user."
+)
 _logger = logging.getLogger(__name__)
 
 
@@ -72,11 +82,36 @@ class PauseNotifier:
                 break
 
     def _tick(self) -> None:
-        """Pre: called serially by this worker. Post: no action without a gateway;
-        otherwise reads every CLI index page (INDEX_PAGE_SIZE rows each, offset
-        advancing until a short page), injects new bound pauses and atomically
-        records only accepted keys. Failures warn without payloads and skip the
-        remainder of this tick. Raises: none; owns CLI carrier cleanup.
+        """Pre: called serially by this worker. Post: runs one delivery pass only
+        while holding the profile-wide exclusive notifier lock, so concurrent
+        notifier instances (plugin reloads, several managers in one profile)
+        never deliver the same pause twice; a busy lock skips this tick.
+        Raises: none; lock failures warn and skip the tick.
+        """
+        lock_path = Path(get_hermes_home()) / "runtime" / "canon" / "pause-notifier.lock"
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            _logger.warning("Canon pause notifier: lock unavailable; skipping tick")
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            self._deliver()
+        finally:
+            os.close(fd)
+
+    def _deliver(self) -> None:
+        """Pre: caller holds the notifier lock. Post: no action without a gateway;
+        otherwise reads every CLI index page, removes obsolete prompt files and
+        reads Canon's card for each new bound pause. Oversize wakes carry a private
+        atomic file containing the exact prompt stdout bytes instead of cardBody.
+        Only accepted injection keys are persisted. Prompt failures warn without
+        payloads and leave that row retryable; other failures skip the tick.
+        Raises: none; owns CLI carrier and temporary prompt-file cleanup.
         """
         try:
             if not plugins.get_plugin_manager().has_gateway_message_injector:
@@ -96,34 +131,84 @@ class PauseNotifier:
                     rows.extend(page)
                     if len(page) < INDEX_PAGE_SIZE:
                         break
+                state = Path(get_hermes_home()) / "runtime" / "canon" / "pause-notifier.json"
+                prompts = state.parent / "prompts"
+                current = {
+                    f"{row['runId']}-{row['eventCount']}"
+                    for row in rows
+                    if row["status"] == "paused"
+                    and isinstance(row["hostSession"], str) and row["hostSession"]
+                }
+                for path in prompts.glob("*.json"):
+                    if path.stem not in current:
+                        path.unlink(missing_ok=True)
+                notified = self._read_state(state)
+                for row in rows:
+                    if row["status"] != "paused":
+                        continue
+                    session = row["hostSession"]
+                    if not isinstance(session, str) or not session:
+                        continue
+                    run_id = row["runId"]
+                    key = f"{run_id}:{row['eventCount']}"
+                    if key in notified:
+                        continue
+                    try:
+                        argv = transport._build_argv("inspect", {"surface": "prompt", "run_id": run_id}, root)
+                        result = subprocess.run(argv, capture_output=True, timeout=60)
+                        if result.returncode != 0:
+                            _logger.warning("Canon pause notifier: prompt failed; will retry")
+                            continue
+                        prompt = json.loads(result.stdout)
+                        message = {
+                            "type": "canon_human_gate_wake",
+                            "runId": run_id,
+                            "workflowRef": row["workflowRef"],
+                            "humanGateDelivery": row["humanGateDelivery"],
+                            "instruction": WAKE_INSTRUCTION,
+                            "cardBody": prompt["humanGatePrompt"]["cardBody"],
+                            "actions": prompt["humanGatePrompt"]["actions"],
+                            "continuePaused": prompt["continuePaused"],
+                        }
+                    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+                        _logger.warning("Canon pause notifier: prompt failed; will retry")
+                        continue
+                    text = json.dumps(message, ensure_ascii=False, separators=(',', ':'))
+                    if len(text) > MAX_INLINE_CHARS:
+                        path = prompts / f"{run_id}-{row['eventCount']}.json"
+                        self._write_prompt(path, result.stdout)
+                        del message["cardBody"]
+                        message["cardBodyFile"] = str(path.resolve())
+                        message["cardBodySha256"] = hashlib.sha256(result.stdout).hexdigest()
+                        text = json.dumps(message, ensure_ascii=False, separators=(',', ':'))
+                    if self._ctx.inject_message(text, session_key=session):
+                        notified.add(key)
+                        self._write_state(state, notified)
+                    elif key not in self._warned_keys:
+                        self._warned_keys.add(key)
+                        _logger.warning("Canon pause notifier: injection refused; will retry")
             finally:
                 shutil.rmtree(root, ignore_errors=True)
-            state = Path(get_hermes_home()) / "runtime" / "canon" / "pause-notifier.json"
-            notified = self._read_state(state)
-            for row in rows:
-                if row["status"] != "paused":
-                    continue
-                session = row["hostSession"]
-                if not isinstance(session, str) or not session:
-                    continue
-                run_id = row["runId"]
-                key = f"{run_id}:{row['eventCount']}"
-                if key in notified:
-                    continue
-                delivery = row["humanGateDelivery"] or "not specified — ask the user of this session"
-                text = (
-                    f"Canon run {run_id} ({row['workflowRef']}) is paused at a Human Gate. "
-                    f"Delivery: {delivery}. Read the card with canon_inspect run_id={run_id}; "
-                    "answer with canon_checkpoint subcommand=continue-paused."
-                )
-                if self._ctx.inject_message(text, session_key=session):
-                    notified.add(key)
-                    self._write_state(state, notified)
-                elif key not in self._warned_keys:
-                    self._warned_keys.add(key)
-                    _logger.warning("Canon pause notifier: injection refused; will retry")
         except Exception:
             _logger.warning("Canon pause notifier: tick failed; will retry")
+
+    @staticmethod
+    def _write_prompt(path: Path, content: bytes) -> None:
+        """Pre: path is plugin-owned and content is exact Canon prompt stdout.
+        Post: atomically replaces a 0600 file in a 0700 directory. Raises: I/O
+        errors retaining any old file and removing the temporary file.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.parent.chmod(0o700)
+        fd, name = tempfile.mkstemp(prefix=".prompt-", dir=path.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(content)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _read_state(path: Path) -> set[str]:

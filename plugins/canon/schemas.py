@@ -15,14 +15,14 @@ _COMMAND_PARAMETERS = {
     "pause": "mode " + _BACKENDS + " run_id thread_id",
     "cancel": "mode " + _BACKENDS + " run_id thread_id",
     "restart": "mode host_adapter host_config " + _BACKENDS + " checkpoint_id",
-    "inspect": "mode backend artifact_backend artifact_root journal_backend journal_db surface run_id after_sequence limit workflow",
+    "inspect": "mode backend checkpoint_backend checkpoint_db artifact_backend artifact_root journal_backend journal_db surface run_id after_sequence limit workflow",
     "index": "mode backend artifact_backend artifact_root journal_backend journal_db host_session limit offset",
 }
 _ENUMS = {
     "checkpoint_backend": ["none", "sqlite"],
     "journal_backend": ["none", "sqlite"],
     "artifact_backend": ["none", "local"],
-    "surface": ["full", "inspect", "report", "timeline", "artifacts", "events"],
+    "surface": ["full", "inspect", "report", "timeline", "artifacts", "events", "prompt"],
     "subcommand": ["history", "inspect", "replay", "replay-node", "fork", "fork-node", "continue-paused"],
     "checkpoint_mode": ["continue_paused", "replay_from_checkpoint", "replay_from_node", "fork_from_checkpoint", "fork_from_node"],
 }
