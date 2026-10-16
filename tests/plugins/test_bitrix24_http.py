@@ -28,6 +28,7 @@ EXPECTED_TOKEN = "expected-app-token"
 def ingress_handler(monkeypatch):
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", "https://example.com/rest/1/test")
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", EXPECTED_TOKEN)
+    monkeypatch.setenv("BITRIX24_BOT_MENTION", "@hermes")
     return _make_webhook_ingress_handler(deduper=InProcessEventDeduper())
 
 
@@ -139,13 +140,15 @@ def test_parse_bitrix24_webhook_payload_errors_do_not_echo_token_or_raw_secret()
 def test_parse_bitrix24_webhook_payload_output_is_accepted_by_ingress_handler(ingress_handler):
     raw_body = urlencode(
         [
-            ("event", "ONTASKADD"),
+            ("event", "ONTASKCOMMENTADD"),
             ("ts", "1719050000"),
             ("event_handler_id", "handler-1"),
             ("auth[domain]", EXPECTED_DOMAIN),
             ("auth[application_token]", EXPECTED_TOKEN),
             ("auth[member_id]", "member-77"),
-            ("data[FIELDS_AFTER][ID]", "42"),
+            ("data[FIELDS_AFTER][ID]", "0"),
+            ("data[FIELDS_AFTER][TASK_ID]", "42"),
+            ("data[FIELDS_AFTER][MESSAGE_ID]", "84"),
         ]
     ).encode("utf-8")
 
@@ -154,9 +157,9 @@ def test_parse_bitrix24_webhook_payload_output_is_accepted_by_ingress_handler(in
 
     assert result["accepted"] is True
     assert result["reason"] == "targeted_event"
-    assert result["event"] == "ONTASKADD"
+    assert result["event"] == "ONTASKCOMMENTADD"
     assert result["event_id"] == payload["event_id"]
     assert result["source_domain"] == EXPECTED_DOMAIN
     assert result["payload"]["data"]["FIELDS_AFTER"] == {
-        "ID": "42",
+        "ID": "0", "TASK_ID": "42", "MESSAGE_ID": "84",
     }

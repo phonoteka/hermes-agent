@@ -58,9 +58,9 @@ def _find_tool(tools: list[dict], name: str) -> dict | None:
 def _supported_payload(domain: str = "example.com") -> dict:
     return {
         "event_id": "surface-task-42",
-        "event": "ONTASKADD",
+        "event": "ONTASKCOMMENTADD",
         "auth": {"domain": domain, "application_token": "expected-app-token"},
-        "data": {"FIELDS_AFTER": {"ID": "42"}, "FIELDS_BEFORE": "undefined", "IS_ACCESSIBLE_AFTER": "undefined", "IS_ACCESSIBLE_BEFORE": "N"},
+        "data": {"FIELDS_AFTER": {"ID": "0", "TASK_ID": "42", "MESSAGE_ID": "84"}},
     }
 
 
@@ -134,7 +134,7 @@ def test_bitrix24_webhook_ingress_rejects_when_application_token_is_unconfigured
     assert result == {
         "accepted": False,
         "reason": "webhook_auth_not_configured",
-        "event": "ONTASKADD",
+        "event": "ONTASKCOMMENTADD",
     }
 
 

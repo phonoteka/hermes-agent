@@ -32,9 +32,9 @@ class _FakeClock:
 def _task_payload(*, event_id: str) -> dict:
     return {
         "event_id": event_id,
-        "event": "ONTASKADD",
+        "event": "ONTASKCOMMENTADD",
         "auth": {"domain": "example.com", "application_token": "expected-app-token"},
-        "data": {"FIELDS_AFTER": {"ID": "42"}, "FIELDS_BEFORE": "undefined", "IS_ACCESSIBLE_AFTER": "undefined", "IS_ACCESSIBLE_BEFORE": "N"},
+        "data": {"FIELDS_AFTER": {"ID": "0", "TASK_ID": "42", "MESSAGE_ID": "84"}},
     }
 
 
@@ -68,6 +68,7 @@ def test_in_process_event_deduper_evicts_oldest_entries_over_max_size():
 def test_webhook_ingress_accepts_same_event_again_after_ttl_expiry(monkeypatch):
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", "https://example.com/rest/1/test")
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", "expected-app-token")
+    monkeypatch.setenv("BITRIX24_BOT_MENTION", "@hermes")
 
     clock = _FakeClock()
     deduper = InProcessEventDeduper(ttl_seconds=5, max_events=10, clock=clock)
@@ -85,7 +86,7 @@ def test_webhook_ingress_accepts_same_event_again_after_ttl_expiry(monkeypatch):
     assert second == {
         "accepted": False,
         "reason": "duplicate_event",
-        "event": "ONTASKADD",
+        "event": "ONTASKCOMMENTADD",
         "event_id": "evt-ttl-1",
         "deduped": True,
     }

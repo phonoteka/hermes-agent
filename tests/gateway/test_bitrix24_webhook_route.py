@@ -53,7 +53,7 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
     return app
 
 
-def _bitrix_payload(*, token: str = EXPECTED_TOKEN, domain: str = EXPECTED_DOMAIN, event: str = "ONTASKADD", event_id: str = "evt-accepted-1", description: str = "@hermes review task", title: str = "Webhook smoke") -> dict:
+def _bitrix_payload(*, token: str = EXPECTED_TOKEN, domain: str = EXPECTED_DOMAIN, event: str = "ONTASKCOMMENTADD", event_id: str = "evt-accepted-1", description: str = "@hermes review task", title: str = "Webhook smoke") -> dict:
     fields: dict[str, object] = {"ID": "42", "DOWNLOAD_URL": DOWNLOAD_URL}
     if event in {"ONTASKCOMMENTADD", "ONTASKCOMMENTUPDATE"}:
         fields = {"ID": "0", "TASK_ID": "42", "MESSAGE_ID": "84", "DOWNLOAD_URL": DOWNLOAD_URL}
@@ -124,13 +124,13 @@ async def test_bitrix24_dedicated_route_accepts_unsigned_payload_and_sanitizes_e
     assert event.message_id == "evt-accepted-1"
     assert event.raw_message["event_id"] == "evt-accepted-1"
     assert event.raw_message["task_title"] == "Webhook smoke"
-    assert event.raw_message["payload"]["data"]["FIELDS_AFTER"]["ID"] == "42"
-    assert "auth" not in json.dumps(event.raw_message)
+    assert event.raw_message["payload"]["data"]["FIELDS_AFTER"]["TASK_ID"] == "42"
+    assert '"auth"' not in json.dumps(event.raw_message)
     assert EXPECTED_TOKEN not in json.dumps(event.raw_message)
     assert EXPECTED_WEBHOOK_URL not in json.dumps(event.raw_message)
     assert "DOWNLOAD_URL" not in json.dumps(event.raw_message)
     assert DOWNLOAD_URL not in json.dumps(event.raw_message)
-    assert "auth" not in event.text
+    assert '"auth"' not in event.text
     assert EXPECTED_TOKEN not in event.text
     assert EXPECTED_WEBHOOK_URL not in event.text
     assert "DOWNLOAD_URL" not in event.text
@@ -388,7 +388,7 @@ async def test_bitrix24_capture_accepted_payload(bitrix_env, tmp_path):
         )
         assert resp.status == 202
         assert await resp.json() == {
-            "status": "accepted", "route": "bitrix24", "event": "ONTASKADD",
+            "status": "accepted", "route": "bitrix24", "event": "ONTASKCOMMENTADD",
             "delivery_id": "evt-capture-accepted",
         }
         await asyncio.sleep(0)
@@ -402,12 +402,12 @@ async def test_bitrix24_capture_accepted_payload(bitrix_env, tmp_path):
     assert record["content_type"] == "application/json"
     assert record["user_agent"] == "Bitrix24 diagnostic test"
     assert record["body_bytes"] == len(raw_body)
-    assert record["payload"]["event"] == "ONTASKADD"
+    assert record["payload"]["event"] == "ONTASKCOMMENTADD"
     assert record["payload"]["auth"] == {
         "domain": EXPECTED_DOMAIN, "application_token": "<redacted>", "member_id": "<redacted>",
     }
     assert record["payload"]["data"]["FIELDS_AFTER"]["DOWNLOAD_URL"] == "<redacted>"
-    assert record["payload"]["data"]["FIELDS_AFTER"]["ID"] == "42"
+    assert record["payload"]["data"]["FIELDS_AFTER"]["TASK_ID"] == "42"
     assert record["payload"]["data"]["nested"] == [{
         "auth": "<redacted>", "access_token": "<redacted>", "client_secret": "<redacted>",
         "PASSWORD": "<redacted>", "sourceUrl": "<redacted>", "ID": 17, "message": "Оставить текст",
@@ -425,8 +425,8 @@ async def test_bitrix24_capture_real_form_shape(bitrix_env, tmp_path):
     adapter = _make_adapter(bitrix24_enabled=True, capture_path=str(capture_path))
     client, dispatched = await _capturing_client(adapter)
     body = urlencode([
-        ("event", "ONTASKUPDATE"), ("data[FIELDS_BEFORE][ID]", "42"),
-        ("data[FIELDS_AFTER][ID]", "42"), ("auth[domain]", EXPECTED_DOMAIN),
+        ("event", "ONTASKCOMMENTADD"), ("data[FIELDS_AFTER][ID]", "0"),
+        ("data[FIELDS_AFTER][TASK_ID]", "42"), ("data[FIELDS_AFTER][MESSAGE_ID]", "84"), ("auth[domain]", EXPECTED_DOMAIN),
         ("auth[application_token]", EXPECTED_TOKEN),
     ]).encode("utf-8")
     async with client as cli:
@@ -442,8 +442,8 @@ async def test_bitrix24_capture_real_form_shape(bitrix_env, tmp_path):
     record = json.loads(text)
     assert record["status"] == 202
     assert record["reason"] is None
-    assert record["payload"]["data"]["FIELDS_AFTER"]["ID"] == "42"
-    assert record["payload"]["data"]["FIELDS_BEFORE"]["ID"] == "42"
+    assert record["payload"]["data"]["FIELDS_AFTER"]["TASK_ID"] == "42"
+    assert record["payload"]["data"]["FIELDS_AFTER"]["MESSAGE_ID"] == "84"
     assert record["payload"]["auth"]["application_token"] == "<redacted>"
     assert record["body_bytes"] == len(body)
     assert EXPECTED_TOKEN not in text
@@ -499,7 +499,7 @@ async def test_bitrix24_capture_disabled(bitrix_env, tmp_path):
         resp = await cli.post("/bitrix24/webhook", json=_bitrix_payload(event_id="evt-capture-disabled"))
         assert resp.status == 202
         assert await resp.json() == {
-            "status": "accepted", "route": "bitrix24", "event": "ONTASKADD",
+            "status": "accepted", "route": "bitrix24", "event": "ONTASKCOMMENTADD",
             "delivery_id": "evt-capture-disabled",
         }
         await asyncio.sleep(0)
@@ -518,7 +518,7 @@ async def test_bitrix24_capture_write_failure_keeps_response(bitrix_env, tmp_pat
             resp = await cli.post("/bitrix24/webhook", json=_bitrix_payload(event_id="evt-capture-write-failure"))
             assert resp.status == 202
             assert await resp.json() == {
-                "status": "accepted", "route": "bitrix24", "event": "ONTASKADD",
+                "status": "accepted", "route": "bitrix24", "event": "ONTASKCOMMENTADD",
                 "delivery_id": "evt-capture-write-failure",
             }
             await asyncio.sleep(0)
@@ -600,3 +600,18 @@ async def test_bitrix24_route_source_unavailable_is_502_and_retry_is_not_deduped
         assert retry.status == 202
         await asyncio.sleep(0)
     assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", ["ONTASKADD", "ONTASKUPDATE"])
+async def test_bitrix24_route_ignores_task_events_even_with_tag(bitrix_env, event):
+    """Only tagged comments reach the agent; task create/update never dispatches."""
+    adapter = _make_adapter(bitrix24_enabled=True)
+    client, dispatched = await _capturing_client(adapter)
+    async with client as cli:
+        resp = await cli.post("/bitrix24/webhook", json=_bitrix_payload(event=event, event_id=f"evt-{event}"))
+        assert resp.status == 200
+        assert (await resp.json())["reason"] == "not_targeted"
+        await asyncio.sleep(0)
+    assert dispatched == []
+    assert bitrix_env.calls == []

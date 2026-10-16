@@ -288,26 +288,26 @@ def test_bitrix24_webhook_rejects_bad_supported_event_shape_as_unknown_payload_s
     }
 
 
-def test_bitrix24_webhook_normalizes_one_targeted_task_event_and_dedups_retries(
+def test_bitrix24_webhook_normalizes_one_targeted_comment_and_dedups_retries(
     ingress_tool,
     monkeypatch,
 ):
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", "https://example.com/rest/1/test")
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", "expected-app-token")
 
-    first = _invoke(ingress_tool, _task_payload())
-    second = _invoke(ingress_tool, _task_payload())
+    payload = _comment_payload(event_id="evt-task-1", post_message="@hermes take a look")
+    first = _invoke(ingress_tool, payload)
+    second = _invoke(ingress_tool, payload)
 
     assert first["accepted"] is True
     assert first["reason"] == "targeted_event"
     assert first["targeted"] is True
     assert first["deduped"] is False
-    assert first["targeting"] == {"mode": "project_rule", "mention": "@hermes"}
     assert first["normalized_turn"] == {
         "source": "bitrix24",
-        "event": "ONTASKADD",
+        "event": "ONTASKCOMMENTADD",
         "event_id": "evt-task-1",
-        "object_id": "42",
+        "object_id": "85",
     }
     assert first["turns"] == [first["normalized_turn"]]
     assert second["accepted"] is False
@@ -323,68 +323,43 @@ def test_bitrix24_webhook_dedups_across_two_handler_instances_in_same_process(mo
 
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", "https://example.com/rest/1/test")
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", "expected-app-token")
+    monkeypatch.setenv("BITRIX24_BOT_MENTION", "@hermes")
 
     shared_deduper = InProcessEventDeduper()
     first_handler = _make_webhook_ingress_handler(deduper=shared_deduper)
     second_handler = _make_webhook_ingress_handler(deduper=shared_deduper)
+    payload = _comment_payload(event_id="evt-cross-handler-1", post_message="@hermes take a look")
 
-    first = json.loads(first_handler(_task_payload(event_id="evt-cross-handler-1"), task_id="build-fix"))
-    second = json.loads(second_handler(_task_payload(event_id="evt-cross-handler-1"), task_id="build-fix"))
+    first = json.loads(first_handler(payload, task_id="build-fix"))
+    second = json.loads(second_handler(payload, task_id="build-fix"))
 
     assert first["accepted"] is True
     assert first["reason"] == "targeted_event"
     assert second == {
         "accepted": False,
         "reason": "duplicate_event",
-        "event": "ONTASKADD",
+        "event": "ONTASKCOMMENTADD",
         "event_id": "evt-cross-handler-1",
         "deduped": True,
     }
 
 
-def test_bitrix24_webhook_normalizes_targeted_task_update_as_project_rule(
+@pytest.mark.parametrize("event", ["ONTASKADD", "ONTASKUPDATE"])
+def test_bitrix24_webhook_ignores_task_events_even_with_tag_in_description(
     ingress_tool,
+    fake_event_source,
     monkeypatch,
+    event,
 ):
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", "https://example.com/rest/1/test")
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", "expected-app-token")
 
-    result = _invoke(ingress_tool, _task_payload(event_id="evt-task-update-1", event="ONTASKUPDATE"))
+    result = _invoke(ingress_tool, _task_payload(event_id=f"evt-{event}", event=event))
 
-    assert result["accepted"] is True
-    assert result["reason"] == "targeted_event"
-    assert result["targeting"]["mode"] == "project_rule"
-    assert result["normalized_turn"] == {
-        "source": "bitrix24",
-        "event": "ONTASKUPDATE",
-        "event_id": "evt-task-update-1",
-        "object_id": "42",
-    }
-    assert len(result["turns"]) == 1
-
-
-def test_bitrix24_webhook_accepts_sparse_task_update_without_title(
-    ingress_tool,
-    monkeypatch,
-):
-    monkeypatch.setenv("BITRIX24_WEBHOOK_URL", "https://example.com/rest/1/test")
-    monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", "expected-app-token")
-
-    result = _invoke(
-        ingress_tool,
-        _task_payload(
-            event_id="evt-task-update-sparse-1",
-            event="ONTASKUPDATE",
-            title=None,
-            description="description only update",
-        ),
-    )
-
-    assert result["accepted"] is True
-    assert result["event"] == "ONTASKUPDATE"
-    assert result["task_id"] == "42"
-    assert result["reason"] == "targeted_event"
-    assert result["payload"]["data"]["FIELDS_AFTER"] == {"ID": "42"}
+    assert result["accepted"] is False
+    assert result["reason"] == "not_targeted"
+    assert "turns" not in result
+    assert fake_event_source.calls == []
 
 
 def test_bitrix24_webhook_sanitizes_auth_fields_from_accepted_result(

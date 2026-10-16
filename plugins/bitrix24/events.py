@@ -242,27 +242,6 @@ def _accepted_event_response(
     return result
 
 
-def _normalize_task_event(
-    payload: dict[str, Any], *, event: str, event_id: str, source_domain: str,
-    event_source: Bitrix24EventSource,
-) -> dict[str, Any] | None:
-    """Enrich real task IDs; return None for malformed data, propagate source failure."""
-    task_id = _optional_text(_payload_fields(payload).get("ID"))
-    if not task_id:
-        return None
-    task = event_source.get_task(task_id)
-    if task is None:
-        return {"accepted": False, "reason": "task_not_found"}
-    result = _accepted_event_response(
-        payload=payload, event=event, event_id=event_id, source_domain=source_domain,
-        object_id=task_id, targeting_mode="project_rule", task_id=task_id,
-        message=task.description, file_ids=_payload_file_ids(payload),
-    )
-    result.update(task_title=task.title, message=task.description,
-                  actor_id=task.created_by if event == "ONTASKADD" else task.changed_by)
-    return result
-
-
 def _normalize_comment_event(
     payload: dict[str, Any], *, event: str, event_id: str, source_domain: str,
     event_source: Bitrix24EventSource, bot_user_id: str,
@@ -339,14 +318,15 @@ def _normalize_supported_event(
     event_source: Bitrix24EventSource | None = None, bot_user_id: str = "",
 ) -> dict[str, Any] | None:
     """Normalize supported events; task/comment events require an authoritative source."""
-    if event in (_TASK_EVENTS | _COMMENT_EVENTS):
+    if event in _TASK_EVENTS:
+        # Task create/update is not a message: the bot answers only tagged comments.
+        return {
+            "accepted": False, "reason": "not_targeted", "targeted": False,
+            "event": event, "event_id": event_id, "source_domain": source_domain,
+        }
+    if event in _COMMENT_EVENTS:
         if event_source is None:
             raise ValueError("task event source is required")
-        if event in _TASK_EVENTS:
-            return _normalize_task_event(
-                payload, event=event, event_id=event_id, source_domain=source_domain,
-                event_source=event_source,
-            )
         return _normalize_comment_event(
             payload, event=event, event_id=event_id, source_domain=source_domain,
             event_source=event_source, bot_user_id=bot_user_id,

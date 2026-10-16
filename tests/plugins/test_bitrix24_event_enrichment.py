@@ -155,13 +155,13 @@ def test_ingress_author_policy(ingress, author, text, mode, mentioned, reason, e
 
 @pytest.mark.parametrize("event,actor", [("ONTASKADD", "5"), ("ONTASKUPDATE", "6")])
 def test_ingress_task_real_shape(ingress, event, actor):
-    _, handler = ingress
+    source, handler = ingress
+    source.task = TaskFacts("1154", "Задача", "@tux Описание", actor, actor, "99")
     result = json.loads(handler(real_payload(event)))
-    assert result["accepted"] is True
-    assert result["task_title"] == "Задача"
-    assert result["message"] == "Описание"
-    assert result["actor_id"] == actor
-    assert result["targeting"]["mode"] == "project_rule"
+    assert result["accepted"] is False
+    assert result["reason"] == "not_targeted"
+    assert "agent_request" not in result
+    assert source.calls == []
 
 
 @pytest.mark.parametrize("missing,reason", [("task", "task_not_found"), ("chat", "task_not_found"), ("message", "message_not_found")])
