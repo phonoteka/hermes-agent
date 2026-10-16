@@ -30,7 +30,7 @@ class _Source:
         self.messages: dict[str, tuple[str, str, str]] = {}
 
     def get_task(self, task_id):
-        return TaskFacts(task_id, f"Task {task_id}", "", "1", "1", f"9{task_id}")
+        return TaskFacts(task_id, f"Task {task_id}", "", "1", "1", f"9{task_id}", "52")
 
     def get_task_message(self, chat_id, message_id):
         task_id, author, text = self.messages[message_id]
@@ -46,7 +46,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", WEBHOOK)
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", TOKEN)
     monkeypatch.setenv("BITRIX24_BOT_MENTION", "@tux")
-    monkeypatch.delenv("BITRIX24_ALLOWED_GROUP_IDS", raising=False)
+    monkeypatch.setenv("BITRIX24_ALLOWED_GROUP_IDS", "52,54")
     source = _Source()
     from plugins.bitrix24 import ingress
     monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)

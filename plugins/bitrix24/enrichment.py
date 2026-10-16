@@ -20,6 +20,7 @@ class TaskFacts:
     created_by: str
     changed_by: str
     chat_id: str
+    group_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +64,7 @@ class RestBitrix24EventSource:
         try:
             response = self._client.call(
                 "tasks.task.get", taskId=task_id,
-                select=["ID", "TITLE", "DESCRIPTION", "CREATED_BY", "CHANGED_BY", "CHAT_ID"],
+                select=["ID", "TITLE", "DESCRIPTION", "CREATED_BY", "CHANGED_BY", "CHAT_ID", "GROUP_ID"],
             )
         except Exception as exc:
             raise Bitrix24SourceUnavailable("task source unavailable") from exc
@@ -74,6 +75,7 @@ class RestBitrix24EventSource:
         return TaskFacts(
             _text(task.get("id")), _text(task.get("title")), _text(task.get("description")),
             _text(task.get("createdBy")), _text(task.get("changedBy")), _text(task.get("chatId")),
+            _text(task.get("groupId")),
         )
 
     def get_task_message(self, chat_id: str, message_id: str) -> MessageFacts | None:

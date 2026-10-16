@@ -13,6 +13,7 @@ def fake_event_source(monkeypatch):
     from plugins.bitrix24.enrichment import MessageFacts
     source.messages = {str(84 + i): MessageFacts(str(84 + i), "1", text) for i, text in enumerate(_COMMENT_TEXTS)}
     monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    monkeypatch.setenv("BITRIX24_ALLOWED_GROUP_IDS", "52,54")
     return source
 
 import yaml

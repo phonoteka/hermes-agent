@@ -140,6 +140,12 @@ def _payload_dialog_id(payload: dict[str, Any]) -> str:
     return ""
 
 
+def _allowed_group_ids() -> frozenset[str]:
+    """Bitrix24 workgroups whose tasks the bot serves; unset means none (fail closed)."""
+    raw = os.getenv("BITRIX24_ALLOWED_GROUP_IDS", "")
+    return frozenset(part.strip() for part in raw.split(",") if part.strip())
+
+
 def _target_mention() -> str:
     return os.getenv("BITRIX24_BOT_MENTION", _DEFAULT_BOT_MENTION).strip().lower()
 
@@ -255,6 +261,11 @@ def _normalize_comment_event(
     task = event_source.get_task(task_id)
     if task is None or not task.chat_id:
         return {"accepted": False, "reason": "task_not_found"}
+    if task.group_id not in _allowed_group_ids():
+        return {
+            "accepted": False, "targeted": False, "reason": "group_not_allowed", "event": event,
+            "event_id": event_id, "source_domain": source_domain, "task_id": task_id,
+        }
     message = event_source.get_task_message(task.chat_id, message_id)
     if message is None:
         return {"accepted": False, "reason": "message_not_found"}

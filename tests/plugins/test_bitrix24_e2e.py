@@ -12,6 +12,7 @@ def fake_event_source(monkeypatch):
 
     source = FakeEventSource('@hermes сделай краткое резюме и потом mark done')
     monkeypatch.setattr(ingress, "RestBitrix24EventSource", lambda client: source)
+    monkeypatch.setenv("BITRIX24_ALLOWED_GROUP_IDS", "52,54")
     return source
 
 import yaml

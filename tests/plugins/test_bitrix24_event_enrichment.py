@@ -15,7 +15,7 @@ class FakeEventSource:
     """Supply explicit task/message facts without accessing the network."""
 
     def __init__(self, text="@hermes take a look", author_id="1"):
-        self.task = TaskFacts("42", "Webhook smoke", "@hermes review task", "5", "6", "99")
+        self.task = TaskFacts("42", "Webhook smoke", "@hermes review task", "5", "6", "99", "52")
         self.message = MessageFacts("84", author_id, text)
         self.messages = {}
         self.unavailable = False
@@ -50,13 +50,13 @@ class FakeClient:
 def test_rest_task_found():
     client = FakeClient({"result": {"task": {
         "id": "1154", "title": "Задача", "description": "Описание",
-        "createdBy": "5", "changedBy": "6", "chatId": "99",
+        "createdBy": "5", "changedBy": "6", "chatId": "99", "groupId": "54",
     }}})
     assert RestBitrix24EventSource(client).get_task("1154") == TaskFacts(
-        "1154", "Задача", "Описание", "5", "6", "99",
+        "1154", "Задача", "Описание", "5", "6", "99", "54",
     )
     assert client.calls == [("tasks.task.get", {
-        "taskId": "1154", "select": ["ID", "TITLE", "DESCRIPTION", "CREATED_BY", "CHANGED_BY", "CHAT_ID"],
+        "taskId": "1154", "select": ["ID", "TITLE", "DESCRIPTION", "CREATED_BY", "CHANGED_BY", "CHAT_ID", "GROUP_ID"],
     })]
 
 
@@ -113,8 +113,9 @@ def ingress(monkeypatch):
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", "https://example.com/rest/78/fake")
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", "fake-token")
     monkeypatch.setenv("BITRIX24_BOT_MENTION", "@tux")
+    monkeypatch.setenv("BITRIX24_ALLOWED_GROUP_IDS", "52,54")
     source = FakeEventSource()
-    source.task = TaskFacts("1154", "Задача", "Описание", "5", "6", "99")
+    source.task = TaskFacts("1154", "Задача", "Описание", "5", "6", "99", "52")
     handler = _make_webhook_ingress_handler(
         event_source=source, bot_user_id="78", deduper=InProcessEventDeduper(),
         agent_request_from_result=_agent_request_from_result,
@@ -156,7 +157,7 @@ def test_ingress_author_policy(ingress, author, text, mode, mentioned, reason, e
 @pytest.mark.parametrize("event,actor", [("ONTASKADD", "5"), ("ONTASKUPDATE", "6")])
 def test_ingress_task_real_shape(ingress, event, actor):
     source, handler = ingress
-    source.task = TaskFacts("1154", "Задача", "@tux Описание", actor, actor, "99")
+    source.task = TaskFacts("1154", "Задача", "@tux Описание", actor, actor, "99", "52")
     result = json.loads(handler(real_payload(event)))
     assert result["accepted"] is False
     assert result["reason"] == "not_targeted"
@@ -170,12 +171,33 @@ def test_ingress_missing_facts(ingress, missing, reason):
     if missing == "task":
         source.task = None
     elif missing == "chat":
-        source.task = TaskFacts("1154", "Задача", "", "5", "6", "")
+        source.task = TaskFacts("1154", "Задача", "", "5", "6", "", "52")
     else:
         source.message = None
     result = json.loads(handler(real_payload()))
     assert result["accepted"] is False
     assert result["reason"] == reason
+
+
+@pytest.mark.parametrize("allowed,group_id", [("52,54", "17"), ("52,54", ""), ("", "52")])
+def test_ingress_rejects_task_outside_allowed_groups(ingress, monkeypatch, allowed, group_id):
+    source, handler = ingress
+    monkeypatch.setenv("BITRIX24_ALLOWED_GROUP_IDS", allowed)
+    source.task = TaskFacts("1154", "Задача", "", "5", "6", "99", group_id)
+    source.message = MessageFacts("201404", "5", "@tux сделай")
+    result = json.loads(handler(real_payload()))
+    assert result["accepted"] is False
+    assert result["reason"] == "group_not_allowed"
+    assert "agent_request" not in result
+    assert ("message", "99", "201404") not in source.calls
+
+
+@pytest.mark.parametrize("group_id", ["52", "54"])
+def test_ingress_accepts_task_in_allowed_group(ingress, group_id):
+    source, handler = ingress
+    source.task = TaskFacts("1154", "Задача", "", "5", "6", "99", group_id)
+    source.message = MessageFacts("201404", "5", "@tux сделай")
+    assert json.loads(handler(real_payload()))["accepted"] is True
 
 
 def test_ingress_unavailable_does_not_dedup_recovery(ingress):
