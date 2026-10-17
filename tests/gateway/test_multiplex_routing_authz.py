@@ -151,3 +151,27 @@ def test_completion_preflight_runs_in_target_profile_scope(mux):
         return unscoped, scoped
 
     assert asyncio.run(_run()) == ("terminal", "deliver")
+
+
+def test_default_profile_event_keeps_its_session_key_inside_a_routed_turn(mux):
+    """A default-profile process event drained inside a routed secondary turn (post-turn hooks of a
+    bitrix24 turn drain the shared queue) must still be keyed ``agent:main:...``; under the secondary's
+    scope the adapter derived ``agent:ops:...`` and dropped every such wake as misrouted."""
+    from gateway.run import _profile_runtime_scope
+    from gateway.session import build_session_key
+
+    expected = build_session_key(SessionSource(platform=Platform.TELEGRAM, chat_id="-100", chat_type="group"))
+    assert expected.startswith("agent:main:")
+    runner, adapter = mux.runner, mux.primary
+    runner.session_store, runner._session_sources = None, {}
+    adapter.config = runner.config.platforms[Platform.TELEGRAM]
+    adapter._session_store = SimpleNamespace(_resolve_profile_for_key=lambda source: (
+        source.profile if source.profile else __import__("hermes_cli.profiles", fromlist=["x"]).get_active_profile_name()))
+    evt = {"session_key": expected, "platform": "telegram", "chat_type": "group", "chat_id": "-100"}
+
+    async def _derive():
+        async with runner._completion_event_scope(evt):
+            return adapter._source_session_key(runner._build_process_event_source(evt))
+
+    with _profile_runtime_scope(mux.home / "profiles" / "ops"):
+        assert asyncio.run(_derive()) == expected

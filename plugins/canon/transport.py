@@ -160,7 +160,7 @@ async def handle_command(command: str, args: dict[str, Any], *, ctx: Any, task_i
             "command": shlex.join([sys.executable, "-I", str(Path(__file__).with_name("background_runner.py")), path]),
             "background": True, "notify_on_complete": asynchronous, "pty": False,
             "workdir": str(Path(__file__).resolve().parents[2]),
-        }, task_id=task_id))
+        }, task_id=task_id, _host_local=True))
         native_id = started.get("session_id")
         if not native_id or started.get("exit_code") != 0:
             raise CanonTransportError("Canon process was not accepted by native transport")

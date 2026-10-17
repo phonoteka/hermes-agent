@@ -1269,12 +1269,21 @@ class GatewayNotificationsMixin:
         the ROOT scope, so a secondary profile's completion was looked up in the DEFAULT profile's
         state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever."""
         from gateway.run import _async_profile_runtime_scope
-        from hermes_constants import get_hermes_home_override
+        from hermes_constants import get_default_hermes_root, get_hermes_home_override
         source = self._build_process_event_source(evt)
-        if source is None or not getattr(source, "profile", None):
+        if source is None:
             return contextlib.nullcontext()
+        override = get_hermes_home_override()
+        if not getattr(source, "profile", None):
+            # Default-profile event. Its drain can run inside a routed secondary turn (post-turn hooks
+            # of a bitrix-reader turn drain the shared queue), where the ambient override names that
+            # secondary profile; leaving it in place re-keys the default session into the secondary
+            # namespace and the adapter drops the event. Only an unscoped context is already right.
+            if override is None:
+                return contextlib.nullcontext()
+            return _async_profile_runtime_scope(get_default_hermes_root())
         profile_home = self._resolve_profile_home_for_source(source)
-        if get_hermes_home_override() == str(profile_home):
+        if override == str(profile_home):
             return contextlib.nullcontext()
         return _async_profile_runtime_scope(profile_home)
 

@@ -1576,6 +1576,9 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
+        # Dispatch-only kwarg (never part of the model schema): Hermes-owned control-plane callers
+        # such as the Canon plugin transport run their child on the host, not in the profile sandbox.
+        _host_local=kw.get("_host_local", False) is True,
     )
 
 

@@ -310,6 +310,17 @@ def test_real_cli_stdout_and_error_are_unchanged(command, real_context, tmp_path
             assert json.loads(output) == json.loads(direct.stdout)
 
 
+def test_cli_runs_on_host_when_profile_terminal_is_a_sandbox(real_context):
+    """A profile whose terminal runs in a container (no host paths, no Canon) still launches Canon on the host."""
+    from tools.terminal_scope import terminal_scope
+    direct = direct_cli(["validate", str(minimal_workflow())])
+    assert direct.returncode == 0, direct.stderr
+    sandbox = {"TERMINAL_ENV": "docker", "TERMINAL_DOCKER_IMAGE": "hermes-missing-image-for-canon-test:0"}
+    with terminal_scope(sandbox):
+        output = real_context.invoke("canon_validate", {"workflow": str(minimal_workflow()), "timeout_seconds": 30})
+    assert output == direct.stdout
+
+
 def test_real_cli_negative_control_invalid_workflow_matches_cli_error(real_context, tmp_path):
     invalid = tmp_path / "invalid.json"
     invalid.write_text("{}")
