@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from .attachments import _ATTACHMENT_SIZE_CAP_BYTES, _materialize_attachments
 from .client import Bitrix24Client, _get_client
+from .code import _handle_bitrix24_code_read, _handle_bitrix24_code_search
 from .handoff import _agent_request_from_result
 from .ingress import _IngressWebhookCheck, _OutboundWebhookCheck, _make_webhook_ingress_handler
 from .schemas import (
     BITRIX24_CHAT_GET_SCHEMA,
     BITRIX24_CHAT_SEND_SCHEMA,
+    BITRIX24_CODE_READ_SCHEMA,
+    BITRIX24_CODE_SEARCH_SCHEMA,
     BITRIX24_MY_PLAN_STAGES_GET_SCHEMA,
     BITRIX24_MY_PLAN_TASK_MOVE_SCHEMA,
     BITRIX24_STATUS_SCHEMA,
@@ -37,6 +40,20 @@ from .tools import (
 )
 
 _TOOL_SPECS = (
+    {
+        "name": "bitrix24_code_read",
+        "schema": BITRIX24_CODE_READ_SCHEMA,
+        "handler": _handle_bitrix24_code_read,
+        "requires_env": ["BITRIX24_WEBHOOK_URL"],
+        "emoji": "📖",
+    },
+    {
+        "name": "bitrix24_code_search",
+        "schema": BITRIX24_CODE_SEARCH_SCHEMA,
+        "handler": _handle_bitrix24_code_search,
+        "requires_env": ["BITRIX24_WEBHOOK_URL"],
+        "emoji": "🔎",
+    },
     {
         "name": "bitrix24_status",
         "schema": BITRIX24_STATUS_SCHEMA,
