@@ -7,36 +7,6 @@ _POSITIVE_ID_SCHEMA = {
     ]
 }
 
-BITRIX24_CODE_READ_SCHEMA = {
-    "name": "bitrix24_code_read",
-    "description": "Read numbered lines from one tracked source file in a configured Plastinka code root (backend or editor). Only available inside a Bitrix24 task session; read-only, not arbitrary filesystem access.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "root": {"type": "string", "enum": ["backend", "editor"]},
-            "path": {"type": "string", "minLength": 1},
-            "start_line": {"type": "integer", "minimum": 1},
-            "line_count": {"type": "integer", "minimum": 1, "maximum": 100},
-        },
-        "required": ["root", "path"],
-        "additionalProperties": False,
-    },
-}
-
-BITRIX24_CODE_SEARCH_SCHEMA = {
-    "name": "bitrix24_code_search",
-    "description": "Literal case-insensitive search of tracked source in the configured Plastinka backend or editor code root. Only available inside a Bitrix24 task session; returns bounded matching lines, read-only.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "root": {"type": "string", "enum": ["backend", "editor"]},
-            "query": {"type": "string", "minLength": 2, "maxLength": 120},
-        },
-        "required": ["root", "query"],
-        "additionalProperties": False,
-    },
-}
-
 BITRIX24_STATUS_SCHEMA = {
     "name": "bitrix24_status",
     "description": (

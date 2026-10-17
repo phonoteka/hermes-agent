@@ -174,25 +174,23 @@ class TaskWorkflowLaunch:
             "This task has a Canon workflow that analyses the task and models its solution: it "
             "extracts the facts, studies the project code (including the legacy implementation), "
             "asks the questions that remain open and, after the user's decision on its card, "
-            "freezes the task specification. When the comment asks to analyse the task or model "
-            "the solution - for example \"разбери\", \"разбери задачу\", \"смоделируй\", "
-            "\"смоделируй решение\" or an explicit request to run the workflow - do not analyse it yourself: "
+            "freezes the task specification. You cannot read the project code in this session; "
+            "the workflow can. When the comment asks to analyse the task or model the solution - "
+            "for example \"разбери\", \"разбери задачу\", \"смоделируй\", \"смоделируй "
+            "решение\" or an explicit request to run the workflow - do not analyse it yourself: "
             f"{call}"
-            "Then reply with one short sentence that the workflow was started. An ordinary question "
-            "about code, even if it says 'разбери функцию', is not a request to start the task "
-            "workflow. If this conversation shows that a workflow of this task is already waiting "
-            "for a decision, do not start another one unless the comment explicitly asks to restart it; "
-            "the comment is then the decision or a question about that card."
+            "Then reply with one short sentence that the workflow was started. If this "
+            "conversation shows that a workflow of this task is already waiting for a decision, "
+            "do not start another one unless the comment explicitly asks to restart it; the "
+            "comment is then the decision or a question about that card."
         )
 
 
-def _render_prompt(
-    result: Dict[str, Any], launch: Optional[TaskWorkflowLaunch] = None, *, code_access: bool = False,
-) -> str:
-    """Render sanitized facts and configured capabilities for this task turn.
+def _render_prompt(result: Dict[str, Any], launch: Optional[TaskWorkflowLaunch] = None) -> str:
+    """Render the sanitized event facts the agent needs; reply routing is implicit.
 
-    A new task starts the workflow; later task turns receive launch facts and can
-    answer ordinary code questions directly when scoped source access is configured.
+    Every task turn carries the configured workflow launch facts: a task_created event starts the
+    workflow, any other task event may start it on the user's request.
     """
     facts = {
         "event": result.get("event", ""),
@@ -213,14 +211,6 @@ def _render_prompt(
         f"```json\n{json.dumps(compact, ensure_ascii=False, indent=2)[:4000]}\n```"
     )
     task_id = str(result.get("task_id") or "")
-    if task_id and code_access:
-        rendered += (
-            "\n\nFor ordinary questions about the Plastinka code, use bitrix24_code_search "
-            "and bitrix24_code_read with root=backend or root=editor to read the tracked source. "
-            "Answer using exact paths and line numbers. These tools only read code; they cannot "
-            "write files or run commands. Do not start the Canon workflow for a free-form code "
-            "question unless the user explicitly requests task analysis or solution modeling."
-        )
     if launch is not None and task_id:
         created = (result.get("targeting") or {}).get("mode") == TASK_CREATED
         rendered += "\n\n" + launch.instruction(task_id, created=created)
@@ -267,12 +257,6 @@ class Bitrix24Adapter(BasePlatformAdapter):
         self._capture_path: Optional[Path] = Path(capture) if capture else None
         self._runner: Optional[web.AppRunner] = None
         self._task_workflow = TaskWorkflowLaunch.from_extra(extra)
-        roots = extra.get("code_roots")
-        self._code_access = (
-            isinstance(roots, dict)
-            and all(isinstance(roots.get(name), str) and Path(roots[name]).is_absolute()
-                    for name in ("backend", "editor"))
-        )
         self._ingress = _make_webhook_ingress_handler(
             materialize_attachments=_materialize_attachments,
             agent_request_from_result=_agent_request_from_result,
@@ -351,8 +335,7 @@ class Bitrix24Adapter(BasePlatformAdapter):
             message_id=str(result.get("message_id") or event_id) or None,
         )
         event = MessageEvent(
-            text=_render_prompt(result, self._task_workflow, code_access=self._code_access),
-            message_type=MessageType.TEXT, source=source,
+            text=_render_prompt(result, self._task_workflow), message_type=MessageType.TEXT, source=source,
             raw_message=result, message_id=str(result.get("message_id") or event_id) or None,
         )
         logger.info("[bitrix24] event=%s event_id=%s address=%s", result.get("event"), event_id, chat_id)

@@ -94,13 +94,11 @@ def _created(event_id: str, task_id: str) -> bytes:
     }).encode()
 
 
-async def _adapter(port: int, task_workflow: dict | None = None, code_roots: dict | None = None):
+async def _adapter(port: int, task_workflow: dict | None = None):
     from plugins.bitrix24.platform import Bitrix24Adapter
     extra = {"host": "127.0.0.1", "port": port}
     if task_workflow is not None:
         extra["task_workflow"] = task_workflow
-    if code_roots is not None:
-        extra["code_roots"] = code_roots
     adapter = Bitrix24Adapter(PlatformConfig(enabled=True, extra=extra))
     events = []
 
@@ -294,29 +292,6 @@ async def test_new_task_of_served_group_starts_its_workflow_in_the_task_session(
     assert _canon_run_arguments(tagged.text) == _canon_run_arguments(created.text)
     assert "A new task was created" not in tagged.text
     assert "смоделируй решение" in tagged.text
-
-
-@pytest.mark.asyncio
-async def test_existing_task_comment_can_ask_about_code_without_losing_workflow_launch(env):
-    env.source.messages = {"704": ("1180", "1", "@tux разбери функцию каталога")}
-    port = _free_port()
-    adapter, events = await _adapter(
-        port, {"workflow": WORKFLOW, "execution_root": EXECUTION_ROOT},
-        {"backend": EXECUTION_ROOT, "editor": "/var/www/editor.dev.plastinka.com"},
-    )
-    try:
-        status, _ = await _post(port, _comment("c7", "1180", "704"))
-        await _drain(adapter)
-    finally:
-        await adapter.disconnect()
-    assert status == 202
-    assert len(events) == 1
-    assert "bitrix24_code_search" in events[0].text
-    assert "bitrix24_code_read" in events[0].text
-    assert "ordinary question" in events[0].text
-    assert _canon_run_arguments(events[0].text)["workflow_input_json"] == {
-        "taskInput": {"bitrixTaskId": "1180"},
-    }
 
 
 @pytest.mark.asyncio

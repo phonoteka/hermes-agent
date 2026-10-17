@@ -6,8 +6,6 @@ kind: standalone
 requires_env:
   - BITRIX24_WEBHOOK_URL
 provides_tools:
-  - bitrix24_code_read
-  - bitrix24_code_search
   - bitrix24_status
   - bitrix24_webhook_ingress
   - bitrix24_task_create

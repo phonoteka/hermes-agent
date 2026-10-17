@@ -22,8 +22,6 @@ class _CapturingContext:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_MANIFEST = REPO_ROOT / "plugins" / "bitrix24" / "plugin.yaml"
 ALL_BITRIX24_TOOLS = {
-    "bitrix24_code_read",
-    "bitrix24_code_search",
     "bitrix24_status",
     "bitrix24_webhook_ingress",
     "bitrix24_task_create",
@@ -40,8 +38,6 @@ ALL_BITRIX24_TOOLS = {
     "bitrix24_my_plan_task_move",
 }
 TASK_SURFACE_WITHOUT_TOKEN = {
-    "bitrix24_code_read",
-    "bitrix24_code_search",
     "bitrix24_status",
     "bitrix24_task_create",
     "bitrix24_task_get",
@@ -105,8 +101,6 @@ def test_bitrix24_manifest_requires_env_reflects_plugin_minimum_not_ingress_toke
 def test_bitrix24_registered_requires_env_keeps_ingress_token_specific():
     tools = {tool["name"]: tool for tool in _registered_tools()}
 
-    assert tools["bitrix24_code_read"]["requires_env"] == ["BITRIX24_WEBHOOK_URL"]
-    assert tools["bitrix24_code_search"]["requires_env"] == ["BITRIX24_WEBHOOK_URL"]
     assert tools["bitrix24_webhook_ingress"]["requires_env"] == [
         "BITRIX24_WEBHOOK_URL",
         "BITRIX24_APPLICATION_TOKEN",
