@@ -68,6 +68,27 @@ def test_profile_digest_ignores_generated_python_cache_but_tracks_skill_source(t
         runtime._profile_digest(profile, config)
 
 
+def test_profile_digest_ignores_skill_runtime_state_outside_skill_packages(tmp_path):
+    profile = tmp_path / "profile"
+    skills = profile / "skills"
+    skill = skills / "category" / "fixture" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("source", encoding="utf-8")
+    config = {"model": {"provider": "openrouter", "default": "fixture-model"}}
+    first = runtime._profile_digest(profile, config)
+
+    (skills / ".usage.json").write_text('{"fixture": {"use_count": 1}}', encoding="utf-8")
+    (skills / ".usage.json.lock").write_text("", encoding="utf-8")
+    (skills / ".curator_state").write_text("{}", encoding="utf-8")
+    (skills / ".archive" / "old").mkdir(parents=True)
+    (skills / ".archive" / "old" / "SKILL.md").write_text("archived", encoding="utf-8")
+
+    assert runtime._profile_digest(profile, config) == first
+    (skill.parent / "references").mkdir()
+    (skill.parent / "references" / "notes.md").write_text("changed", encoding="utf-8")
+    assert runtime._profile_digest(profile, config) != first
+
+
 def _assert_continuation_request_contract():
     names = {item.name for item in fields(runtime.ProfileAgentSessionRequest)}
     assert {

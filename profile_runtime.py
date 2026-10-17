@@ -340,12 +340,28 @@ def _canonical(value: Any) -> bytes:
 
 
 def _profile_digest(profile_home: Path, config: Mapping[str, Any]) -> str:
+    """Digest profile config plus skill package sources only.
+
+    Runtime state kept beside skills (usage telemetry, curator state, archives) changes on
+    every skill load and is not profile identity, so only files inside a skill package
+    (a directory with SKILL.md) outside scanner-excluded dirs are hashed.
+    """
+    from agent.skill_utils import EXCLUDED_SKILL_DIRS
+
     skills = []
     skills_dir = profile_home / "skills"
     if skills_dir.is_dir():
+        skill_roots = {
+            marker.parent for marker in skills_dir.rglob("SKILL.md")
+            if not any(part in EXCLUDED_SKILL_DIRS for part in marker.relative_to(skills_dir).parts)
+        }
         for path in sorted(item for item in skills_dir.rglob("*") if item.is_file()):
             skill_path = path.relative_to(skills_dir)
             if "__pycache__" in skill_path.parts or path.suffix in {".pyc", ".pyo"}:
+                continue
+            if any(part in EXCLUDED_SKILL_DIRS for part in skill_path.parts):
+                continue
+            if not any(root == path.parent or root in path.parents for root in skill_roots):
                 continue
             skills.append({"path": path.relative_to(profile_home).as_posix(), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
     manifest = {"config": _safe_snapshot(config), "skills": skills}
