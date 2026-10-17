@@ -5809,6 +5809,8 @@ class TestCredentialPoolRecovery:
         next_entry = SimpleNamespace(label="secondary")
 
         class _Pool:
+            provider = agent.provider
+
             def current(self):
                 return SimpleNamespace(label="primary")
 

@@ -427,6 +427,53 @@ class TestFailureAttribution:
 
 
 
+    def test_anthropic_first_429_rotates_and_survives_new_turn(self, tmp_path, monkeypatch):
+        """An account limit must not wait ten minutes or reset on interruption."""
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import load_pool
+
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "limited-key"), self._entry(1, "available-key")],
+        )
+        selected = pool.select()
+        assert selected is not None and selected.id == "cred-0"
+        agent = self._agent(pool, failing_key="limited-key", credential_id="cred-0")
+        result = recover_with_credential_pool(
+            agent, status_code=429, has_retried_429=False,
+            error_context={
+                "reason": "rate_limit_error",
+                "message": "This request would exceed your account's rate limit. Please try again later.",
+                "reset_at": time.time() + 3600,
+            },
+        )
+
+        assert result == (True, False)
+        assert agent._swap_credential.call_args[0][0].id == "cred-1"
+        assert self._statuses(pool)["cred-0"] == "exhausted"
+        assert self._statuses(pool)["cred-1"] != "exhausted"
+        # A new process/turn must consume the persisted cooldown, not repeat
+        # the first failure against the same higher-priority account.
+        selected = load_pool("anthropic").select()
+        assert selected is not None and selected.id == "cred-1"
+
+    def test_anthropic_first_429_without_alternative_does_not_spin(self, tmp_path, monkeypatch):
+        """Exhaustion persists even when no replacement can be dispatched."""
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+        from agent.credential_pool import load_pool
+
+        pool = self._make_pool(tmp_path, monkeypatch, [self._entry(0, "limited-key")])
+        agent = self._agent(pool, failing_key="limited-key", credential_id="cred-0")
+        assert recover_with_credential_pool(
+            agent, status_code=429, has_retried_429=False,
+        ) == (False, True)
+        assert self._statuses(pool)["cred-0"] == "exhausted"
+        assert load_pool("anthropic").select() is None
+        assert recover_with_credential_pool(
+            agent, status_code=429, has_retried_429=True,
+        ) == (False, True)
+        agent._swap_credential.assert_not_called()
+
     def test_pre_exhausted_check_uses_failing_key(self, tmp_path, monkeypatch):
         """The 'already exhausted → rotate immediately' check must inspect the
         failing entry, not pool.current(): first 429 on an already-exhausted

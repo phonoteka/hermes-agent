@@ -781,7 +781,10 @@ def _recover_rate_limit(pool, *, has_retried_429, error_context, api_key_hint, c
         usage_limit_reached = any(t in context_reason for t in _USAGE_LIMIT_REASON_TOKENS) or any(
             t in context_message for t in _USAGE_LIMIT_MESSAGE_TOKENS
         )
-    if not has_retried_429 and not usage_limit_reached:
+    # Anthropic account limits can carry an hours-long Retry-After. Persist
+    # the failed credential and try the next account before entering backoff;
+    # otherwise an interrupted wait restarts the same failing account forever.
+    if pool.provider != "anthropic" and not has_retried_429 and not usage_limit_reached:
         return False, True
     return (True, False) if rotate_and_swap(429, "rate limit") else (False, True)
 
@@ -792,7 +795,8 @@ def recover_with_credential_pool(
     error_context: Optional[Dict[str, Any]] = None, billing_unverified: bool = False,
 ) -> tuple[bool, bool]:
     """Attempt credential recovery via pool rotation; returns (recovered, has_retried_429).
-    Rate limits: retry once, then rotate. Billing: rotate immediately. Auth: refresh before
+    Rate limits: Anthropic rotates immediately; others retry once, then rotate.
+    Billing: rotate immediately. Auth: refresh before
     rotating. ``classified_reason`` beats raw HTTP codes (e.g. Anthropic 400 "out of extra
     usage"); ``billing_unverified`` gives the entry a short cooldown, not the one-hour bench."""
     pool = agent._credential_pool
