@@ -154,15 +154,37 @@ def test_ingress_author_policy(ingress, author, text, mode, mentioned, reason, e
         assert result["agent_request"]["comments"][0]["message"] == text
 
 
-@pytest.mark.parametrize("event,actor", [("ONTASKADD", "5"), ("ONTASKUPDATE", "6")])
-def test_ingress_task_real_shape(ingress, event, actor):
+def test_ingress_task_update_is_not_a_turn(ingress):
     source, handler = ingress
-    source.task = TaskFacts("1154", "Задача", "@tux Описание", actor, actor, "99", "52")
-    result = json.loads(handler(real_payload(event)))
+    source.task = TaskFacts("1154", "Задача", "@tux Описание", "6", "6", "99", "52")
+    result = json.loads(handler(real_payload("ONTASKUPDATE")))
     assert result["accepted"] is False
     assert result["reason"] == "not_targeted"
-    assert "agent_request" not in result
     assert source.calls == []
+
+
+@pytest.mark.parametrize("group_id", ["52", "54"])
+def test_ingress_new_task_of_served_group_is_accepted(ingress, group_id):
+    source, handler = ingress
+    source.task = TaskFacts("1154", "Задача", "Описание без тега", "5", "5", "99", group_id)
+    result = json.loads(handler(real_payload("ONTASKADD")))
+    assert result["accepted"] is True
+    assert result["targeting"]["mode"] == "task_created"
+    assert result["task_id"] == "1154"
+    assert result["task_title"] == "Задача"
+    assert result["task_description"] == "Описание без тега"
+    assert result["group_id"] == group_id
+    assert result["author_id"] == "5"
+    assert source.calls == [("task", "1154")]
+
+
+@pytest.mark.parametrize("group_id", ["17", ""])
+def test_ingress_new_task_of_other_group_is_rejected(ingress, group_id):
+    source, handler = ingress
+    source.task = TaskFacts("1154", "Задача", "", "5", "5", "99", group_id)
+    result = json.loads(handler(real_payload("ONTASKADD")))
+    assert result["accepted"] is False
+    assert result["reason"] == "group_not_allowed"
 
 
 @pytest.mark.parametrize("missing,reason", [("task", "task_not_found"), ("chat", "task_not_found"), ("message", "message_not_found")])

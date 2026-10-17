@@ -1012,6 +1012,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     "unsupported_event": 200,
                     "not_targeted": 200,
                     "project_not_allowed": 200,
+                    "group_not_allowed": 200,
                     "duplicate_event": 200,
                     "task_not_found": 200,
                     "message_not_found": 200,
@@ -1023,6 +1024,13 @@ class WebhookAdapter(BasePlatformAdapter):
                 if status in {401, 403, 502, 503}:
                     body = {"error": reason or "invalid_payload"}
                 return web.json_response(body, status=status), payload
+
+        if (result.get("targeting") or {}).get("mode") == "task_created":
+            # Starting a task workflow belongs to the Bitrix24 platform plugin, which owns the
+            # task session and its configured workflow; this per-event route has neither.
+            return web.json_response(
+                {"status": "ignored", "reason": "task_workflow_not_configured"}, status=200
+            ), payload
 
         now = time.time()
         if not self._record_rate_limit_hit("bitrix24", now):

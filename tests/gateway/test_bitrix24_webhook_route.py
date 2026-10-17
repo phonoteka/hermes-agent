@@ -75,6 +75,7 @@ def bitrix_env(monkeypatch):
     monkeypatch.setenv("BITRIX24_WEBHOOK_URL", EXPECTED_WEBHOOK_URL)
     monkeypatch.setenv("BITRIX24_APPLICATION_TOKEN", EXPECTED_TOKEN)
     monkeypatch.setenv("BITRIX24_BOT_MENTION", "@hermes")
+    monkeypatch.setenv("BITRIX24_ALLOWED_GROUP_IDS", "52,54")
     from plugins.bitrix24 import ingress
     from tests.plugins.test_bitrix24_event_enrichment import FakeEventSource
     source = FakeEventSource()
@@ -557,7 +558,7 @@ async def test_bitrix24_route_real_comment_shape_author_and_tag_policy(
     bitrix_env, author_id, text, message_id, expected_status, expected_body, dispatched_mode,
 ):
     from plugins.bitrix24.enrichment import MessageFacts, TaskFacts
-    bitrix_env.task = TaskFacts("42", "Настоящая задача", "", "5", "5", "99")
+    bitrix_env.task = TaskFacts("42", "Настоящая задача", "", "5", "5", "99", "52")
     bitrix_env.message = MessageFacts(message_id, author_id, text)
     adapter = _make_adapter(bitrix24_enabled=True)
     client, captured = await _capturing_client(adapter)
@@ -603,9 +604,22 @@ async def test_bitrix24_route_source_unavailable_is_502_and_retry_is_not_deduped
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("event", ["ONTASKADD", "ONTASKUPDATE"])
+async def test_bitrix24_route_leaves_new_task_workflow_to_platform_plugin(bitrix_env):
+    """This per-event route never starts a task workflow; the Bitrix24 platform plugin owns it."""
+    adapter = _make_adapter(bitrix24_enabled=True)
+    client, dispatched = await _capturing_client(adapter)
+    async with client as cli:
+        resp = await cli.post("/bitrix24/webhook", json=_bitrix_payload(event="ONTASKADD", event_id="evt-add"))
+        assert resp.status == 200
+        assert (await resp.json())["reason"] == "task_workflow_not_configured"
+        await asyncio.sleep(0)
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", ["ONTASKUPDATE"])
 async def test_bitrix24_route_ignores_task_events_even_with_tag(bitrix_env, event):
-    """Only tagged comments reach the agent; task create/update never dispatches."""
+    """Only tagged comments reach the agent; task updates never dispatch."""
     adapter = _make_adapter(bitrix24_enabled=True)
     client, dispatched = await _capturing_client(adapter)
     async with client as cli:

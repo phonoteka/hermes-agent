@@ -28,9 +28,10 @@ class _Source:
 
     def __init__(self) -> None:
         self.messages: dict[str, tuple[str, str, str]] = {}
+        self.groups: dict[str, str] = {}
 
     def get_task(self, task_id):
-        return TaskFacts(task_id, f"Task {task_id}", "", "1", "1", f"9{task_id}", "52")
+        return TaskFacts(task_id, f"Task {task_id}", "", "1", "1", f"9{task_id}", self.groups.get(task_id, "52"))
 
     def get_task_message(self, chat_id, message_id):
         task_id, author, text = self.messages[message_id]
@@ -79,9 +80,26 @@ def _comment(event_id: str, task_id: str, message_id: str, token: str = TOKEN) -
     }).encode()
 
 
-async def _adapter(port: int):
+WORKFLOW = "/srv/canon/solution_modeling_workflow_pack/workflow.json"
+EXECUTION_ROOT = "/srv/project"
+
+
+def _created(event_id: str, task_id: str) -> bytes:
+    return urlencode({
+        "event": "ONTASKADD",
+        "event_id": event_id,
+        "data[FIELDS_AFTER][ID]": task_id,
+        "auth[application_token]": TOKEN,
+        "auth[domain]": DOMAIN,
+    }).encode()
+
+
+async def _adapter(port: int, task_workflow: dict | None = None):
     from plugins.bitrix24.platform import Bitrix24Adapter
-    adapter = Bitrix24Adapter(PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "port": port}))
+    extra = {"host": "127.0.0.1", "port": port}
+    if task_workflow is not None:
+        extra["task_workflow"] = task_workflow
+    adapter = Bitrix24Adapter(PlatformConfig(enabled=True, extra=extra))
     events = []
 
     async def _handler(event):
@@ -233,3 +251,66 @@ async def test_register_and_injection_reach_task_session(env, tmp_path):
     assert len(delivered) == 1
     assert delivered[0].source.chat_id == "task:42"
     assert "task:42" in session.session_key
+
+
+def _canon_run_arguments(prompt: str) -> dict:
+    block = prompt.split("call canon_run with exactly these arguments:\n```json\n", 1)[1]
+    return json.loads(block.split("\n```", 1)[0])
+
+
+@pytest.mark.asyncio
+async def test_new_task_of_served_group_starts_its_workflow_in_the_task_session(env):
+    env.source.groups = {"1190": "54", "1191": "17"}
+    env.source.messages = {"701": ("1190", "1", "@tux вопрос")}
+    port = _free_port()
+    adapter, events = await _adapter(port, {"workflow": WORKFLOW, "execution_root": EXECUTION_ROOT})
+    try:
+        served = await _post(port, _created("c1", "1190"))
+        foreign = await _post(port, _created("c2", "1191"))
+        comment = await _post(port, _comment("c3", "1190", "701"))
+        await _drain(adapter)
+    finally:
+        await adapter.disconnect()
+    assert served[0] == 202
+    assert foreign == (200, {"status": "ignored", "reason": "group_not_allowed"})
+    assert comment[0] == 202
+    assert len(events) == 2
+    created, tagged = events
+    assert _key(created) == _key(tagged)
+    assert created.source.chat_id == "task:1190"
+    assert _canon_run_arguments(created.text) == {
+        "workflow": WORKFLOW,
+        "execution_root": EXECUTION_ROOT,
+        "mode": "production",
+        "wait_mode": "async-no-wait",
+        "workflow_input_json": {"taskInput": {"bitrixTaskId": "1190"}},
+        "human_gate_delivery": (
+            "Post the card as your reply in this Bitrix24 task session (it becomes a task comment). "
+            "The decision arrives later as a comment mentioning the bot; do not use clarify."
+        ),
+    }
+    assert "canon_run" not in tagged.text
+
+
+@pytest.mark.asyncio
+async def test_new_task_without_configured_workflow_is_not_dispatched(env):
+    port = _free_port()
+    adapter, events = await _adapter(port)
+    try:
+        result = await _post(port, _created("c4", "1192"))
+        await _drain(adapter)
+    finally:
+        await adapter.disconnect()
+    assert result == (200, {"status": "ignored", "reason": "task_workflow_not_configured"})
+    assert events == []
+
+
+@pytest.mark.parametrize("task_workflow", [
+    {"workflow": "relative/workflow.json", "execution_root": EXECUTION_ROOT},
+    {"workflow": WORKFLOW},
+    "workflow.json",
+])
+def test_incomplete_task_workflow_config_is_rejected(env, task_workflow):
+    from plugins.bitrix24.platform import Bitrix24Adapter
+    with pytest.raises(ValueError):
+        Bitrix24Adapter(PlatformConfig(enabled=True, extra={"task_workflow": task_workflow}))

@@ -16,6 +16,7 @@ import json
 import logging
 import re
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -53,6 +54,7 @@ _STATUS_BY_REASON = {
     "unsupported_event": 200,
     "not_targeted": 200,
     "project_not_allowed": 200,
+    "group_not_allowed": 200,
     "duplicate_event": 200,
     "task_not_found": 200,
     "message_not_found": 200,
@@ -65,8 +67,21 @@ PLATFORM_HINT = (
     "You are talking inside a Bitrix24 task (or chat). Each conversation is bound to one task and "
     "keeps its history across comments. Your normal reply is posted to that task as a comment "
     "automatically; do not also post it with bitrix24_task_comment_add. Bitrix24 shows BBCode: keep "
-    "formatting simple (bold, italic, code, links). You are woken only by comments that mention the "
-    "bot; read the task with bitrix24_task_comments when you need the full discussion."
+    "formatting simple (bold, italic, code, links). You are woken by: a new task of a served group "
+    "(start its workflow as instructed), a Canon Human Gate wake for this task's workflow (post the "
+    "card as your reply and wait), and comments that mention the bot. Never use clarify here: the "
+    "user answers only with a new comment. Read a tagged comment in the context of this "
+    "conversation: when a Canon Human Gate of this task is waiting, a comment that approves, asks "
+    "for changes or stops is the user's decision - pass it to canon_checkpoint continue-paused with "
+    "the stored continuePaused request (approve; revise with the user's corrections as "
+    "revisionInstructions; abort); any other comment is a question or request to answer directly. "
+    "When it is unclear whether a comment is a gate decision, ask in your reply instead of "
+    "deciding. Read the task with bitrix24_task_comments when you need the full discussion."
+)
+TASK_CREATED = "task_created"
+HUMAN_GATE_DELIVERY = (
+    "Post the card as your reply in this Bitrix24 task session (it becomes a task comment). "
+    "The decision arrives later as a comment mentioning the bot; do not use clarify."
 )
 
 
@@ -107,8 +122,54 @@ def _address_for(result: Dict[str, Any]) -> Optional[tuple[str, str]]:
     return None
 
 
-def _render_prompt(result: Dict[str, Any]) -> str:
-    """Render the sanitized event facts the agent needs; reply routing is implicit."""
+@dataclass(frozen=True, slots=True)
+class TaskWorkflowLaunch:
+    """Canon workflow every new task of a served group starts with.
+
+    Invariant: both paths are absolute; the workflow file and execution root are owned by config
+    ``platforms.bitrix24.extra.task_workflow`` and are not guessed by the agent.
+    """
+
+    workflow: str
+    execution_root: str
+
+    @classmethod
+    def from_extra(cls, extra: Dict[str, Any]) -> Optional["TaskWorkflowLaunch"]:
+        """Read ``task_workflow``; None when absent; ValueError when present but incomplete."""
+        raw = extra.get("task_workflow")
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError("platforms.bitrix24.extra.task_workflow must be a mapping")
+        workflow = str(raw.get("workflow") or "").strip()
+        execution_root = str(raw.get("execution_root") or "").strip()
+        if not workflow.startswith("/") or not execution_root.startswith("/"):
+            raise ValueError("task_workflow needs absolute workflow and execution_root paths")
+        return cls(workflow=workflow, execution_root=execution_root)
+
+    def instruction(self, task_id: str) -> str:
+        """The exact first action for a newly created task."""
+        arguments = {
+            "workflow": self.workflow,
+            "execution_root": self.execution_root,
+            "mode": "production",
+            "wait_mode": "async-no-wait",
+            "workflow_input_json": {"taskInput": {"bitrixTaskId": task_id}},
+            "human_gate_delivery": HUMAN_GATE_DELIVERY,
+        }
+        return (
+            "A new task was created. Start its workflow now: call canon_run with exactly these "
+            f"arguments:\n```json\n{json.dumps(arguments, ensure_ascii=False, indent=2)}\n```\n"
+            "Then reply with one short sentence that the task was taken into work. The workflow "
+            "will wake this session with a card when it needs the user's decision."
+        )
+
+
+def _render_prompt(result: Dict[str, Any], launch: Optional[TaskWorkflowLaunch] = None) -> str:
+    """Render the sanitized event facts the agent needs; reply routing is implicit.
+
+    A task_created event additionally carries the configured workflow launch instruction.
+    """
     facts = {
         "event": result.get("event", ""),
         "event_id": result.get("event_id", ""),
@@ -118,13 +179,18 @@ def _render_prompt(result: Dict[str, Any]) -> str:
         "message_id": result.get("message_id", ""),
         "author_id": result.get("author_id", "") or result.get("actor_id", ""),
         "message": result.get("message", ""),
+        "task_description": result.get("task_description", ""),
+        "group_id": result.get("group_id", ""),
         "attachments": result.get("attachments", []),
     }
     compact = {key: value for key, value in facts.items() if value not in (None, "", [], {})}
-    return (
+    rendered = (
         "Bitrix24 message for you. Your reply will be posted back here automatically.\n\n"
         f"```json\n{json.dumps(compact, ensure_ascii=False, indent=2)[:4000]}\n```"
     )
+    if (result.get("targeting") or {}).get("mode") == TASK_CREATED and launch is not None:
+        rendered += "\n\n" + launch.instruction(str(result.get("task_id") or ""))
+    return rendered
 
 
 def _redact_capture_payload(payload: dict) -> dict:
@@ -166,6 +232,7 @@ class Bitrix24Adapter(BasePlatformAdapter):
         capture = extra.get("capture_path")
         self._capture_path: Optional[Path] = Path(capture) if capture else None
         self._runner: Optional[web.AppRunner] = None
+        self._task_workflow = TaskWorkflowLaunch.from_extra(extra)
         self._ingress = _make_webhook_ingress_handler(
             materialize_attachments=_materialize_attachments,
             agent_request_from_result=_agent_request_from_result,
@@ -229,6 +296,9 @@ class Bitrix24Adapter(BasePlatformAdapter):
                     else {"status": "ignored", "reason": reason or "invalid_payload"})
             return web.json_response(body, status=status), payload
 
+        if (result.get("targeting") or {}).get("mode") == TASK_CREATED and self._task_workflow is None:
+            return web.json_response({"status": "ignored", "reason": "task_workflow_not_configured"},
+                                     status=200), payload
         address = _address_for(result)
         if address is None:
             return web.json_response({"status": "ignored", "reason": "no_task_or_dialog"}, status=200), payload
@@ -241,7 +311,7 @@ class Bitrix24Adapter(BasePlatformAdapter):
             message_id=str(result.get("message_id") or event_id) or None,
         )
         event = MessageEvent(
-            text=_render_prompt(result), message_type=MessageType.TEXT, source=source,
+            text=_render_prompt(result, self._task_workflow), message_type=MessageType.TEXT, source=source,
             raw_message=result, message_id=str(result.get("message_id") or event_id) or None,
         )
         logger.info("[bitrix24] event=%s event_id=%s address=%s", result.get("event"), event_id, chat_id)

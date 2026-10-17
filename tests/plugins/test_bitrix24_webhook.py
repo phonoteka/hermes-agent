@@ -348,7 +348,7 @@ def test_bitrix24_webhook_dedups_across_two_handler_instances_in_same_process(mo
     }
 
 
-@pytest.mark.parametrize("event", ["ONTASKADD", "ONTASKUPDATE"])
+@pytest.mark.parametrize("event", ["ONTASKUPDATE"])
 def test_bitrix24_webhook_ignores_task_events_even_with_tag_in_description(
     ingress_tool,
     fake_event_source,

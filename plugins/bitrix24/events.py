@@ -17,7 +17,8 @@ SUPPORTED_EVENTS = {
 }
 
 _DEFAULT_BOT_MENTION = "@hermes"
-_TASK_EVENTS = {"ONTASKADD", "ONTASKUPDATE"}
+_TASK_CREATED_EVENT = "ONTASKADD"
+_TASK_EVENTS = {_TASK_CREATED_EVENT, "ONTASKUPDATE"}
 _COMMENT_EVENTS = {"ONTASKCOMMENTADD", "ONTASKCOMMENTUPDATE"}
 _CHAT_EVENTS = {"ONIMCONNECTORMESSAGEADD", "ONIMBOTMESSAGEADD"}
 _MENTION_EVENTS = _COMMENT_EVENTS | _CHAT_EVENTS
@@ -288,6 +289,37 @@ def _normalize_comment_event(
     return result
 
 
+def _normalize_task_created_event(
+    payload: dict[str, Any], *, event: str, event_id: str, source_domain: str,
+    event_source: Bitrix24EventSource,
+) -> dict[str, Any] | None:
+    """Accept a newly created task of an allowed workgroup as the first turn of its task session.
+
+    pre: event is ONTASKADD with FIELDS_AFTER.ID; event_source reads the authoritative task.
+    post: tasks outside BITRIX24_ALLOWED_GROUP_IDS are rejected as group_not_allowed; an accepted
+          result carries task id, title, description, group and creator for the session prompt.
+    raises: Bitrix24SourceUnavailable when the task cannot be read.
+    """
+    task_id = _optional_text(_payload_fields(payload).get("ID"))
+    if not task_id:
+        return None
+    task = event_source.get_task(task_id)
+    if task is None:
+        return {"accepted": False, "reason": "task_not_found"}
+    if task.group_id not in _allowed_group_ids():
+        return {
+            "accepted": False, "targeted": False, "reason": "group_not_allowed", "event": event,
+            "event_id": event_id, "source_domain": source_domain, "task_id": task_id,
+        }
+    result = _accepted_event_response(
+        payload=payload, event=event, event_id=event_id, source_domain=source_domain,
+        object_id=task_id, targeting_mode="task_created", task_id=task_id,
+    )
+    result.update(task_title=task.title, task_description=task.description,
+                  group_id=task.group_id, author_id=task.created_by)
+    return result
+
+
 def _normalize_comment_or_chat_event(
     payload: dict[str, Any], *, event: str, event_id: str, source_domain: str
 ) -> dict[str, Any] | None:
@@ -329,8 +361,15 @@ def _normalize_supported_event(
     event_source: Bitrix24EventSource | None = None, bot_user_id: str = "",
 ) -> dict[str, Any] | None:
     """Normalize supported events; task/comment events require an authoritative source."""
+    if event == _TASK_CREATED_EVENT:
+        if event_source is None:
+            raise ValueError("task event source is required")
+        return _normalize_task_created_event(
+            payload, event=event, event_id=event_id, source_domain=source_domain,
+            event_source=event_source,
+        )
     if event in _TASK_EVENTS:
-        # Task create/update is not a message: the bot answers only tagged comments.
+        # A task update is not a message: the bot answers only tagged comments.
         return {
             "accepted": False, "reason": "not_targeted", "targeted": False,
             "event": event, "event_id": event_id, "source_domain": source_domain,
