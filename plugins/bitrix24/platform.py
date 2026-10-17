@@ -147,9 +147,9 @@ class TaskWorkflowLaunch:
             raise ValueError("task_workflow needs absolute workflow and execution_root paths")
         return cls(workflow=workflow, execution_root=execution_root)
 
-    def instruction(self, task_id: str) -> str:
-        """The exact first action for a newly created task."""
-        arguments = {
+    def arguments(self, task_id: str) -> Dict[str, Any]:
+        """The exact canon_run arguments that start this task's workflow."""
+        return {
             "workflow": self.workflow,
             "execution_root": self.execution_root,
             "mode": "production",
@@ -157,18 +157,40 @@ class TaskWorkflowLaunch:
             "workflow_input_json": {"taskInput": {"bitrixTaskId": task_id}},
             "human_gate_delivery": HUMAN_GATE_DELIVERY,
         }
+
+    def instruction(self, task_id: str, *, created: bool) -> str:
+        """Launch facts for one task turn: start now for a new task, start on request otherwise."""
+        call = (
+            "call canon_run with exactly these arguments (do not change, shorten or add any):\n"
+            f"```json\n{json.dumps(self.arguments(task_id), ensure_ascii=False, indent=2)}\n```\n"
+        )
+        if created:
+            return (
+                f"A new task was created. Start its workflow now: {call}"
+                "Then reply with one short sentence that the task was taken into work. The workflow "
+                "will wake this session with a card when it needs the user's decision."
+            )
         return (
-            "A new task was created. Start its workflow now: call canon_run with exactly these "
-            f"arguments:\n```json\n{json.dumps(arguments, ensure_ascii=False, indent=2)}\n```\n"
-            "Then reply with one short sentence that the task was taken into work. The workflow "
-            "will wake this session with a card when it needs the user's decision."
+            "This task has a Canon workflow that analyses the task and models its solution: it "
+            "extracts the facts, studies the project code (including the legacy implementation), "
+            "asks the questions that remain open and, after the user's decision on its card, "
+            "freezes the task specification. You cannot read the project code in this session; "
+            "the workflow can. When the comment asks to analyse the task or model the solution - "
+            "for example \"разбери\", \"разбери задачу\", \"смоделируй\", \"смоделируй "
+            "решение\" or an explicit request to run the workflow - do not analyse it yourself: "
+            f"{call}"
+            "Then reply with one short sentence that the workflow was started. If this "
+            "conversation shows that a workflow of this task is already waiting for a decision, "
+            "do not start another one unless the comment explicitly asks to restart it; the "
+            "comment is then the decision or a question about that card."
         )
 
 
 def _render_prompt(result: Dict[str, Any], launch: Optional[TaskWorkflowLaunch] = None) -> str:
     """Render the sanitized event facts the agent needs; reply routing is implicit.
 
-    A task_created event additionally carries the configured workflow launch instruction.
+    Every task turn carries the configured workflow launch facts: a task_created event starts the
+    workflow, any other task event may start it on the user's request.
     """
     facts = {
         "event": result.get("event", ""),
@@ -188,8 +210,10 @@ def _render_prompt(result: Dict[str, Any], launch: Optional[TaskWorkflowLaunch] 
         "Bitrix24 message for you. Your reply will be posted back here automatically.\n\n"
         f"```json\n{json.dumps(compact, ensure_ascii=False, indent=2)[:4000]}\n```"
     )
-    if (result.get("targeting") or {}).get("mode") == TASK_CREATED and launch is not None:
-        rendered += "\n\n" + launch.instruction(str(result.get("task_id") or ""))
+    task_id = str(result.get("task_id") or "")
+    if launch is not None and task_id:
+        created = (result.get("targeting") or {}).get("mode") == TASK_CREATED
+        rendered += "\n\n" + launch.instruction(task_id, created=created)
     return rendered
 
 

@@ -254,7 +254,7 @@ async def test_register_and_injection_reach_task_session(env, tmp_path):
 
 
 def _canon_run_arguments(prompt: str) -> dict:
-    block = prompt.split("call canon_run with exactly these arguments:\n```json\n", 1)[1]
+    block = prompt.split("call canon_run with exactly these arguments", 1)[1].split("```json\n", 1)[1]
     return json.loads(block.split("\n```", 1)[0])
 
 
@@ -289,7 +289,23 @@ async def test_new_task_of_served_group_starts_its_workflow_in_the_task_session(
             "The decision arrives later as a comment mentioning the bot; do not use clarify."
         ),
     }
-    assert "canon_run" not in tagged.text
+    assert _canon_run_arguments(tagged.text) == _canon_run_arguments(created.text)
+    assert "A new task was created" not in tagged.text
+    assert "смоделируй решение" in tagged.text
+
+
+@pytest.mark.asyncio
+async def test_comment_in_task_without_configured_workflow_carries_no_launch(env):
+    env.source.messages = {"702": ("1193", "1", "@tux разбери задачу")}
+    port = _free_port()
+    adapter, events = await _adapter(port)
+    try:
+        await _post(port, _comment("c5", "1193", "702"))
+        await _drain(adapter)
+    finally:
+        await adapter.disconnect()
+    assert len(events) == 1
+    assert "canon_run" not in events[0].text
 
 
 @pytest.mark.asyncio
