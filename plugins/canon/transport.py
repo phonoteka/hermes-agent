@@ -17,6 +17,7 @@ from jsonschema.exceptions import ValidationError
 
 from .background_runner import _redact_cli_text
 from .schemas import TOOL_SCHEMAS
+from .wake_listener import wake_socket_path
 
 _JSON_PARAMETERS = {"request_json", "state_patch_json", "host_config", "backend", "workflow_input_json"}
 _BACKEND_PARAMETERS = {"backend", "checkpoint_backend", "checkpoint_db", "artifact_backend", "artifact_root", "journal_backend", "journal_db"}
@@ -62,7 +63,7 @@ def _ensure_private_directory(path: Path) -> None:
 
 
 def _default_arguments(command: str, args: dict[str, Any]) -> dict[str, Any]:
-    """Pre: command is supported. Post: generates host config without a notification hook; preserves explicit host_config and provisions default stores only absent explicit authority. Raises: OSError."""
+    """Pre: command is supported. Post: generates host config with the shared wake endpoint; preserves explicit host_config and provisions default stores only absent explicit authority. Raises: OSError."""
     values = dict(args)
     durable = Path(get_hermes_home()) / "runtime" / "canon" / "durable"
     explicit_backend = bool(_BACKEND_PARAMETERS & values.keys())
@@ -70,7 +71,10 @@ def _default_arguments(command: str, args: dict[str, Any]) -> dict[str, Any]:
         if "host_config" not in values and "durable_root" not in values and not explicit_backend:
             config: dict[str, Any] = {
                 "mode": "production", "hostAdapter": "canon-hermes-profile",
-                "hostConfiguration": {"profilesRoot": str(get_default_hermes_root())},
+                "hostConfiguration": {
+                    "profilesRoot": str(get_default_hermes_root()),
+                    "gatewayWakeSocket": str(wake_socket_path()),
+                },
             }
             if command == "run":
                 config["durableRoot"] = str(durable)

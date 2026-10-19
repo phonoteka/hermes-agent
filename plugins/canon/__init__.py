@@ -1,16 +1,16 @@
-"""Register one mechanical Hermes tool per Canon CLI command."""
+"""Register mechanical Canon tools and the gateway-wide pause wake listener."""
 from __future__ import annotations
 
 from typing import Any
 
-from .pause_notifier import PauseNotifier
+from .wake_listener import WakeListener
 from .schemas import TOOL_SCHEMAS
 from .transport import handle_command
 
 
 def register(ctx: Any) -> None:
     """Pre: ctx supports tool registration, injection and unload callbacks.
-    Post: registers eleven CLI tools without aliases and starts one notifier
+    Post: registers eleven CLI tools without aliases and starts one wake listener
     whose stop callback is owned by plugin unload. Raises: registration or
     worker startup errors unchanged.
     """
@@ -21,9 +21,9 @@ def register(ctx: Any) -> None:
 
         ctx.register_tool(name=schema["name"], toolset="canon", schema=schema,
                           handler=handler, is_async=True, emoji="🚦", description=schema["description"])
-    notifier = PauseNotifier(ctx)
-    notifier.start()
-    ctx.on_unload(notifier.stop)
+    listener = WakeListener(ctx)
+    listener.start()
+    ctx.on_unload(listener.stop)
 
 
 __all__ = ["register"]
