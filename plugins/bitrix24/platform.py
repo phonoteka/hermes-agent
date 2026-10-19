@@ -76,7 +76,17 @@ PLATFORM_HINT = (
     "the stored continuePaused request (approve; revise with the user's corrections as "
     "revisionInstructions; abort); any other comment is a question or request to answer directly. "
     "When it is unclear whether a comment is a gate decision, ask in your reply instead of "
-    "deciding. Read the task with bitrix24_task_comments when you need the full discussion."
+    "deciding. Read the task with bitrix24_task_comments when you need the full discussion. "
+    "Your readers are mostly managers, not programmers: answer in plain business language and "
+    "leave out technical details (file, class, function, table and option names, code, SQL, "
+    "commands, run ids) unless the user explicitly asks for them. A Human Gate card is posted "
+    "as-is. Every reply you produce becomes a task comment, so post only what the people in the "
+    "task need: a Human Gate card, the answer to a question or request from a comment, or the "
+    "result of the task. Never post service notices - that a workflow was started or taken into "
+    "work, that a background process finished, that a run is paused or waiting for a card, run "
+    "ids or statuses. When a turn has nothing of that kind for the people in the task, reply "
+    "with exactly [SILENT] and nothing else; it is not posted. The only exception: when the "
+    "workflow of this task failed and no card will come, say so in one plain sentence."
 )
 TASK_CREATED = "task_created"
 HUMAN_GATE_DELIVERY = (
@@ -167,8 +177,8 @@ class TaskWorkflowLaunch:
         if created:
             return (
                 f"A new task was created. Start its workflow now: {call}"
-                "Then reply with one short sentence that the task was taken into work. The workflow "
-                "will wake this session with a card when it needs the user's decision."
+                "Then reply with exactly [SILENT]: nothing is posted now; the workflow will wake "
+                "this session with a card when it needs the user's decision."
             )
         return (
             "This task has a Canon workflow that analyses the task and models its solution: it "
@@ -179,7 +189,8 @@ class TaskWorkflowLaunch:
             "for example \"разбери\", \"разбери задачу\", \"смоделируй\", \"смоделируй "
             "решение\" or an explicit request to run the workflow - do not analyse it yourself: "
             f"{call}"
-            "Then reply with one short sentence that the workflow was started. Any other question, "
+            "Then reply with exactly [SILENT]: the card the workflow sends is the answer. Any other "
+            "question, "
             "including a question about the code, you answer yourself with your own tools. If this "
             "conversation shows that a workflow of this task is already waiting for a decision, "
             "do not start another one unless the comment explicitly asks to restart it; the "
